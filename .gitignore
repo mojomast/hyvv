@@ -19,3 +19,4 @@ config.json
 dist/
 htmlcov/
 venv/
+release-assets/

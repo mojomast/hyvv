@@ -39,6 +39,15 @@ jobs:
         # HYVV_BASE_URL plus HYVV_TOKEN_FILE (read-only unless --writes).
         run: uv run python -m contract -v
 
+      - name: Release assets (build only; no tag, sign or upload)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist release-assets
+          uv build
+          uv run python scripts/build_release_assets.py --dist dist --out release-assets
+          ls dist release-assets
+
       - name: Installer dry run
         shell: bash
         run: |

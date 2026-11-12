@@ -67,15 +67,22 @@ Calls a reusable workflow kept in one place (proposed:
 SHA) so the signing identity is the reusable workflow, which is what GitHub
 documents for SLSA v1 Build Level 3 with artifact attestations.
 
-1. Build wheel and sdist with uv on `ubuntu-latest`.
-2. Write `checksums.txt`.
+1. Build wheel and sdist with uv on `ubuntu-latest` into `dist/` (PyPI gets
+   exactly these two files).
+2. `scripts/build_release_assets.py` writes `install.sh`, `install.ps1` and
+   `checksums.txt` (covering the installers and both dist files) into a
+   separate `release-assets/` dir. CI runs the same script on every PR without
+   tagging, and `tests/test_release_metadata.py` checks that pyproject name,
+   version and entry point, the runtime version and the installer examples
+   agree.
 3. `actions/attest-build-provenance` on every artifact (permissions:
    `id-token: write`, `attestations: write`, `contents: write` for the release
    upload only).
 4. `cosign sign-blob --bundle` on `checksums.txt`, `install.sh`, `install.ps1`
    (keyless, GitHub OIDC identity).
 5. Publish to PyPI with trusted publishing (PyPI attestations on by default).
-6. Upload artifacts, bundles and checksums to the GitHub Release.
+6. Upload `dist/*.tar.gz`, `dist/*.whl` and `release-assets/*` (installers,
+   checksums, Sigstore bundles) to the GitHub Release by explicit path.
 7. Open (not merge) the Homebrew tap bump PR via a GitHub App token.
 8. Mark the release `beta` in `channels/beta.json`.
 

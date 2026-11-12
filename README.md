@@ -64,7 +64,9 @@ Then edit `%USERPROFILE%\.orbit-launcher\config.json` (seeded from `config.examp
 
 `config.example.json` binds `127.0.0.1`. To accept coordinators on a tailnet, set `bind` to the host's Tailscale address. Binding `0.0.0.0` is refused.
 
-Linux / SSH-host install is a stub: `./scripts/install.sh` checks a few dependencies and exits 2 until that installer ships.
+On Linux and macOS, `./scripts/install.sh [--dry-run] [--mode user|system] [--prefix DIR] [--version VER]` installs into a versioned uv venv as the logged-in user (`--mode system` copies files only in 0.1.15; service units come later).
+
+Releases keep PyPI and GitHub assets apart: `uv build` writes only the sdist and wheel to `dist/` (published to PyPI), and `scripts/build_release_assets.py` writes `install.sh`, `install.ps1` and `checksums.txt` to `release-assets/`, which `release.yml` signs and uploads to the GitHub Release. CI runs the same build on every PR without tagging; `tests/test_release_metadata.py` checks that pyproject, the runtime version and the installer examples agree.
 
 Provider keys belong in the environment or in a user-only file, never in the repo or in `config.json`:
 
