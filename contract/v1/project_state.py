@@ -51,6 +51,14 @@ FIELDS = {"schema", "schema_version", "project", "display_name", "state", "at", 
           "reason", "generation", "snapshot_path", "primary_repo", "history"}
 
 
+_REPARSE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+
+def _is_link(st: os.stat_result) -> bool:
+    """Symlink, or on Windows any reparse point (junctions and mount points too)."""
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE)
+
+
 class DispatchRefused(Exception):
     def __init__(self, http: int, code: str, message: str, **extra: Any):
         super().__init__(message)
@@ -83,7 +91,7 @@ def safe_snapshot(repo_root: Path, rel: Any) -> Path:
             st = os.lstat(cur)
         except FileNotFoundError:
             raise _invalid("snapshot_path does not exist", "snapshot_missing") from None
-        if stat.S_ISLNK(st.st_mode):
+        if _is_link(st):
             raise _invalid("snapshot_path has a symlink component", "snapshot_path_symlink")
     if not stat.S_ISREG(os.lstat(cur).st_mode):
         raise _invalid("snapshot_path is not a regular file", "snapshot_path_invalid")
@@ -151,7 +159,7 @@ def read_state(repo_root: Path) -> dict[str, Any] | None:
     sdir = root / ".workflow"
     path = sdir / "project-state.json"
     for p in (sdir, path):
-        if os.path.lexists(p) and stat.S_ISLNK(os.lstat(p).st_mode):
+        if os.path.lexists(p) and _is_link(os.lstat(p)):
             raise _invalid("state file path is a symlink")
     if not os.path.lexists(path):
         return None

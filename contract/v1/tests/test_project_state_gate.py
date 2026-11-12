@@ -251,6 +251,18 @@ class AC_PARK_SnapshotPath(Gate):
         self.write(_doc("active", "parked", snapshot_path="via/PARKED.md"))
         self.assertRefused(self.create(generation=2), 400, "invalid_project_state", "snapshot_path_symlink")
 
+    @unittest.skipUnless(os.name == "nt", "Windows junctions")
+    def test_windows_junction_component_is_refused(self):
+        import subprocess
+        (self.repo / "real").mkdir()
+        (self.repo / "real/PARKED.md").write_text("x", encoding="utf-8")
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(self.repo / "via"), str(self.repo / "real")],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            self.skipTest("mklink /J failed")
+        self.write(_doc("active", "parked", snapshot_path="via/PARKED.md"))
+        self.assertRefused(self.create(generation=2), 400, "invalid_project_state", "snapshot_path_symlink")
+
     def test_resolved_path_must_stay_inside_the_repo(self):
         self.write(_doc("active", "parked"))
         outside = Path(self._tmp.name) / "outside.md"
