@@ -131,6 +131,7 @@ def load_config(path):
     cfg.setdefault("image", "ghcr.io/trycua/linux@sha256:fd00735ceb6c65ab628d962640068c9f63076a49a62d86f6b6eb5ac4bbcbbf6b")
     cfg.setdefault("runtime", "runc")
     cfg.setdefault("memory_mb", 6144)
+    cfg.setdefault("cpus", 2)
     cfg.setdefault("backoff_s", [30, 60, 120, 240])
     cfg.setdefault("data_dir", str(Path.home() / ".orbit-launcher"))
     cfg.setdefault("projects", {})  # name -> {"repo": url} (authorized projects)
@@ -194,7 +195,7 @@ SDK_CONTRACT = [
     ("AgentRun", "artifacts", True, []),
 ]
 SDK_TYPES = {  # constructor keyword fields the backend passes or reads
-    "SandboxCreateOptions": ["on", "kind", "runtime", "image", "name", "memory_mb", "wait_for"],
+    "SandboxCreateOptions": ["on", "kind", "runtime", "image", "name", "memory_mb", "cpus", "wait_for"],
     "ReadinessProbe": ["service"],
     "AgentRunOptions": ["env", "model", "base_url", "wire", "repo", "branch", "cwd", "exit_when_idle", "label"],
     "AgentEventPage": ["events", "cursor", "caught_up"],
@@ -332,7 +333,7 @@ class CuaBackend:
         attempt["sandbox"] = name  # recorded before create so a failed start still cleans up the right sandbox
         sb = await self.client.sandboxes().create(cua.SandboxCreateOptions(
             on="local", kind="container", runtime=cfg["runtime"], image=cfg["image"], name=name,
-            memory_mb=cfg["memory_mb"], wait_for=[cua.ReadinessProbe(service="env")]))
+            memory_mb=cfg["memory_mb"], cpus=cfg.get("cpus", 2), wait_for=[cua.ReadinessProbe(service="env")]))
         self._sb[name] = sb
         proj = cfg["projects"].get(b.get("project", ""), {})
         wd, base = (None, None)
@@ -525,7 +526,7 @@ class AgyCuaRunner:
         a.update(cua_state_dir=str(state), sandbox=name)  # recorded before create so a failure still cleans up
         sb = await self._client(a).sandboxes().create(cua.SandboxCreateOptions(
             on="local", kind="container", runtime=cfg["runtime"], image=cfg["image"], name=name,
-            memory_mb=cfg["memory_mb"], wait_for=[cua.ReadinessProbe(service="env")]))
+            memory_mb=cfg["memory_mb"], cpus=cfg.get("cpus", 2), wait_for=[cua.ReadinessProbe(service="env")]))
         self.be._sb[name] = sb
         wd = base = None
         if mode == "code":  # same seeding as opencode bees: source_rev, else sync_branch / HEAD -> git repo in the sandbox

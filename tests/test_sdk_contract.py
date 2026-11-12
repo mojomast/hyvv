@@ -98,6 +98,8 @@ class Contract(unittest.TestCase):
         self.assertIsInstance(opts, n.AgentRunOptions)
         self.assertEqual((opts.model, opts.base_url, opts.wire), ("deepseek-v4.1-flash", launcher.GO_BASE_URL, "openai-chat"))
         self.assertIsInstance(sbs.create.call_args.args[0], n.SandboxCreateOptions)
+        self.assertEqual(sbs.create.call_args.args[0].cpus, 2)
+        self.assertEqual(sbs.create.call_args.args[0].memory_mb, 1024)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
