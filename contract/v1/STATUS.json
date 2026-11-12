@@ -1,0 +1,48 @@
+{
+  "labels": {
+    "launcher-0.1.15": "Implemented in launcher 0.1.15 (launcher.py) and covered by tests",
+    "reference": "Implemented in the /v1 reference (contract/v1/reference.py) and its tests only; not in the launcher yet",
+    "specified": "Specified in this contract; not implemented anywhere yet",
+    "proposed": "Proposed addition; not yet planned work"
+  },
+  "endpoints": {
+    "GET /v1/version": "specified",
+    "GET /v1/health": "launcher-0.1.15",
+    "GET /v1/attempts": "launcher-0.1.15",
+    "POST /v1/attempts": "launcher-0.1.15",
+    "GET /v1/attempts/{attempt_id}": "launcher-0.1.15",
+    "GET /v1/attempts/{attempt_id}/events": "launcher-0.1.15",
+    "GET /v1/attempts/{attempt_id}/result": "launcher-0.1.15",
+    "GET /v1/attempts/{attempt_id}/artifact": "reference",
+    "POST /v1/attempts/{attempt_id}/review": "launcher-0.1.15",
+    "POST /v1/attempts/{attempt_id}/cancel": "launcher-0.1.15",
+    "GET /v1/projects": "launcher-0.1.15",
+    "GET /v1/containers": "launcher-0.1.15",
+    "POST /v1/config": "launcher-0.1.15",
+    "GET /v1/leases": "specified",
+    "POST /v1/leases": "specified",
+    "DELETE /v1/leases/{lease_id}": "specified",
+    "POST /v1/leases/{lease_id}/renew": "specified"
+  },
+  "features": {
+    "host bearer token on every route": "launcher-0.1.15",
+    "priority_routing (deepseek: or priority high to DeepSeek official)": "launcher-0.1.15",
+    "go_fallback (automatic DeepSeek fallback on Go limits)": "launcher-0.1.15",
+    "artifact_fetch (hyvv.worker-artifact/1)": "reference",
+    "per-coordinator keys plus per-attempt artifact capability": "reference",
+    "result_sha256 pinned on first read": "reference",
+    "owner-only result files (POSIX 0600, Windows owner-only ACL)": "reference",
+    "bee.usage/v1 records in the artifact payload": "reference",
+    "GET /v1/version capabilities list": "specified",
+    "bee-slot leases (capability leases, 429 capacity_exhausted)": "specified",
+    "project_parked refusal (409)": "proposed"
+  },
+  "reference_evidence": {
+    "GET /v1/attempts/{attempt_id}/artifact": ["ArtifactStore.get_artifact", "AC001SucceededArtifact"],
+    "artifact_fetch (hyvv.worker-artifact/1)": ["ArtifactStore.get_artifact", "AC001SucceededArtifact"],
+    "per-coordinator keys plus per-attempt artifact capability": ["ArtifactStore.create_attempt", "AC010Capability"],
+    "result_sha256 pinned on first read": ["ArtifactStore._get", "AC008Restart"],
+    "owner-only result files (POSIX 0600, Windows owner-only ACL)": ["ArtifactStore._write_result", "PrivateFiles"],
+    "bee.usage/v1 records in the artifact payload": ["ArtifactStore._build_payload", "AC001SucceededArtifact"]
+  }
+}

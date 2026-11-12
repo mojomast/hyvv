@@ -1,6 +1,6 @@
-# Planned: global bee-slot leases
+# Specified, not implemented: global bee-slot leases
 
-Status: **planned**. Not implemented in launcher v0.1.15. Advertise the
+Status: **specified** (`x-hyvv-status: specified`). Not implemented in launcher 0.1.15 or the reference. Advertise the
 `leases` capability from `GET /v1/version` once the routes ship.
 
 hyvv is the shared dispatch point for the global bee-slot cap. Orbit and

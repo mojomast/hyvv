@@ -57,13 +57,13 @@ class VersionSchema(unittest.TestCase):
         self.assertEqual(allowed, {"artifact_fetch", "priority_routing", "go_fallback", "leases"})
         self.assertTrue(set(example["capabilities"]) <= allowed)
 
-    def test_leases_are_planned_and_versioned(self):
+    def test_leases_are_specified_and_versioned(self):
         text = (ROOT / "contract/v1/openapi.yaml").read_text(encoding="utf-8")
         self.assertIn("/v1/leases:", text)
         self.assertIn("capacity_exhausted", text)
         self.assertIn("Retry-After", text)
         self.assertIn("x-capability: leases", text)
-        self.assertIn("x-implementation: planned", text)
+        self.assertIn("x-hyvv-status: specified", text)
         for name in ("lease.json", "lease-create.json", "lease-renew.json", "lease-list.json"):
             schema = _load(name)
             self.assertIn("$id", schema)
@@ -72,14 +72,14 @@ class VersionSchema(unittest.TestCase):
         handler = src.split("def make_handler", 1)[-1]
         self.assertNotIn('["v1", "leases"]', handler)
 
-    def test_openapi_mentions_planned_version_and_artifact_routes(self):
+    def test_openapi_labels_version_and_artifact_routes(self):
 
         text = (ROOT / "contract/v1/openapi.yaml").read_text(encoding="utf-8")
         self.assertIn("/v1/version:", text)
         self.assertIn("/v1/attempts/{attempt_id}/artifact:", text)
         self.assertIn("artifact_fetch", text)
         self.assertIn("hyvv.worker-artifact/1", text)
-        self.assertIn("x-implementation: planned", text)
+        self.assertIn("x-hyvv-status: reference", text)
 
 
 class SemverPolicy(unittest.TestCase):
@@ -91,7 +91,7 @@ class SemverPolicy(unittest.TestCase):
 
 
 class LauncherStatus(unittest.TestCase):
-    def test_launcher_v0115_marks_version_and_artifact_as_planned(self):
+    def test_launcher_v0115_has_no_version_or_artifact_route(self):
         src = (ROOT / "launcher.py").read_text(encoding="utf-8")
         self.assertIn('VERSION = "0.1.15"', src)
         # The live 0.1.15 handler has health, not /v1/version or /artifact.

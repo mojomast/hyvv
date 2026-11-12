@@ -22,13 +22,22 @@ The imported runtime is **v0.1.15**. It already routes unprefixed and `go:` mode
 The `/v1` contract in `contract/v1` is the source of truth going forward:
 
 - OpenAPI plus JSON Schemas for attempts, artifacts (`hyvv.worker-artifact/1`), errors, and usage records (`bee.usage/v1`)
-- `GET /v1/version` returns `api_version` and capabilities: `artifact_fetch`, `priority_routing`, `go_fallback`, and planned `leases`
+- `GET /v1/version` (specified, not implemented) will return `api_version` and capabilities: `artifact_fetch`, `priority_routing`, `go_fallback`, and `leases`
 - Semver: `/v1` only ever gets additive changes. A breaking change is `/v2`, served alongside `/v1` for one release
-- Conformance tests, including artifact acceptance criteria `AC-001`–`AC-009`
+- Conformance tests, including artifact acceptance criteria `AC-001`–`AC-010`
 
 A proposed additive check, **not yet planned**, would refuse `POST /v1/attempts` for projects whose `.workflow/project-state.json` is `parked` or `archived` (409 `project_parked`) unless the caller supplies an explicit override plus a reason. It is marked “proposed, aligns with workflow docs/18-parking-projects.md (MR.INDIA, in progress).” See [`contract/v1/proposals/project-parked.md`](contract/v1/proposals/project-parked.md).
 
-`GET /v1/version` and `GET /v1/attempts/{attempt_id}/artifact` are **specified and tested against a reference implementation, but not yet implemented in launcher v0.1.15**. Coordinators should not read raw result files or runtime paths; they should use the artifact endpoint once it ships.
+Nothing below the first row ships in the launcher yet. `GET /v1/attempts/{attempt_id}/artifact` is implemented and tested only in the `/v1` reference (`contract/v1/reference.py`); `GET /v1/version` and `/v1/leases` are specified but unimplemented; parking is proposed. Coordinators should not read raw result files or runtime paths; they should use the artifact endpoint once the launcher ships it.
+
+<!-- status:begin (generated from contract/v1/STATUS.json; python -m contract.v1.status --write) -->
+| Status | Endpoints | Features |
+| --- | --- | --- |
+| **Implemented in launcher 0.1.15** (`launcher-0.1.15`) | `GET /v1/health`, `GET /v1/attempts`, `POST /v1/attempts`, `GET /v1/attempts/{attempt_id}`, `GET /v1/attempts/{attempt_id}/events`, `GET /v1/attempts/{attempt_id}/result`, `POST /v1/attempts/{attempt_id}/review`, `POST /v1/attempts/{attempt_id}/cancel`, `GET /v1/projects`, `GET /v1/containers`, `POST /v1/config` | host bearer token on every route; priority_routing (deepseek: or priority high to DeepSeek official); go_fallback (automatic DeepSeek fallback on Go limits) |
+| **Implemented in the /v1 reference only** (`reference`) | `GET /v1/attempts/{attempt_id}/artifact` | artifact_fetch (hyvv.worker-artifact/1); per-coordinator keys plus per-attempt artifact capability; result_sha256 pinned on first read; owner-only result files (POSIX 0600, Windows owner-only ACL); bee.usage/v1 records in the artifact payload |
+| **Specified, not implemented** (`specified`) | `GET /v1/version`, `GET /v1/leases`, `POST /v1/leases`, `DELETE /v1/leases/{lease_id}`, `POST /v1/leases/{lease_id}/renew` | GET /v1/version capabilities list; bee-slot leases (capability leases, 429 capacity_exhausted) |
+| **Proposed** (`proposed`) | — | project_parked refusal (409) |
+<!-- status:end -->
 
 ## Install
 
@@ -103,4 +112,4 @@ The Cua SDK contract test (`tests/test_sdk_contract.py`) is skipped when `cua` i
 MIT. This matches [bundlebees](https://github.com/mojomast/bundlebees), [hermes-agent](https://github.com/mojomast/hermes-agent), and [comfyrizz](https://github.com/mojomast/comfyrizz). Some other mojomast repositories use a different license or do not yet have a `LICENSE` file.
 
 
-A planned `/v1/leases` API makes hyvv the shared dispatch point for the global bee-slot cap (default 12, CI limited to 2). See [`contract/v1/LEASES.md`](contract/v1/LEASES.md). It is specified here and is not implemented in v0.1.15.
+A specified (not implemented) `/v1/leases` API makes hyvv the shared dispatch point for the global bee-slot cap (default 12, CI limited to 2). See [`contract/v1/LEASES.md`](contract/v1/LEASES.md). It is specified here and is not implemented in v0.1.15.

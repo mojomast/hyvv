@@ -52,7 +52,7 @@
   },
   "planned": {
     "leases": {
-      "status": "planned; not implemented in launcher v0.1.15",
+      "status": "specified; not implemented in launcher 0.1.15 or the reference (x-hyvv-status: specified)",
       "http": {
         "429": [
           "capacity_exhausted"

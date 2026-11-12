@@ -9,9 +9,12 @@ info:
 
     hyvv is a vocabulary, not a dependency on bundlebees.
 
-    Endpoints marked `x-implementation: planned` are part of this contract
-    but are not yet in launcher v0.1.15. Items marked `x-proposal` are
-    suggested additions (see contract/v1/proposals/), not yet planned work.
+    Every operation carries `x-hyvv-status`, one of: `launcher-0.1.15`
+    (implemented in launcher 0.1.15), `reference` (implemented only in the
+    /v1 reference, contract/v1/reference.py), `specified` (specified, not
+    implemented), or `proposed`. contract/v1/STATUS.json is the source and
+    tests/test_status_labels.py keeps the labels honest. Items marked
+    `x-proposal` are proposed additions (see contract/v1/proposals/).
   license:
     name: MIT
     identifier: MIT
@@ -30,7 +33,7 @@ paths:
       tags: [meta]
       operationId: getVersion
       summary: API version and capabilities
-      x-implementation: planned
+      x-hyvv-status: specified
       security:
         - bearerAuth: []
       responses:
@@ -58,7 +61,7 @@ paths:
       tags: [meta]
       operationId: getHealth
       summary: Liveness and host counters
-      x-implementation: implemented
+      x-hyvv-status: launcher-0.1.15
       security:
         - bearerAuth: []
       responses:
@@ -87,7 +90,7 @@ paths:
       operationId: listAttempts
       summary: List attempts (public and lease fields only; newest 200)
       description: Responses never include patch text, brief objective text, host names, or runtime paths.
-      x-implementation: implemented
+      x-hyvv-status: launcher-0.1.15
       security:
         - bearerAuth: []
       parameters:
@@ -116,7 +119,7 @@ paths:
       tags: [attempts]
       operationId: createAttempt
       summary: Create an attempt (idempotent if attempt_id already exists)
-      x-implementation: implemented
+      x-hyvv-status: launcher-0.1.15
       security:
         - bearerAuth: []
       requestBody:
@@ -211,7 +214,7 @@ paths:
       tags: [attempts]
       operationId: getAttempt
       summary: Public fields for one attempt (no patch, no host paths)
-      x-implementation: implemented
+      x-hyvv-status: launcher-0.1.15
       security:
         - bearerAuth: []
       parameters:
@@ -233,7 +236,7 @@ paths:
       tags: [attempts]
       operationId: getAttemptEvents
       summary: Events since a cursor (no patch text)
-      x-implementation: implemented
+      x-hyvv-status: launcher-0.1.15
       security:
         - bearerAuth: []
       parameters:
@@ -258,7 +261,7 @@ paths:
         Historical endpoint. The manifest may include host and work-dir fields.
         Coordinators must use `GET /v1/attempts/{attempt_id}/artifact` once
         `artifact_fetch` ships.
-      x-implementation: implemented
+      x-hyvv-status: launcher-0.1.15
       deprecated: true
       security:
         - bearerAuth: []
@@ -279,7 +282,7 @@ paths:
       tags: [artifacts]
       operationId: getAttemptArtifact
       summary: Coordinator-only artifact fetch
-      x-implementation: planned
+      x-hyvv-status: reference
       x-capability: artifact_fetch
       security:
         - coordinatorKey: []
@@ -325,7 +328,7 @@ paths:
       tags: [attempts]
       operationId: reviewAttempt
       summary: Record a coordinator verdict
-      x-implementation: implemented
+      x-hyvv-status: launcher-0.1.15
       security:
         - bearerAuth: []
       parameters:
@@ -357,7 +360,7 @@ paths:
       tags: [attempts]
       operationId: cancelAttempt
       summary: Cancel an attempt
-      x-implementation: implemented
+      x-hyvv-status: launcher-0.1.15
       security:
         - bearerAuth: []
       parameters:
@@ -375,7 +378,7 @@ paths:
       tags: [host]
       operationId: listProjects
       summary: Authorized project names only (no paths, repos, or branches)
-      x-implementation: implemented
+      x-hyvv-status: launcher-0.1.15
       security:
         - bearerAuth: []
       responses:
@@ -389,7 +392,7 @@ paths:
       tags: [host]
       operationId: getContainerProfile
       summary: Sandbox image profile (not live containers)
-      x-implementation: implemented
+      x-hyvv-status: launcher-0.1.15
       security:
         - bearerAuth: []
       responses:
@@ -403,7 +406,7 @@ paths:
       tags: [host]
       operationId: patchRuntimeConfig
       summary: Runtime-only max_concurrent change (not written to disk)
-      x-implementation: implemented
+      x-hyvv-status: launcher-0.1.15
       security:
         - bearerAuth: []
       requestBody:
@@ -428,7 +431,7 @@ paths:
       tags: [leases]
       operationId: listLeases
       summary: List live bee-slot leases and cap usage
-      x-implementation: planned
+      x-hyvv-status: specified
       x-capability: leases
       security:
         - bearerAuth: []
@@ -445,7 +448,7 @@ paths:
       tags: [leases]
       operationId: acquireLease
       summary: Acquire bee slots
-      x-implementation: planned
+      x-hyvv-status: specified
       x-capability: leases
       security:
         - bearerAuth: []
@@ -485,7 +488,7 @@ paths:
       tags: [leases]
       operationId: releaseLease
       summary: Release a lease immediately
-      x-implementation: planned
+      x-hyvv-status: specified
       x-capability: leases
       security:
         - bearerAuth: []
@@ -507,7 +510,7 @@ paths:
       tags: [leases]
       operationId: renewLease
       summary: Renew a live lease
-      x-implementation: planned
+      x-hyvv-status: specified
       x-capability: leases
       security:
         - bearerAuth: []
@@ -545,7 +548,7 @@ components:
       type: http
       scheme: bearer
       description: >
-        Specified: a per-coordinator key that authenticates a principal. The
+        Reference only (x-hyvv-status reference): a per-coordinator key that authenticates a principal. The
         host stores only key hashes. Used by artifact_fetch together with the
         attempt capability.
   parameters:

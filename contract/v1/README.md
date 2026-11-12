@@ -8,7 +8,8 @@ hyvv is a vocabulary, not a dependency on bundlebees. Any coordinator that speak
 
 | Path | What it is |
 | --- | --- |
-| `openapi.yaml` | The `/v1` API, including planned endpoints |
+| `openapi.yaml` | The `/v1` API; every operation has `x-hyvv-status` |
+| `STATUS.json`, `status.py` | Status labels and the README table renderer |
 | `schemas/` | JSON Schemas for attempts, artifacts, errors, usage (`bee.usage/v1`), and `GET /v1/version` |
 | `error_codes.json` | Artifact-endpoint status codes, reused verbatim in the conformance tests |
 | `SEMVER.md` | `/v1` is additive-only; a break means `/v2` served alongside `/v1` for one release |
@@ -19,28 +20,24 @@ hyvv is a vocabulary, not a dependency on bundlebees. Any coordinator that speak
 | `proposals/` | Proposed `/v1` additions that are not yet planned work |
 | `schemas/project-state.json` | Proposed `.workflow/project-state.json` shape |
 
-## Implementation status at v0.1.15
+## Implementation status
 
-Already implemented in `launcher.py`:
+Four labels, one per endpoint and feature. `STATUS.json` is the source, every `openapi.yaml` operation carries the same `x-hyvv-status`, and `tests/test_status_labels.py` fails if a label is dishonest: a `launcher-0.1.15` route must answer on the in-process launcher, any other route must be absent from it, and every `reference` item must name the reference code and test that prove it.
 
-- `GET /v1/health`, `GET /v1/attempts`, `GET /v1/attempts/{id}`, `GET /v1/attempts/{id}/events`, `GET /v1/attempts/{id}/result` (legacy full manifest; see below)
-- `GET /v1/projects`, `GET /v1/containers`
-- `POST /v1/attempts`, `POST /v1/attempts/{id}/review`, `POST /v1/attempts/{id}/cancel`, `POST /v1/config`
-- Auth: `Authorization: Bearer`. The process binds loopback and/or a Tailscale address only.
-- Routing capabilities that the contract will advertise as `priority_routing` and `go_fallback`.
+<!-- status:begin (generated from contract/v1/STATUS.json; python -m contract.v1.status --write) -->
+| Status | Endpoints | Features |
+| --- | --- | --- |
+| **Implemented in launcher 0.1.15** (`launcher-0.1.15`) | `GET /v1/health`, `GET /v1/attempts`, `POST /v1/attempts`, `GET /v1/attempts/{attempt_id}`, `GET /v1/attempts/{attempt_id}/events`, `GET /v1/attempts/{attempt_id}/result`, `POST /v1/attempts/{attempt_id}/review`, `POST /v1/attempts/{attempt_id}/cancel`, `GET /v1/projects`, `GET /v1/containers`, `POST /v1/config` | host bearer token on every route; priority_routing (deepseek: or priority high to DeepSeek official); go_fallback (automatic DeepSeek fallback on Go limits) |
+| **Implemented in the /v1 reference only** (`reference`) | `GET /v1/attempts/{attempt_id}/artifact` | artifact_fetch (hyvv.worker-artifact/1); per-coordinator keys plus per-attempt artifact capability; result_sha256 pinned on first read; owner-only result files (POSIX 0600, Windows owner-only ACL); bee.usage/v1 records in the artifact payload |
+| **Specified, not implemented** (`specified`) | `GET /v1/version`, `GET /v1/leases`, `POST /v1/leases`, `DELETE /v1/leases/{lease_id}`, `POST /v1/leases/{lease_id}/renew` | GET /v1/version capabilities list; bee-slot leases (capability leases, 429 capacity_exhausted) |
+| **Proposed** (`proposed`) | — | project_parked refusal (409) |
+<!-- status:end -->
 
-Planned (specified here, not in launcher v0.1.15):
-
-- `GET /v1/version` (`api_version` plus capabilities)
-- `GET /v1/attempts/{attempt_id}/artifact` (`hyvv.worker-artifact/1`), the coordinator-only artifact fetch, advertised as the `artifact_fetch` capability
-- Coordinator-key plus per-attempt capability authorization for that endpoint
-- Pinning `result_sha256` on first read, 0600+rename writes, `O_NOFOLLOW` plus realpath reads
-- Usage records in the artifact payload shaped as `bee.usage/v1`
-- `POST/GET/DELETE /v1/leases` (global bee-slot lease system, capability `leases`)
+Auth on implemented routes: `Authorization: Bearer` with the per-host token. The process binds loopback and/or a Tailscale address only.
 
 `GET /v1/attempts/{id}/result` is the historical manifest and may contain host and work-dir fields. Coordinators must use the artifact endpoint once it ships, not the raw result or runtime files.
 
-## Artifact endpoint
+## Artifact endpoint (reference only)
 
 `GET /v1/attempts/{attempt_id}/artifact`
 
@@ -69,6 +66,6 @@ Error codes (HTTP → `code`):
 
 `POST /v1/attempts` would read `.workflow/project-state.json` in the authorized project's repo (`state`, `reason`, `at`, `by`). If `state` is `parked` or `archived`, the host returns **409 `project_parked`** unless the request includes an explicit override plus a reason, both of which are recorded on the attempt. Details: [`proposals/project-parked.md`](proposals/project-parked.md). A pending conformance test lives in `tests/test_project_parked_proposed.py`.
 
-## Planned: bee-slot leases
+## Specified, not implemented: bee-slot leases
 
 hyvv is the shared dispatch point for the global bee cap (default 12, CI limited to 2, optional per-coordinator caps). Coordinators acquire, renew and release leases at `/v1/leases`. A cap hit is **429 `capacity_exhausted`** with `Retry-After`. See [`LEASES.md`](LEASES.md). Schemas are versioned under `schemas/lease*.json`. Orbit and bundlebees are clients; MR.INDIA writes those adapters and their contract tests.
