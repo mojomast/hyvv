@@ -33,7 +33,7 @@ Planned (specified here, not in launcher v0.1.15):
 
 - `GET /v1/version` (`api_version` plus capabilities)
 - `GET /v1/attempts/{attempt_id}/artifact` (`hyvv.worker-artifact/1`), the coordinator-only artifact fetch, advertised as the `artifact_fetch` capability
-- Coordinator-scoped authorization for that endpoint (the caller must be the attempt's coordinator)
+- Coordinator-key plus per-attempt capability authorization for that endpoint
 - Pinning `result_sha256` on first read, 0600+rename writes, `O_NOFOLLOW` plus realpath reads
 - Usage records in the artifact payload shaped as `bee.usage/v1`
 - `POST/GET/DELETE /v1/leases` (global bee-slot lease system, capability `leases`)
@@ -44,7 +44,8 @@ Planned (specified here, not in launcher v0.1.15):
 
 `GET /v1/attempts/{attempt_id}/artifact`
 
-- Auth: Bearer token; peer is loopback or Tailscale; `X-Hyvv-Coordinator` (or `coordinator` query) must match the attempt's coordinator.
+- Auth, two parts. (1) `Authorization: Bearer <coordinator key>`: a per-coordinator key that authenticates a principal; the host stores only key hashes and the coordinator identity always comes from the key, never from a request field. The caller must be the attempt's owner (`403 not_owner`). (2) `X-Hyvv-Capability: <capability>`: a per-attempt capability returned once, only to the creating principal, in the 201 response to `POST /v1/attempts` (`artifact_capability`). The host stores only its SHA-256 and compares in constant time. It is bound to that attempt, scoped to its artifact and result, and can expire (TTL) or be revoked. Missing is `401 capability_required`; wrong or another attempt's is `403 capability_invalid`; `403 capability_expired` and `403 capability_revoked` refuse replay. Peer is loopback or Tailscale.
+- Tests: `AC-010a`–`AC-010g` in `tests/test_artifact_ac.py`.
 - Response schema: `hyvv.worker-artifact/1`.
 - Default size cap: 8 MiB (`HYVV_ARTIFACT_MAX_BYTES`). Oversized results return `413 artifact_oversized` before the body is parsed.
 - Guarantees: idempotent, byte-identical reads; `result_sha256` pinned on first read; result files written owner-only via rename (POSIX mode 0600; on Windows the ACL is reset to a single full-control entry for the host user's SID, with inheritance removed, before any data is written; see `privatefs.py`) and read with `O_NOFOLLOW` plus realpath (Windows uses the equivalent no-reparse-point check). List, get, and logs never carry patch text or host paths.
@@ -54,8 +55,8 @@ Error codes (HTTP → `code`):
 | HTTP | `code` |
 | --- | --- |
 | 400 | `invalid_attempt_id` |
-| 401 | `unauthorized` |
-| 403 | `not_owner` |
+| 401 | `unauthorized`, `capability_required` |
+| 403 | `not_owner`, `capability_invalid`, `capability_expired`, `capability_revoked` |
 | 404 | `unknown_attempt`, `result_missing` |
 | 409 | `result_pending`, `no_result_for_state`, `artifact_mismatch`, `artifact_changed`, `artifact_unsafe` |
 | 413 | `artifact_oversized` |

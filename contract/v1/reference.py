@@ -1,5 +1,16 @@
 """In-memory reference for GET /v1/attempts/{attempt_id}/artifact.
 
+Authorization is two-part:
+
+* The caller authenticates as a coordinator principal with its own key
+  (``Authorization: Bearer <coordinator key>``). The host stores only key
+  hashes. The coordinator identity comes from the key, never from a request
+  field.
+* Each attempt gets a scoped capability at create time, returned once to the
+  creating principal only. The host stores only its SHA-256 and compares in
+  constant time. It is bound to one attempt, scoped to that attempt's artifact
+  and result, and can expire (TTL) or be revoked.
+
 Launcher v0.1.15 does not yet implement this endpoint. Conformance tests
 exercise this module so the contract is pinned before the host grows the
 route. The implementation is planned; do not treat this as the live server.
@@ -7,7 +18,10 @@ route. The implementation is planned; do not treat this as the live server.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import secrets
+import time
 import os
 import re
 import stat
@@ -28,7 +42,11 @@ UNSAFE_ID_RE = re.compile(r"[\\/]|(\.\.)")
 ERROR_HTTP = {
     "invalid_attempt_id": 400,
     "unauthorized": 401,
+    "capability_required": 401,
     "not_owner": 403,
+    "capability_invalid": 403,
+    "capability_expired": 403,
+    "capability_revoked": 403,
     "unknown_attempt": 404,
     "result_missing": 404,
     "result_pending": 409,
@@ -44,6 +62,14 @@ ERROR_HTTP = {
 TERMINAL_WITHOUT_RESULT = {"cancelled", "not_started"}
 PENDING_STATES = {"queued", "backoff", "starting", "running", "cancel_requested"}
 RETRYABLE = {"worker_disconnected"}
+
+
+CAPABILITY_SCOPE = ("artifact", "result")
+CAPABILITY_PREFIX = "hyvvcap1_"
+
+
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 class ArtifactError(Exception):
@@ -68,12 +94,18 @@ def _canonical(obj: Any) -> bytes:
 class ArtifactStore:
     """Coordinator-only artifact store with first-read pinning and safe files."""
 
-    def __init__(self, root: Path | None = None, max_bytes: int | None = None, token: str = "test-token-hyvv-conformance-0001"):
+    def __init__(self, root: Path | None = None, max_bytes: int | None = None, *,
+                 principals: dict[str, str] | None = None, capability_ttl_s: float | None = None, clock=time.time):
         self.root = Path(root or tempfile.mkdtemp(prefix="hyvv-artifact-"))
         self.results = self.root / "results"
         self.results.mkdir(parents=True, exist_ok=True)
         self.max_bytes = int(max_bytes or os.environ.get("HYVV_ARTIFACT_MAX_BYTES") or DEFAULT_MAX_BYTES)
-        self.token = token
+        # Per-coordinator keys; only their hashes are kept.
+        self._principal_hashes: dict[str, str] = {name: _sha256_hex(key) for name, key in (principals or {}).items()}
+        self.capability_ttl_s = capability_ttl_s
+        self.clock = clock
+        self.cap_path = self.root / "capabilities.json"
+        self.caps: dict[str, dict[str, Any]] = {}  # attempt_id -> {sha256, expires_at, revoked, scope}
         self.attempts: dict[str, dict[str, Any]] = {}
         self.pin_path = self.root / "artifact-pins.json"
         self.pins: dict[str, str] = {}  # attempt_id -> result_sha256
@@ -81,6 +113,7 @@ class ArtifactStore:
         self.disconnected = False
         self.logs: list[str] = []
         self._load_pins()
+        self._load_caps()
 
     def _load_pins(self) -> None:
         if not self.pin_path.exists():
@@ -96,6 +129,88 @@ class ArtifactStore:
         payload = {"pins": self.pins, "bodies": {k: v.decode("utf-8") for k, v in self.bodies.items()}}
         write_private(self.pin_path, json.dumps(payload, indent=1).encode("utf-8"))
 
+    # --- principals and capabilities -------------------------------------
+    def _load_caps(self) -> None:
+        if not self.cap_path.exists():
+            return
+        try:
+            self.caps = dict(json.loads(self.cap_path.read_text(encoding="utf-8")).get("capabilities") or {})
+        except Exception:
+            self.caps = {}
+
+    def _save_caps(self) -> None:
+        write_private(self.cap_path, json.dumps({"capabilities": self.caps}, indent=1).encode("utf-8"))
+
+    def authenticate(self, bearer: str | None) -> str:
+        """Return the principal name for a coordinator key, or raise unauthorized."""
+        if not bearer:
+            raise ArtifactError("unauthorized", "missing or incorrect bearer token")
+        h = _sha256_hex(bearer)
+        found = None
+        for name, ph in self._principal_hashes.items():  # check every entry; no early exit
+            if hmac.compare_digest(h, ph):
+                found = name
+        if found is None:
+            raise ArtifactError("unauthorized", "missing or incorrect bearer token")
+        return found
+
+    def _issue_capability(self, attempt_id: str) -> str:
+        cap = CAPABILITY_PREFIX + secrets.token_urlsafe(32)
+        expires = (self.clock() + self.capability_ttl_s) if self.capability_ttl_s else None
+        self.caps[attempt_id] = {"sha256": _sha256_hex(cap), "expires_at": expires, "revoked": False,
+                                 "scope": list(CAPABILITY_SCOPE)}
+        self._save_caps()
+        return cap
+
+    def create_attempt(self, attempt_id: str, *, bearer: str | None, state: str = "queued",
+                       source_rev: str | None = None, **kwargs: Any) -> tuple[int, dict[str, Any]]:
+        """POST /v1/attempts shape: the creator is the authenticated principal; the capability is returned once."""
+        try:
+            owner = self.authenticate(bearer)
+            self._validate_id(attempt_id)
+        except ArtifactError as exc:
+            return exc.http, exc.body()
+        if attempt_id in self.attempts:
+            a = self.attempts[attempt_id]
+            if a["coordinator"] != owner:
+                return 403, ArtifactError("not_owner").body()
+            return 200, {"attempt_id": attempt_id, "state": a["state"]}  # idempotent re-submit: no capability again
+        cap = self.add_attempt(attempt_id, coordinator=owner, state=state, source_rev=source_rev, **kwargs)
+        out = {"attempt_id": attempt_id, "state": state, "artifact_capability": cap}
+        exp = self.caps[attempt_id]["expires_at"]
+        if exp:
+            out["artifact_capability_expires_at"] = exp
+        return 201, out
+
+    def revoke_capability(self, attempt_id: str, *, bearer: str | None) -> tuple[int, dict[str, Any]]:
+        try:
+            owner = self.authenticate(bearer)
+            a = self.attempts.get(attempt_id)
+            if a is None:
+                raise ArtifactError("unknown_attempt", "no such attempt")
+            if a["coordinator"] != owner:
+                raise ArtifactError("not_owner", "caller is not the attempt coordinator")
+        except ArtifactError as exc:
+            return exc.http, exc.body()
+        if attempt_id in self.caps:
+            self.caps[attempt_id]["revoked"] = True
+            self._save_caps()
+        return 200, {"attempt_id": attempt_id, "revoked": True}
+
+    def _check_capability(self, attempt_id: str, capability: str | None, scope: str) -> None:
+        if not capability:
+            raise ArtifactError("capability_required", "missing attempt capability")
+        rec = self.caps.get(attempt_id)
+        expected = rec["sha256"] if rec else _sha256_hex("no-capability:" + attempt_id)
+        ok = hmac.compare_digest(_sha256_hex(capability), expected)
+        if not rec or not ok or scope not in (rec.get("scope") or []):
+            raise ArtifactError("capability_invalid", "capability is not valid for this attempt")
+        if rec.get("revoked"):
+            raise ArtifactError("capability_revoked", "capability was revoked")
+        exp = rec.get("expires_at")
+        if exp is not None and self.clock() >= exp:
+            raise ArtifactError("capability_expired", "capability has expired")
+
     def add_attempt(
         self,
         attempt_id: str,
@@ -107,7 +222,9 @@ class ArtifactStore:
         result_bytes: bytes | None = None,
         symlink: bool = False,
         mode: int = 0o600,
-    ) -> None:
+    ) -> str | None:
+        """Seed an attempt owned by principal ``coordinator``. Returns its new capability,
+        or None when one was already issued (for example after a restart)."""
         self.attempts[attempt_id] = {
             "attempt_id": attempt_id,
             "coordinator": coordinator,
@@ -115,14 +232,16 @@ class ArtifactStore:
             "source_rev": source_rev,
             "brief": {"source_rev": source_rev},
         }
+        cap = None if attempt_id in self.caps else self._issue_capability(attempt_id)
         if result is None and result_bytes is None and not symlink:
-            return
+            return cap
         path = self.results / f"{attempt_id}.result.json"
         if symlink:
             path.symlink_to("/tmp/hyvv-does-not-exist")
-            return
+            return cap
         data = result_bytes if result_bytes is not None else json.dumps(result, indent=1).encode("utf-8")
         self._write_result(path, data, mode=mode)
+        return cap
 
     def _write_result(self, path: Path, data: bytes, mode: int = 0o600) -> None:
         if mode == 0o600:
@@ -162,26 +281,17 @@ class ArtifactStore:
         attempt_id: str,
         *,
         bearer: str | None,
-        coordinator: str | None,
+        capability: str | None,
         peer: str = "127.0.0.1",
     ) -> tuple[int, bytes]:
-        """Return (http_status, body_bytes). Successful bodies are byte-identical on retry."""
+        """Return (http_status, body_bytes). Successful bodies are byte-identical on retry.
+
+        bearer is the caller's coordinator key; capability is the attempt's scoped
+        capability (header X-Hyvv-Capability). There is no caller-supplied coordinator."""
         try:
-            return 200, self._get(attempt_id, bearer=bearer, coordinator=coordinator, peer=peer)
+            return 200, self._get(attempt_id, bearer=bearer, capability=capability, peer=peer)
         except ArtifactError as exc:
             return exc.http, _canonical(exc.body())
-
-    def _require_auth(self, bearer: str | None, coordinator: str | None, attempt: dict[str, Any] | None) -> None:
-        if not bearer or bearer != self.token:
-            raise ArtifactError("unauthorized", "missing or incorrect bearer token")
-        if not coordinator or not attempt or coordinator != attempt.get("coordinator"):
-            # Missing or wrong coordinator: the caller is not the owner.
-            if attempt is None and coordinator:
-                return  # unknown attempt is decided later, but auth for a missing attempt still needs a coordinator shape
-            if attempt is not None:
-                raise ArtifactError("not_owner", "caller is not the attempt coordinator")
-            if not coordinator:
-                raise ArtifactError("not_owner", "caller is not the attempt coordinator")
 
     def _validate_id(self, attempt_id: str) -> None:
         if not attempt_id or UNSAFE_ID_RE.search(attempt_id) or not ATTEMPT_ID_RE.fullmatch(attempt_id):
@@ -299,21 +409,19 @@ class ArtifactStore:
             "worker_claims_untrusted": claims,
         }
 
-    def _get(self, attempt_id: str, *, bearer: str | None, coordinator: str | None, peer: str) -> bytes:
+    def _get(self, attempt_id: str, *, bearer: str | None, capability: str | None, peer: str) -> bytes:
         if self.disconnected:
-            # Still authenticate so a bad token does not leak a disconnect vs 401? Auth first if possible.
-            # A disconnected host is 503 after a well-formed authorized request.
-            if not bearer or bearer != self.token:
-                raise ArtifactError("unauthorized", "missing or incorrect bearer token")
+            # A disconnected host is 503 only after the caller authenticates.
+            self.authenticate(bearer)
             raise ArtifactError("worker_disconnected", "worker host is disconnected")
         self._validate_id(attempt_id)
+        principal = self.authenticate(bearer)
         attempt = self.attempts.get(attempt_id)
-        if not bearer or bearer != self.token:
-            raise ArtifactError("unauthorized", "missing or incorrect bearer token")
         if attempt is None:
             raise ArtifactError("unknown_attempt", "no such attempt")
-        if not coordinator or coordinator != attempt.get("coordinator"):
+        if principal != attempt.get("coordinator"):
             raise ArtifactError("not_owner", "caller is not the attempt coordinator")
+        self._check_capability(attempt_id, capability, "artifact")
         state = attempt["state"]
         path = self.results / f"{attempt_id}.result.json"
         present = path.is_symlink() or path.exists()

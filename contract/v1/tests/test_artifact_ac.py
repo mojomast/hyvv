@@ -27,9 +27,15 @@ from contract.v1.reference import (  # noqa: E402
 )
 
 CODES = json.loads((ROOT / "contract/v1/error_codes.json").read_text(encoding="utf-8"))
-TOKEN = "test-token-hyvv-conformance-0001"
 OWNER = "coordinator-a"
 OTHER = "coordinator-b"
+# Per-coordinator keys (test values, not real). The host keeps only their hashes.
+OWNER_KEY = "test-key-coordinator-a-not-real-0001"
+OTHER_KEY = "test-key-coordinator-b-not-real-0002"
+PRINCIPALS = {OWNER: OWNER_KEY, OTHER: OTHER_KEY}
+# Capabilities as the creating coordinator would hold them (test-side only; the store keeps hashes).
+ISSUED: dict[str, str] = {}
+_DEFAULT = object()
 REV = "47f2fc93565a53a767c3ff2d498ebf604fd0b4f9"
 PATCH = "diff --git a/foo.py b/foo.py\n+hello\n"
 
@@ -56,12 +62,25 @@ def _manifest(attempt_id="att_deadbeefcafebabe", source_rev=REV, patch=PATCH, fi
     }
 
 
+class _CoordinatorView(ArtifactStore):
+    """Records capabilities the way their creator would receive them, for the tests."""
+
+    def add_attempt(self, attempt_id, **kwargs):
+        cap = super().add_attempt(attempt_id, **kwargs)
+        if cap:
+            ISSUED[attempt_id] = cap
+        return cap
+
+
 def _store(tmp, **kwargs):
-    return ArtifactStore(root=tmp, token=TOKEN, **kwargs)
+    kwargs.setdefault("principals", PRINCIPALS)
+    return _CoordinatorView(root=tmp, **kwargs)
 
 
-def _get(store, attempt_id, bearer=TOKEN, coordinator=OWNER):
-    return store.get_artifact(attempt_id, bearer=bearer, coordinator=coordinator)
+def _get(store, attempt_id, bearer=OWNER_KEY, capability=_DEFAULT):
+    if capability is _DEFAULT:
+        capability = ISSUED.get(attempt_id)
+    return store.get_artifact(attempt_id, bearer=bearer, capability=capability)
 
 
 def assert_owner_only(tc: unittest.TestCase, path: Path) -> None:
@@ -140,15 +159,100 @@ class AC002Auth(unittest.TestCase):
             st, body = _get(s, mid, bearer=None)
             self.assertEqual(st, 401)
             self.assertEqual(_json(body)["code"], "unauthorized")
-            st, body = _get(s, mid, coordinator=OTHER)
+            # Another authenticated coordinator, even holding the right capability, is not the owner.
+            st, body = _get(s, mid, bearer=OTHER_KEY)
             self.assertEqual(st, 403)
             self.assertEqual(_json(body)["code"], "not_owner")
             self.assertEqual(_json(body)["error"], "not_owner")
-            st, body = _get(s, mid, coordinator=None)
-            self.assertEqual(st, 403)
-            self.assertEqual(_json(body)["code"], "not_owner")
             st, body = _get(s, mid)
             self.assertEqual(st, 200)
+
+
+class AC010Capability(unittest.TestCase):
+    """AC-010 artifact reads need the attempt's own scoped capability, issued once to its creator."""
+
+    def _two(self, tmp, **kw):
+        s = _store(tmp, **kw)
+        a, b = "att_capa000000000a", "att_capb000000000b"
+        s.add_attempt(a, coordinator=OWNER, state="succeeded", source_rev=REV, result=_manifest(a))
+        s.add_attempt(b, coordinator=OWNER, state="succeeded", source_rev=REV, result=_manifest(b))
+        return s, a, b
+
+    def test_AC_010a_missing_capability_is_401(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s, a, _ = self._two(tmp)
+            st, body = _get(s, a, capability=None)
+            self.assertEqual((st, _json(body)["code"]), (401, "capability_required"))
+
+    def test_AC_010b_wrong_capability_is_403(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s, a, _ = self._two(tmp)
+            st, body = _get(s, a, capability="hyvvcap1_" + "x" * 43)
+            self.assertEqual((st, _json(body)["code"]), (403, "capability_invalid"))
+
+    def test_AC_010c_another_attempts_capability_is_403(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s, a, b = self._two(tmp)
+            st, body = _get(s, a, capability=ISSUED[b])
+            self.assertEqual((st, _json(body)["code"]), (403, "capability_invalid"))
+            st, _ = _get(s, b)
+            self.assertEqual(st, 200)
+
+    def test_AC_010d_revoked_capability_cannot_be_replayed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s, a, _ = self._two(tmp)
+            cap = ISSUED[a]
+            self.assertEqual(_get(s, a, capability=cap)[0], 200)
+            st, _ = s.revoke_capability(a, bearer=OTHER_KEY)
+            self.assertEqual(st, 403, "only the owner may revoke")
+            st, _ = s.revoke_capability(a, bearer=OWNER_KEY)
+            self.assertEqual(st, 200)
+            st, body = _get(s, a, capability=cap)
+            self.assertEqual((st, _json(body)["code"]), (403, "capability_revoked"))
+            # Revocation survives a restart.
+            s2 = _store(tmp)
+            s2.add_attempt(a, coordinator=OWNER, state="succeeded", source_rev=REV)
+            st, body = _get(s2, a, capability=cap)
+            self.assertEqual((st, _json(body)["code"]), (403, "capability_revoked"))
+
+    def test_AC_010e_expired_capability_cannot_be_replayed(self):
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as tmp:
+            s, a, _ = self._two(tmp, capability_ttl_s=60, clock=lambda: now[0])
+            self.assertEqual(_get(s, a)[0], 200)
+            now[0] += 61
+            st, body = _get(s, a)
+            self.assertEqual((st, _json(body)["code"]), (403, "capability_expired"))
+
+    def test_AC_010f_capability_returned_once_to_the_creator_and_only_hashed_at_rest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = ArtifactStore(root=tmp, principals=PRINCIPALS)
+            mid = "att_create00000001"
+            st, body = s.create_attempt(mid, bearer="not-a-key", state="queued", source_rev=REV)
+            self.assertEqual(st, 401)
+            st, body = s.create_attempt(mid, bearer=OWNER_KEY, state="queued", source_rev=REV)
+            self.assertEqual(st, 201)
+            cap = body["artifact_capability"]
+            self.assertTrue(cap.startswith("hyvvcap1_"))
+            self.assertEqual(s.attempts[mid]["coordinator"], OWNER, "owner comes from the key, not a request field")
+            st, again = s.create_attempt(mid, bearer=OWNER_KEY, state="queued", source_rev=REV)
+            self.assertEqual(st, 200)
+            self.assertNotIn("artifact_capability", again)
+            st, _ = s.create_attempt(mid, bearer=OTHER_KEY, state="queued", source_rev=REV)
+            self.assertEqual(st, 403)
+            for blob in (json.dumps(s.list_attempts()), json.dumps(s.get_attempt(mid)), "\n".join(s.log_lines())):
+                self.assertNotIn(cap, blob)
+            at_rest = "".join(p.read_text(encoding="utf-8", errors="replace") for p in Path(tmp).rglob("*") if p.is_file())
+            self.assertNotIn(cap, at_rest)
+            self.assertNotIn(OWNER_KEY, at_rest)
+            self.assertIn(hashlib.sha256(cap.encode()).hexdigest(), s.cap_path.read_text(encoding="utf-8"))
+            assert_owner_only(self, s.cap_path)
+
+    def test_AC_010g_no_caller_supplied_coordinator(self):
+        import inspect
+        params = inspect.signature(ArtifactStore.get_artifact).parameters
+        self.assertNotIn("coordinator", params)
+        self.assertIn("capability", params)
 
 
 class AC003Ids(unittest.TestCase):
@@ -349,6 +453,8 @@ class ErrorCodeTable(unittest.TestCase):
             for code in codes:
                 self.assertEqual(ERROR_HTTP[code], int(http), code)
         self.assertEqual(CODES["retryable"], ["worker_disconnected"])
+        published = {c for codes in CODES["http"].values() for c in codes}
+        self.assertEqual(published, set(ERROR_HTTP), "reference and published error tables must match both ways")
 
 
 if __name__ == "__main__":

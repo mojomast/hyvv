@@ -4,10 +4,14 @@
       "invalid_attempt_id"
     ],
     "401": [
-      "unauthorized"
+      "unauthorized",
+      "capability_required"
     ],
     "403": [
-      "not_owner"
+      "not_owner",
+      "capability_invalid",
+      "capability_expired",
+      "capability_revoked"
     ],
     "404": [
       "unknown_attempt",

@@ -188,6 +188,20 @@
         "null"
       ],
       "description": "Proposed. Snapshot of .workflow/project-state.json at override time."
+    },
+    "artifact_capability": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Scoped capability for this attempt's artifact and result. Present only in the 201 create response to the creating principal; never in GET, list or replay responses."
+    },
+    "artifact_capability_expires_at": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "description": "Unix time the capability expires, when a TTL applies. Create response only."
     }
   }
 }

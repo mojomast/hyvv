@@ -150,7 +150,10 @@ paths:
                 mode: {type: string}
                 coordinator:
                   type: string
-                  description: Owning coordinator. Planned; required for artifact_fetch authorization.
+                  deprecated: true
+                  description: >
+                    Ignored for authorization. The owning coordinator is the
+                    principal authenticated by the request's coordinator key.
                 project_parked_override:
                   type: boolean
                   description: >
@@ -168,7 +171,11 @@ paths:
               schema:
                 $ref: schemas/attempt.json
         "201":
-          description: Created
+          description: >
+            Created. When artifact_fetch is available, the body also carries
+            `artifact_capability` (and `artifact_capability_expires_at` when a
+            TTL applies). It is returned only here, only to the creating
+            principal, and never again (not on idempotent replay, GET or list).
           content:
             application/json:
               schema:
@@ -275,18 +282,20 @@ paths:
       x-implementation: planned
       x-capability: artifact_fetch
       security:
-        - bearerAuth: []
+        - coordinatorKey: []
       parameters:
         - $ref: "#/components/parameters/AttemptId"
-        - name: X-Hyvv-Coordinator
+        - name: X-Hyvv-Capability
           in: header
           required: true
-          schema: {type: string}
-          description: Must match the attempt's coordinator. A `coordinator` query parameter is also accepted.
-        - name: coordinator
-          in: query
-          required: false
-          schema: {type: string}
+          schema: {type: string, pattern: "^hyvvcap1_[A-Za-z0-9_-]{43}$"}
+          description: >
+            The attempt's scoped capability, returned once in the 201 response
+            to POST /v1/attempts (`artifact_capability`). Bound to this attempt,
+            scoped to its artifact and result, compared by hash in constant
+            time, and subject to expiry and revocation. The caller's
+            coordinator identity comes from its bearer key (`coordinatorKey`),
+            never from a request field.
       responses:
         "200":
           description: `hyvv.worker-artifact/1`
@@ -532,6 +541,13 @@ components:
       type: http
       scheme: bearer
       description: Per-host token from the hyvv data directory. Required on every route.
+    coordinatorKey:
+      type: http
+      scheme: bearer
+      description: >
+        Specified: a per-coordinator key that authenticates a principal. The
+        host stores only key hashes. Used by artifact_fetch together with the
+        attempt capability.
   parameters:
     AttemptId:
       name: attempt_id
