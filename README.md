@@ -70,13 +70,30 @@ The API token is created by `scripts/new-token.ps1` and is not printed.
 
 See [`contract/v1/README.md`](contract/v1/README.md) and [`contract/v1/SEMVER.md`](contract/v1/SEMVER.md).
 
-Orbit and bundlebees should pin this tree at a tag and run `python -m unittest discover -s contract/v1/tests -v` against a mock.
+### Run the contract tests (one command)
+
+```bash
+uv run python -m contract            # or: scripts/contract-test.sh  /  scripts/contract-test.ps1
+```
+
+By default this starts an in-process hyvv (`launcher.py` with its scripted fake backend, no sandboxes or keys) on a free loopback port and runs every test in `contract/v1/tests`: the schema checks, the artifact acceptance criteria `AC-001`–`AC-009` against `reference.py`, and the HTTP conformance suite `test_http_v1.py` for the implemented `/v1` endpoints (auth, health, projects, containers, attempt listing against `schemas/attempt.json`, rejected writes, and a create → events → result → review lifecycle).
+
+To check a running host instead, give its base URL and a token file:
+
+```bash
+HYVV_BASE_URL=http://127.0.0.1:47821 HYVV_TOKEN_FILE=path/to/orbit-api.token uv run python -m contract
+# or: uv run python -m contract --base-url URL --token-file PATH
+```
+
+Live runs are read-only: they never create, review or cancel attempts, and the only POSTs are requests the host must reject (400/403/404). Add `--writes` (or `HYVV_CONTRACT_WRITES=1`) to also create one small attempt. The URL and token are never printed. `GET /v1/version` is skipped while it returns 404 (planned endpoint).
+
+Orbit and bundlebees should pin this tree at a tag and run the same command in their CI against the in-process host or a mock.
 
 ## Development
 
 ```bash
-python -m unittest discover -s tests -v
-python -m unittest discover -s contract/v1/tests -v
+uv run python -m unittest discover -s tests -v   # 82 unit tests
+uv run python -m contract -v                     # 46 contract tests
 ```
 
 The Cua SDK contract test (`tests/test_sdk_contract.py`) is skipped when `cua` is not installed. Run it with `uv run --python 3.12 --with cua==0.5.0 python -m unittest tests.test_sdk_contract -v`.

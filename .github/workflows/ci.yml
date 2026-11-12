@@ -29,11 +29,15 @@ jobs:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
 
-      - name: Sync and test
+      - name: Sync and unit tests
         run: |
           uv sync --frozen --no-dev || uv sync --no-dev
           uv run python -m unittest discover -s tests -v
-          uv run python -m unittest discover -s contract/v1/tests -v
+
+      - name: Contract tests (/v1, in-process hyvv)
+        # Same command a reviewer runs locally. Point it at a live host with
+        # HYVV_BASE_URL plus HYVV_TOKEN_FILE (read-only unless --writes).
+        run: uv run python -m contract -v
 
       - name: Installer dry run
         shell: bash

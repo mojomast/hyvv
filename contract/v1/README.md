@@ -14,6 +14,8 @@ hyvv is a vocabulary, not a dependency on bundlebees. Any coordinator that speak
 | `SEMVER.md` | `/v1` is additive-only; a break means `/v2` served alongside `/v1` for one release |
 | `reference.py` | In-memory reference for `GET /v1/attempts/{attempt_id}/artifact` |
 | `tests/` | Conformance tests, including OA1 acceptance criteria `AC-001`–`AC-009` |
+| `tests/test_http_v1.py` | HTTP conformance for the implemented `/v1` endpoints; in-process hyvv by default, a live host with `HYVV_BASE_URL` + `HYVV_TOKEN_FILE` (read-only unless `--writes`) |
+| `../__main__.py` | One-command runner: `uv run python -m contract` |
 | `proposals/` | Proposed `/v1` additions that are not yet planned work |
 | `schemas/project-state.json` | Proposed `.workflow/project-state.json` shape |
 

@@ -47,6 +47,15 @@ bees as CI runners in phase 4). Nothing is merged or tagged without Kyle's yes.
 Orbit and bundlebees each run the same suite against the mock, pinned to a hyvv
 tag (`HYVV_CONTRACT_REF=v0.x.y`). MR.INDIA owns those jobs.
 
+**Today (PR #1):** `ci.yml` already runs the contract suite on every OS and
+Python in the matrix with `uv run python -m contract -v`. That is the in-process
+target from item 2 above: `launcher.py` started on loopback with its scripted
+`FakeBackend`, plus the `reference.py` mock for the artifact endpoint. The same
+command runs locally. Point it at a live `/v1` host with `HYVV_BASE_URL` and
+`HYVV_TOKEN_FILE` (or `--base-url` / `--token-file`); live runs are read-only
+unless `--writes` is passed. A separate `contract.yml` and the schema diff
+against the last tag are still planned.
+
 ### `security.yml`
 
 gitleaks, zizmor, CodeQL (python, actions), dependency review, pip-audit.

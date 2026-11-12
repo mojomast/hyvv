@@ -129,7 +129,8 @@ class ArtifactStore:
         fd = os.open(tmp, flags, mode)
         try:
             os.write(fd, data)
-            os.fchmod(fd, mode)
+            if hasattr(os, "fchmod"):  # POSIX; Windows has no fchmod, os.chmod below still applies
+                os.fchmod(fd, mode)
         finally:
             os.close(fd)
         os.replace(tmp, path)

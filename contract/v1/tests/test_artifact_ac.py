@@ -321,8 +321,9 @@ class AC009NoLeak(unittest.TestCase):
             self.assertIn(mid, logs)
             self.assertIn("patch_sha256=", logs)
             path = s.results / f"{mid}.result.json"
-            mode = stat.S_IMODE(path.stat().st_mode)
-            self.assertEqual(mode, 0o600)
+            if os.name != "nt":  # POSIX permission bits; Windows ACLs are out of scope for the reference
+                mode = stat.S_IMODE(path.stat().st_mode)
+                self.assertEqual(mode, 0o600)
 
 
 class ErrorCodeTable(unittest.TestCase):
