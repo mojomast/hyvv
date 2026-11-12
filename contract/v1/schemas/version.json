@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/mojomast/hyvv/main/contract/v1/schemas/version.json",
   "title": "GET /v1/version",
-  "description": "Implemented status in v0.1.15: planned. api_version is v1; capabilities are advertised here.",
+  "description": "Implemented in launcher 0.1.15. api_version is the /v1 contract version; version is the hyvv / launcher release; capabilities lists what this host supports.",
   "type": "object",
   "additionalProperties": false,
   "required": [

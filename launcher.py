@@ -298,9 +298,8 @@ class CuaBackend:
             st, _, path = l.partition("\t")
             if not path: continue
             sha = None if st.startswith("D") else ((await self._sh(sb, f"cd '{wd}' && sha256sum -- '{path}' | cut -d' ' -f1"))[0].strip()[:64] or None)
-            scope = a["brief"].get("assigned_files") or []
             files.append({"path": path, "status": st, "sha256": sha, "change": "deleted" if st.startswith("D") else ("added" if st.startswith("A") else "changed"),
-                          "in_assigned_scope": (not scope) or any(path == x or path.startswith(x.rstrip("/") + "/") for x in scope)})
+                          "in_assigned_scope": in_assigned_scope(path, a["brief"].get("assigned_files"))})
         return {"diff": diff, "files": files}
 
     async def _inject_bbs_token(self, sb, attempt):
@@ -681,6 +680,42 @@ def validate_brief(b):
         if k in b and not (isinstance(b[k], list) and all(isinstance(x, str) for x in b[k])): return f"brief.{k} must be a list of strings"
     return None
 
+# Same text rule as contract/v1/project_state.py SAFE_PATH: relative, no empty,
+# "." or ".." segment, no backslash, no trailing slash after normalize, <= 244.
+_SCOPE_PATH = re.compile(r"^(?!/)(?!.*(?:^|/)[.]{1,2}(?:/|$))(?!.*//)(?!.*/$)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
+
+
+def _safe_rel_path(value):
+    """Normalize a repo-relative POSIX path, or None if it is not safe."""
+    if not isinstance(value, str) or "\\" in value:
+        return None
+    text = value.rstrip("/")
+    if not text or len(text) > 244 or not _SCOPE_PATH.match(text):
+        return None
+    return text
+
+
+def in_assigned_scope(path, scope):
+    """True only when path is inside a non-empty assigned_files list.
+
+    Fail closed: missing, empty, or non-list scope allows nothing. A scope
+    entry matches the path exactly, or as a directory prefix followed by '/'.
+    Unsafe paths (`..`, absolute, backslash) never match.
+    """
+    if not isinstance(scope, (list, tuple)) or not scope:
+        return False
+    file_path = _safe_rel_path(path)
+    if file_path is None:
+        return False
+    for raw in scope:
+        entry = _safe_rel_path(raw)
+        if entry is None:
+            continue
+        if file_path == entry or file_path.startswith(entry + "/"):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------- launcher core
 class Launcher:
     def __init__(self, cfg, backend):
@@ -957,7 +992,7 @@ class Launcher:
         for art in res.get("artifacts", []):
             files.append({"path": art["path"], "size": art["size"], "sha256": await self.backend.file_sha256(a, art["path"]),
                           "change": "deleted" if art.get("size") is None else "changed",
-                          "in_assigned_scope": (not b.get("assigned_files")) or any(art["path"].startswith(x) for x in b["assigned_files"])})
+                          "in_assigned_scope": in_assigned_scope(art["path"], b.get("assigned_files"))})
         claims = {}
         m = re.findall(r"\{[\s\S]*\}", res.get("text") or "")
         if m:
@@ -1006,6 +1041,9 @@ def make_handler(L, token):
                 return self._send(200, {"projects": [{"name": k} for k in sorted(L.cfg["projects"])]})
             if p == ["v1", "containers"]:  # the sandbox image profile, not live containers
                 return self._send(200, {"containers": [{"image": L.cfg.get("image"), "runtime": L.cfg.get("runtime"), "memory_mb": L.cfg.get("memory_mb")}]})
+            if p == ["v1", "version"]:
+                return self._send(200, {"api_version": "v1", "version": VERSION,
+                                        "capabilities": ["priority_routing", "go_fallback"]})
             if p == ["v1", "health"]:
                 return self._send(200, {"ok": True, "version": VERSION, "max_concurrent": L.cfg["max_concurrent"], "active": len(L._active()), "queued": len(L._queue()), "model": L.cfg["model"],
                                        "uptime_s": round(time.time() - L.started_at), "loop_lag_ms": round(L.loop_lag_ms, 1)})

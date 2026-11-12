@@ -33,7 +33,7 @@ paths:
       tags: [meta]
       operationId: getVersion
       summary: API version and capabilities
-      x-hyvv-status: specified
+      x-hyvv-status: launcher-0.1.15
       security:
         - bearerAuth: []
       responses:
@@ -49,10 +49,8 @@ paths:
                     api_version: v1
                     version: "0.1.15"
                     capabilities:
-                      - artifact_fetch
                       - priority_routing
                       - go_fallback
-                      - leases
         "401":
           $ref: "#/components/responses/Unauthorized"
 

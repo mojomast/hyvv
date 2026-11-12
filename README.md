@@ -22,20 +22,20 @@ The imported runtime is **v0.1.15**. It already routes unprefixed and `go:` mode
 The `/v1` contract in `contract/v1` is the source of truth going forward:
 
 - OpenAPI plus JSON Schemas for attempts, artifacts (`hyvv.worker-artifact/1`), errors, and usage records (`bee.usage/v1`)
-- `GET /v1/version` (specified, not implemented) will return `api_version` and capabilities: `artifact_fetch`, `priority_routing`, `go_fallback`, and `leases`
+- `GET /v1/version` returns `api_version` (`v1`, the contract version) and `version` (the hyvv / launcher release, currently `0.1.15`), plus the capabilities this host supports (`priority_routing`, `go_fallback`). `artifact_fetch` and `leases` are advertised only once those routes ship
 - Semver: `/v1` only ever gets additive changes. A breaking change is `/v2`, served alongside `/v1` for one release
 - Conformance tests, including artifact acceptance criteria `AC-001`–`AC-010`
 
 The project-state dispatch gate from workflow `docs/18-parking-projects.md` is implemented in the `/v1` reference only, not in launcher 0.1.15. `POST /v1/attempts` with a `project` reads that project's `.workflow/project-state.json` and refuses parked or archived projects (409 `project_parked` / `project_archived`), unless an override flag plus a reason is given. The override is persisted and attributed to the authenticated caller. It also requires `project_state_generation` (409 `project_state_changed`), fails closed on invalid files, and checks `snapshot_path` containment. See [`contract/v1/README.md`](contract/v1/README.md#project-state-dispatch-gate-reference-only).
 
-Nothing below the first row ships in the launcher yet. `GET /v1/attempts/{attempt_id}/artifact` is implemented and tested only in the `/v1` reference (`contract/v1/reference.py`); `GET /v1/version` and `/v1/leases` are specified but unimplemented; the project-state gate (parking) is reference-only. Coordinators should not read raw result files or runtime paths; they should use the artifact endpoint once the launcher ships it.
+Nothing below the first row ships in the launcher yet. `GET /v1/attempts/{attempt_id}/artifact` is implemented and tested only in the `/v1` reference (`contract/v1/reference.py`); `/v1/leases` is specified but unimplemented; the project-state gate (parking) is reference-only. Coordinators should not read raw result files or runtime paths; they should use the artifact endpoint once the launcher ships it.
 
 <!-- status:begin (generated from contract/v1/STATUS.json; python -m contract.v1.status --write) -->
 | Status | Endpoints | Features |
 | --- | --- | --- |
-| **Implemented in launcher 0.1.15** (`launcher-0.1.15`) | `GET /v1/health`, `GET /v1/attempts`, `POST /v1/attempts`, `GET /v1/attempts/{attempt_id}`, `GET /v1/attempts/{attempt_id}/events`, `GET /v1/attempts/{attempt_id}/result`, `POST /v1/attempts/{attempt_id}/review`, `POST /v1/attempts/{attempt_id}/cancel`, `GET /v1/projects`, `GET /v1/containers`, `POST /v1/config` | host bearer token on every route; priority_routing (deepseek: or priority high to DeepSeek official); go_fallback (automatic DeepSeek fallback on Go limits) |
+| **Implemented in launcher 0.1.15** (`launcher-0.1.15`) | `GET /v1/version`, `GET /v1/health`, `GET /v1/attempts`, `POST /v1/attempts`, `GET /v1/attempts/{attempt_id}`, `GET /v1/attempts/{attempt_id}/events`, `GET /v1/attempts/{attempt_id}/result`, `POST /v1/attempts/{attempt_id}/review`, `POST /v1/attempts/{attempt_id}/cancel`, `GET /v1/projects`, `GET /v1/containers`, `POST /v1/config` | host bearer token on every route; priority_routing (deepseek: or priority high to DeepSeek official); go_fallback (automatic DeepSeek fallback on Go limits); GET /v1/version capabilities list |
 | **Implemented in the /v1 reference only** (`reference`) | `GET /v1/attempts/{attempt_id}/artifact` | artifact_fetch (hyvv.worker-artifact/1); per-coordinator keys plus per-attempt artifact capability; result_sha256 pinned on first read; owner-only result files (POSIX 0600, Windows owner-only ACL); bee.usage/v1 records in the artifact payload; project-state dispatch gate (409 project_parked / project_archived / project_state_changed, override plus reason, snapshot_path containment) |
-| **Specified, not implemented** (`specified`) | `GET /v1/version`, `GET /v1/leases`, `POST /v1/leases`, `DELETE /v1/leases/{lease_id}`, `POST /v1/leases/{lease_id}/renew` | GET /v1/version capabilities list; bee-slot leases (capability leases, 429 capacity_exhausted) |
+| **Specified, not implemented** (`specified`) | `GET /v1/leases`, `POST /v1/leases`, `DELETE /v1/leases/{lease_id}`, `POST /v1/leases/{lease_id}/renew` | bee-slot leases (capability leases, 429 capacity_exhausted) |
 | **Proposed** (`proposed`) | — | coordinator-signed briefs (HMAC over the canonical brief with the per-coordinator key, verified at settle) |
 <!-- status:end -->
 
@@ -96,7 +96,7 @@ HYVV_BASE_URL=http://127.0.0.1:47821 HYVV_TOKEN_FILE=path/to/orbit-api.token uv 
 # or: uv run python -m contract --base-url URL --token-file PATH
 ```
 
-Live runs are read-only: they never create, review or cancel attempts, and the only POSTs are requests the host must reject (400/403/404). Add `--writes` (or `HYVV_CONTRACT_WRITES=1`) to also create one small attempt. The URL and token are never printed. `GET /v1/version` is skipped while it returns 404 (planned endpoint).
+Live runs are read-only: they never create, review or cancel attempts, and the only POSTs are requests the host must reject (400/403/404). Add `--writes` (or `HYVV_CONTRACT_WRITES=1`) to also create one small attempt. The URL and token are never printed.
 
 Orbit and bundlebees should pin this tree at a tag and run the same command in their CI against the in-process host or a mock.
 

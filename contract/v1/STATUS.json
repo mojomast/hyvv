@@ -6,7 +6,7 @@
     "proposed": "Proposed addition; not yet planned work"
   },
   "endpoints": {
-    "GET /v1/version": "specified",
+    "GET /v1/version": "launcher-0.1.15",
     "GET /v1/health": "launcher-0.1.15",
     "GET /v1/attempts": "launcher-0.1.15",
     "POST /v1/attempts": "launcher-0.1.15",
@@ -34,7 +34,7 @@
     "owner-only result files (POSIX 0600, Windows owner-only ACL)": "reference",
     "bee.usage/v1 records in the artifact payload": "reference",
     "project-state dispatch gate (409 project_parked / project_archived / project_state_changed, override plus reason, snapshot_path containment)": "reference",
-    "GET /v1/version capabilities list": "specified",
+    "GET /v1/version capabilities list": "launcher-0.1.15",
     "bee-slot leases (capability leases, 429 capacity_exhausted)": "specified",
     "coordinator-signed briefs (HMAC over the canonical brief with the per-coordinator key, verified at settle)": "proposed"
   },

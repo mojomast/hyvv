@@ -91,15 +91,13 @@ class SemverPolicy(unittest.TestCase):
 
 
 class LauncherStatus(unittest.TestCase):
-    def test_launcher_v0115_has_no_version_or_artifact_route(self):
+    def test_launcher_v0115_has_version_but_no_artifact_route(self):
         src = (ROOT / "launcher.py").read_text(encoding="utf-8")
         self.assertIn('VERSION = "0.1.15"', src)
-        # The live 0.1.15 handler has health, not /v1/version or /artifact.
+        # The live 0.1.15 handler has health and /v1/version, not /artifact.
         self.assertIn('["v1", "health"]', src)
-        self.assertNotIn('["v1", "version"]', src)
+        self.assertIn('["v1", "version"]', src)
         self.assertNotIn('"artifact"', src.split("def make_handler", 1)[-1])
-        # Routing capabilities already exist in 0.1.15 and will be advertised
-        # once GET /v1/version ships.
         self.assertIn("is_high_priority", src)
         self.assertIn("falling back", src)
 

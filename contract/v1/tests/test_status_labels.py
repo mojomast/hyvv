@@ -69,7 +69,7 @@ class Labels(unittest.TestCase):
             self.assertEqual(cur, S.block(), f"{p.relative_to(ROOT)} is stale; run python -m contract.v1.status --write")
 
     def test_unshipped_items_are_not_described_as_shipped(self):
-        bad = re.compile(r"(?i)(already implemented|ships today|is implemented in launcher)[^\n]*(/v1/version|/artifact|/v1/leases|project_parked)")
+        bad = re.compile(r"(?i)(already implemented|ships today|is implemented in launcher)[^\n]*(/artifact|/v1/leases|project_parked)")
         for p in [ROOT / "README.md", ROOT / "contract/v1/README.md", ROOT / "contract/v1/LEASES.md", ROOT / "docs/CI.md"]:
             self.assertIsNone(bad.search(p.read_text(encoding="utf-8")), p.name)
 
