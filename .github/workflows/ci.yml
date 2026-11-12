@@ -46,6 +46,9 @@ jobs:
           rm -rf dist release-assets
           uv build
           uv run python scripts/build_release_assets.py --dist dist --out release-assets
+          # dist/ is what PyPI gets: exactly the sdist and the wheel.
+          test "$(ls dist | wc -l | tr -d ' ')" = 2
+          ls dist/*.tar.gz dist/*.whl
           ls dist release-assets
 
       - name: Installer dry run

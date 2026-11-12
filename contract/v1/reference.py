@@ -108,8 +108,10 @@ class ArtifactStore:
         self.caps: dict[str, dict[str, Any]] = {}  # attempt_id -> {sha256, expires_at, revoked, scope}
         self.attempts: dict[str, dict[str, Any]] = {}
         self.pin_path = self.root / "artifact-pins.json"
-        self.pins: dict[str, str] = {}  # attempt_id -> result_sha256
-        self.bodies: dict[str, bytes] = {}  # pinned response bytes
+        # attempt_id -> {"result_sha256", "body_sha256"}. Digests only: raw
+        # patches live solely in the owner-only result files, never in pins.
+        self.pins: dict[str, dict[str, str]] = {}
+        self.bodies: dict[str, bytes] = {}  # in-memory cache of pinned response bytes (not persisted)
         self.disconnected = False
         self.logs: list[str] = []
         self._load_pins()
@@ -122,11 +124,20 @@ class ArtifactStore:
             data = json.loads(self.pin_path.read_text(encoding="utf-8"))
         except Exception:
             return
-        self.pins = dict(data.get("pins") or {})
-        self.bodies = {k: v.encode("utf-8") for k, v in (data.get("bodies") or {}).items()}
+        pins: dict[str, dict[str, str]] = {}
+        for k, v in (data.get("pins") or {}).items():
+            if isinstance(v, str):  # older digest-only form
+                pins[k] = {"result_sha256": v}
+            elif isinstance(v, dict) and isinstance(v.get("result_sha256"), str):
+                pins[k] = {kk: vv for kk, vv in v.items() if kk in ("result_sha256", "body_sha256") and isinstance(vv, str)}
+        self.pins = pins
+        # A legacy "bodies" key held raw response bytes (patches). Ignore it and
+        # rewrite the file digest-only right away.
+        if "bodies" in data:
+            self._save_pins()
 
     def _save_pins(self) -> None:
-        payload = {"pins": self.pins, "bodies": {k: v.decode("utf-8") for k, v in self.bodies.items()}}
+        payload = {"pins": self.pins}
         write_private(self.pin_path, json.dumps(payload, indent=1).encode("utf-8"))
 
     # --- principals and capabilities -------------------------------------
@@ -435,15 +446,19 @@ class ArtifactStore:
         payload = self._build_payload(attempt, raw)
         result_sha256 = payload["result_sha256"]
         pinned = self.pins.get(attempt_id)
-        if pinned and pinned != result_sha256:
+        if pinned and pinned.get("result_sha256") != result_sha256:
             raise ArtifactError("artifact_changed", "result changed since first read")
         body = self.bodies.get(attempt_id)
         if body is not None:
             return body
         body = _canonical(payload)
-        self.pins[attempt_id] = result_sha256
+        body_sha256 = hashlib.sha256(body).hexdigest()
+        if pinned and pinned.get("body_sha256") not in (None, body_sha256):
+            raise ArtifactError("artifact_changed", "artifact bytes changed since first read")
         self.bodies[attempt_id] = body
-        self._save_pins()
+        if pinned != {"result_sha256": result_sha256, "body_sha256": body_sha256}:
+            self.pins[attempt_id] = {"result_sha256": result_sha256, "body_sha256": body_sha256}
+            self._save_pins()
         self.logs.append(f"artifact attempt_id={attempt_id} patch_sha256={payload['patch_sha256']} result_sha256={result_sha256}")
         return body
 

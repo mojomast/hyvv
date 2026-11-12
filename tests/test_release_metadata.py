@@ -135,6 +135,7 @@ class ReleaseAssets(unittest.TestCase):
     def test_ci_runs_the_asset_build_without_tagging(self):
         y = _read(".github/workflows/ci.yml")
         self.assertIn("python scripts/build_release_assets.py --dist dist --out release-assets", y)
+        self.assertIn('test "$(ls dist | wc -l | tr -d \' \')" = 2', y)
         self.assertNotIn("git tag", y)
         self.assertNotIn("gh release", y)
 

@@ -255,6 +255,51 @@ class AC010Capability(unittest.TestCase):
         self.assertIn("capability", params)
 
 
+    def test_AC_010h_shared_token_plus_claimed_name_cannot_read(self):
+        """Audit repro: a holder of some valid key who claims another coordinator's name gets nothing."""
+        import inspect
+        self.assertNotIn("token", inspect.signature(ArtifactStore.__init__).parameters, "no shared host token for artifacts")
+        with tempfile.TemporaryDirectory() as tmp:
+            s, a, _ = self._two(tmp)
+            with self.assertRaises(TypeError):
+                s.get_artifact(a, bearer=OTHER_KEY, capability=ISSUED[a], coordinator=OWNER)
+            # Another principal, even holding the owner's capability, is refused.
+            st, body = _get(s, a, bearer=OTHER_KEY, capability=ISSUED[a])
+            self.assertEqual((st, _json(body)["code"]), (403, "not_owner"))
+            self.assertNotIn(b"+hello", body)
+            # Unknown keys are 401.
+            st, body = _get(s, a, bearer="shared-host-token-not-a-coordinator-key")
+            self.assertEqual(st, 401)
+            self.assertNotIn(b"+hello", body)
+
+    def test_AC_010i_pins_file_holds_digests_not_raw_patches(self):
+        """Audit repro: the pin file must not persist the raw patch; restart replay is still byte-identical."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s, a, _ = self._two(tmp)
+            st, first = _get(s, a)
+            self.assertEqual(st, 200)
+            self.assertIn(b"+hello", first)
+            text = s.pin_path.read_text(encoding="utf-8")
+            self.assertNotIn("+hello", text)
+            self.assertNotIn("diff --git", text)
+            data = json.loads(text)
+            self.assertEqual(set(data), {"pins"})
+            self.assertEqual(data["pins"][a]["body_sha256"], hashlib.sha256(first).hexdigest())
+            assert_owner_only(self, s.pin_path)
+            s2 = _store(tmp)
+            s2.add_attempt(a, coordinator=OWNER, state="succeeded", source_rev=REV)
+            st, again = _get(s2, a)
+            self.assertEqual((st, again), (200, first))
+            # A legacy pin file that still carries bodies is scrubbed on the next save.
+            legacy = {"pins": {a: hashlib.sha256(b"x").hexdigest()}, "bodies": {a: "diff --git +hello"}}
+            s.pin_path.write_text(json.dumps(legacy), encoding="utf-8")
+            s3 = _store(tmp)
+            self.assertNotIn("+hello", s.pin_path.read_text(encoding="utf-8"), "legacy bodies scrubbed on load")
+            s3.add_attempt(a, coordinator=OWNER, state="succeeded", source_rev=REV)
+            st, body = _get(s3, a)
+            self.assertEqual((st, _json(body)["code"]), (409, "artifact_changed"))
+
+
 class AC003Ids(unittest.TestCase):
     def test_AC_003_attempt_ids_are_validated_traversal_unknown_and_malformed_ids_are_refused(self):
         """AC-003 attempt ids are validated: traversal, unknown and malformed ids are refused."""
