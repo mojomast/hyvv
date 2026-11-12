@@ -35,14 +35,33 @@
     "bee.usage/v1 records in the artifact payload": "reference",
     "GET /v1/version capabilities list": "specified",
     "bee-slot leases (capability leases, 429 capacity_exhausted)": "specified",
-    "project_parked refusal (409)": "proposed"
+    "project_parked refusal (409)": "proposed",
+    "coordinator-signed briefs (HMAC over the canonical brief with the per-coordinator key, verified at settle)": "proposed"
   },
   "reference_evidence": {
-    "GET /v1/attempts/{attempt_id}/artifact": ["ArtifactStore.get_artifact", "AC001SucceededArtifact"],
-    "artifact_fetch (hyvv.worker-artifact/1)": ["ArtifactStore.get_artifact", "AC001SucceededArtifact"],
-    "per-coordinator keys plus per-attempt artifact capability": ["ArtifactStore.create_attempt", "AC010Capability"],
-    "result_sha256 pinned on first read": ["ArtifactStore._get", "AC008Restart"],
-    "owner-only result files (POSIX 0600, Windows owner-only ACL)": ["ArtifactStore._write_result", "PrivateFiles"],
-    "bee.usage/v1 records in the artifact payload": ["ArtifactStore._build_payload", "AC001SucceededArtifact"]
+    "GET /v1/attempts/{attempt_id}/artifact": [
+      "ArtifactStore.get_artifact",
+      "AC001SucceededArtifact"
+    ],
+    "artifact_fetch (hyvv.worker-artifact/1)": [
+      "ArtifactStore.get_artifact",
+      "AC001SucceededArtifact"
+    ],
+    "per-coordinator keys plus per-attempt artifact capability": [
+      "ArtifactStore.create_attempt",
+      "AC010Capability"
+    ],
+    "result_sha256 pinned on first read": [
+      "ArtifactStore._get",
+      "AC008Restart"
+    ],
+    "owner-only result files (POSIX 0600, Windows owner-only ACL)": [
+      "ArtifactStore._write_result",
+      "PrivateFiles"
+    ],
+    "bee.usage/v1 records in the artifact payload": [
+      "ArtifactStore._build_payload",
+      "AC001SucceededArtifact"
+    ]
   }
 }

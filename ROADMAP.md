@@ -163,6 +163,13 @@ reboot handled, update + rollback works.
 - [ ] Optional outbound-dial mode for hosts without a tailnet (Coder/Daytona
       style), behind a capability flag.
 - [ ] winget and Scoop manifests; `.deb`/`.rpm` if users ask.
+- [ ] Coordinator-signed briefs (proposed): the coordinator sends an HMAC over
+      the canonical brief (including `assigned_files` and `source_rev`) made
+      with its per-coordinator key. hyvv stores it with the attempt, and
+      settle or verify checks it, so a lease rewritten on the worker host is
+      detected. This closes the trust-boundary limitation documented in
+      workflow `contrib/hermes-bees/README.md`, where the work attempt record
+      and the handoff pin both live on the worker host.
 
 ## Phase 4: bees as runners
 
