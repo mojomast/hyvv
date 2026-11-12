@@ -1,7 +1,7 @@
 # Proposal: refuse dispatch to parked or archived projects
 
 Status: **proposed, aligns with workflow docs/18-parking-projects.md (MR.INDIA, in progress)**.
-Not implemented in launcher v0.1.15. This is not yet a `/v1` planned endpoint; it is a proposed additive check on `POST /v1/attempts`.
+Not implemented in launcher v0.1.15. **Update:** the gate is now implemented in the `/v1` reference (`contract/v1/project_state.py`, tests in `contract/v1/tests/test_project_state_gate.py`); see `contract/v1/README.md`. This file is the original proposal.
 
 ## Rule
 

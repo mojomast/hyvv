@@ -38,18 +38,6 @@
     "worker_disconnected"
   ],
   "default_artifact_max_bytes": 8388608,
-  "proposed": {
-    "aligns_with": "workflow docs/18-parking-projects.md (MR.INDIA, in progress)",
-    "http": {
-      "400": [
-        "override_reason_required",
-        "invalid_project_state"
-      ],
-      "409": [
-        "project_parked"
-      ]
-    }
-  },
   "planned": {
     "leases": {
       "status": "specified; not implemented in launcher 0.1.15 or the reference (x-hyvv-status: specified)",
@@ -66,5 +54,29 @@
         "ci_cap": 2
       }
     }
+  },
+  "project_state": {
+    "status": "reference (x-hyvv-status: reference); not in launcher 0.1.15",
+    "spec": "workflow docs/18-parking-projects.md at mojomast/workflow 2bcf0c5 (feat/park-project)",
+    "http": {
+      "400": [
+        "invalid_project_state",
+        "override_reason_required"
+      ],
+      "403": [
+        "project_not_authorized"
+      ],
+      "409": [
+        "project_parked",
+        "project_archived",
+        "project_state_changed"
+      ]
+    },
+    "invalid_project_state_details": [
+      "snapshot_path_invalid",
+      "snapshot_path_symlink",
+      "snapshot_path_escape",
+      "snapshot_missing"
+    ]
   }
 }

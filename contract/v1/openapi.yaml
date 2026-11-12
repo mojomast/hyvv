@@ -157,15 +157,25 @@ paths:
                   description: >
                     Ignored for authorization. The owning coordinator is the
                     principal authenticated by the request's coordinator key.
+                project_state_generation:
+                  type: integer
+                  minimum: 0
+                  description: >
+                    Reference only (x-hyvv-status reference; not launcher 0.1.15).
+                    Required with `project`: the `generation` of
+                    .workflow/project-state.json the dispatcher gated on (0 when the
+                    file is absent). hyvv re-reads the file and refuses with 409
+                    project_state_changed if it differs (workflow docs/18, AC-PARK-22).
                 project_parked_override:
                   type: boolean
                   description: >
-                    Proposed, aligns with workflow docs/18-parking-projects.md
-                    (MR.INDIA, in progress). Required, together with a reason,
-                    to create an attempt on a parked or archived project.
+                    Reference only. Together with a non-empty reason, allows an
+                    attempt on a parked or archived project. Attributed to the
+                    authenticated principal and persisted. Does not bypass an
+                    invalid state file or a generation mismatch.
                 project_parked_override_reason:
                   type: string
-                  description: Required when project_parked_override is true. Recorded on the attempt.
+                  description: Required (non-empty) when project_parked_override is true. Persisted with the override.
       responses:
         "200":
           description: Existing attempt (idempotent replay)
@@ -184,18 +194,26 @@ paths:
               schema:
                 $ref: schemas/attempt.json
         "400":
-          description: Invalid brief or attempt_id
+          description: >
+            Invalid brief or attempt_id. Reference only: invalid_project_state
+            (the state file is present but invalid, unreadable, oversized, a
+            symlink, or its snapshot_path fails containment; `detail` is one of
+            snapshot_path_invalid, snapshot_path_symlink, snapshot_path_escape,
+            snapshot_missing) and override_reason_required.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
-          description: Project is not authorized on this host
+          description: Project is not authorized on this host (reference code project_not_authorized)
         "409":
           description: >
-            Proposed, aligns with workflow docs/18-parking-projects.md
-            (MR.INDIA, in progress). The project's .workflow/project-state.json
-            has state parked or archived, and no explicit override plus reason
-            was supplied. Error code project_parked.
-          x-proposal: project_parked
+            Reference only (contract/v1/project_state.py; not launcher 0.1.15),
+            per workflow docs/18-parking-projects.md at 2bcf0c5.
+            project_parked or project_archived when the project's
+            .workflow/project-state.json is parked or archived and no override
+            plus reason was given; project_state_changed when
+            project_state_generation is missing or differs from the file, or
+            the file's generation is not its history length.
+          x-hyvv-feature-status: reference
           content:
             application/json:
               schema:
@@ -207,7 +225,9 @@ paths:
                 state: parked
                 reason: waiting on a review
                 at: "2026-11-12T21:00:00Z"
-                by: coordinator
+                by: human:owner
+                project: example-project
+                generation: 2
 
   /v1/attempts/{attempt_id}:
     get:

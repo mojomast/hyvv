@@ -28,9 +28,9 @@ Four labels, one per endpoint and feature. `STATUS.json` is the source, every `o
 | Status | Endpoints | Features |
 | --- | --- | --- |
 | **Implemented in launcher 0.1.15** (`launcher-0.1.15`) | `GET /v1/health`, `GET /v1/attempts`, `POST /v1/attempts`, `GET /v1/attempts/{attempt_id}`, `GET /v1/attempts/{attempt_id}/events`, `GET /v1/attempts/{attempt_id}/result`, `POST /v1/attempts/{attempt_id}/review`, `POST /v1/attempts/{attempt_id}/cancel`, `GET /v1/projects`, `GET /v1/containers`, `POST /v1/config` | host bearer token on every route; priority_routing (deepseek: or priority high to DeepSeek official); go_fallback (automatic DeepSeek fallback on Go limits) |
-| **Implemented in the /v1 reference only** (`reference`) | `GET /v1/attempts/{attempt_id}/artifact` | artifact_fetch (hyvv.worker-artifact/1); per-coordinator keys plus per-attempt artifact capability; result_sha256 pinned on first read; owner-only result files (POSIX 0600, Windows owner-only ACL); bee.usage/v1 records in the artifact payload |
+| **Implemented in the /v1 reference only** (`reference`) | `GET /v1/attempts/{attempt_id}/artifact` | artifact_fetch (hyvv.worker-artifact/1); per-coordinator keys plus per-attempt artifact capability; result_sha256 pinned on first read; owner-only result files (POSIX 0600, Windows owner-only ACL); bee.usage/v1 records in the artifact payload; project-state dispatch gate (409 project_parked / project_archived / project_state_changed, override plus reason, snapshot_path containment) |
 | **Specified, not implemented** (`specified`) | `GET /v1/version`, `GET /v1/leases`, `POST /v1/leases`, `DELETE /v1/leases/{lease_id}`, `POST /v1/leases/{lease_id}/renew` | GET /v1/version capabilities list; bee-slot leases (capability leases, 429 capacity_exhausted) |
-| **Proposed** (`proposed`) | — | project_parked refusal (409); coordinator-signed briefs (HMAC over the canonical brief with the per-coordinator key, verified at settle) |
+| **Proposed** (`proposed`) | — | coordinator-signed briefs (HMAC over the canonical brief with the per-coordinator key, verified at settle) |
 <!-- status:end -->
 
 Auth on implemented routes: `Authorization: Bearer` with the per-host token. The process binds loopback and/or a Tailscale address only.
@@ -60,11 +60,20 @@ Error codes (HTTP → `code`):
 | 502 | `artifact_malformed` |
 | 503 | `worker_disconnected` (retryable) |
 
-## Proposed: parked or archived projects
+## Project-state dispatch gate (reference only)
 
-**Proposed, aligns with workflow docs/18-parking-projects.md (MR.INDIA, in progress).** Not implemented in launcher v0.1.15.
+Implemented in `project_state.py` and `ArtifactStore.create_attempt` (the `/v1` reference). Launcher 0.1.15 does not enforce it, so the launcher test in `tests/test_project_parked_proposed.py` stays pending. The gate follows workflow `docs/18-parking-projects.md` and `tools/project-state/check.py` at mojomast/workflow `2bcf0c5` (`workflow.project-state/v1`). Tests: `tests/test_project_state_gate.py` (`AC_PARK_*`).
 
-`POST /v1/attempts` would read `.workflow/project-state.json` in the authorized project's repo (`state`, `reason`, `at`, `by`). If `state` is `parked` or `archived`, the host returns **409 `project_parked`** unless the request includes an explicit override plus a reason, both of which are recorded on the attempt. Details: [`proposals/project-parked.md`](proposals/project-parked.md). A pending conformance test lives in `tests/test_project_parked_proposed.py`.
+When `POST /v1/attempts` names a `project`, hyvv reads `.workflow/project-state.json` from that project's configured repo root. It checks, in order:
+
+1. **Authorized project**, or 403 `project_not_authorized`.
+2. **Valid state**, or 400 `invalid_project_state` (fail closed). The file is refused if it is a symlink, `.workflow/` is a symlink, it is over 256 KiB, it is unreadable, it has unknown fields (including the old `changed_at`/`changed_by` names), the transition is not allowed, a resume is not by `human:*`, or the last history entry does not match. `snapshot_path` (required when parked or archived) must be relative, with no empty, `.` or `..` segment, no backslash, and at most 244 characters. No component may be a symlink, the target must be a regular file, and its resolved path must stay inside the repo root. `detail` names the failure: `snapshot_path_invalid`, `snapshot_path_symlink`, `snapshot_path_escape` or `snapshot_missing`. An absent file defaults to `active` at generation 0, and the attempt records `defaulted: true`.
+3. **Generation**, or 409 `project_state_changed`. The file's `generation` must equal its history length, and the request's `project_state_generation` (required) must equal the file's. A park that lands between the dispatcher's read and the start is refused this way.
+4. **State.** `parked` returns 409 `project_parked`, and `archived` returns 409 `project_archived`. The body carries `project`, `state`, `at`, `by`, `reason`, `generation` and `message`. `project_parked_override: true` with a non-empty `project_parked_override_reason` allows the dispatch; a flag without a reason is 400 `override_reason_required`. The override records the authenticated principal (never the `coordinator` request field), the time, the reason, and the state's `state`/`at`/`by`/`reason`/`generation`. It is stored on the attempt and in the owner-only `dispatch-overrides.json` before the attempt is created.
+
+The gate never cancels in-flight attempts. The checks run on every new dispatch; an idempotent replay of an existing `attempt_id` returns the existing attempt.
+
+Spec difference to flag: docs/18 §7 proposes one code, `project_parked`, for both states (with `state` in the body). This reference returns `project_archived` for archived projects, as Kyle's 5:37 PM request specified. It also returns `project_state_changed` (not `invalid_project_state`) when the file's generation does not equal its history length.
 
 ## Specified, not implemented: bee-slot leases
 

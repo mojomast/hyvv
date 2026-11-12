@@ -33,9 +33,9 @@
     "result_sha256 pinned on first read": "reference",
     "owner-only result files (POSIX 0600, Windows owner-only ACL)": "reference",
     "bee.usage/v1 records in the artifact payload": "reference",
+    "project-state dispatch gate (409 project_parked / project_archived / project_state_changed, override plus reason, snapshot_path containment)": "reference",
     "GET /v1/version capabilities list": "specified",
     "bee-slot leases (capability leases, 429 capacity_exhausted)": "specified",
-    "project_parked refusal (409)": "proposed",
     "coordinator-signed briefs (HMAC over the canonical brief with the per-coordinator key, verified at settle)": "proposed"
   },
   "reference_evidence": {
@@ -62,6 +62,10 @@
     "bee.usage/v1 records in the artifact payload": [
       "ArtifactStore._build_payload",
       "AC001SucceededArtifact"
+    ],
+    "project-state dispatch gate (409 project_parked / project_archived / project_state_changed, override plus reason, snapshot_path containment)": [
+      "ArtifactStore._gate_project",
+      "AC_PARK_Dispatch"
     ]
   }
 }

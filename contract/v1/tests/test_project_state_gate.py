@@ -181,7 +181,7 @@ class AC_PARK_Generation(Gate):
         self.assertRefused(self.create(generation=1), 409, "project_state_changed")
 
     def test_file_generation_must_equal_history_length(self):
-        for bad in (1, 3, 0, None, "2"):
+        for bad in (1, 2, 4, 0, None, "3"):
             with self.subTest(generation=bad):
                 self.write(_doc("active", "parked", "active", generation=bad) if bad is not None
                            else {k: v for k, v in _doc("active", "parked", "active").items() if k != "generation"})
@@ -269,6 +269,22 @@ class AC_PARK_SnapshotPath(Gate):
         self.write(_doc("active", "parked", snapshot_path="docs/PARKED.md"))
         aid, st, body = self.create(generation=2, project_parked_override=True, project_parked_override_reason="ok")
         self.assertEqual(st, 201, body)
+
+
+
+class AC_PARK_Published(unittest.TestCase):
+    def test_error_codes_json_matches_the_gate(self):
+        codes = json.loads((ROOT / "contract/v1/error_codes.json").read_text(encoding="utf-8"))["project_state"]
+        published = {c: int(h) for h, cs in codes["http"].items() for c in cs}
+        self.assertEqual(published, PS.PARK_HTTP)
+
+    def test_status_label_is_reference_and_backed_by_these_tests(self):
+        status = json.loads((ROOT / "contract/v1/STATUS.json").read_text(encoding="utf-8"))
+        key = next(k for k in status["features"] if k.startswith("project-state dispatch gate"))
+        self.assertEqual(status["features"][key], "reference")
+        self.assertEqual(status["reference_evidence"][key], ["ArtifactStore._gate_project", "AC_PARK_Dispatch"])
+        launcher = (ROOT / "launcher.py").read_text(encoding="utf-8")
+        self.assertNotIn("project_state_generation", launcher, "relabel launcher-0.1.15 if the launcher gains the gate")
 
 
 if __name__ == "__main__":

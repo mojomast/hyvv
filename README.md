@@ -26,17 +26,17 @@ The `/v1` contract in `contract/v1` is the source of truth going forward:
 - Semver: `/v1` only ever gets additive changes. A breaking change is `/v2`, served alongside `/v1` for one release
 - Conformance tests, including artifact acceptance criteria `AC-001`–`AC-010`
 
-A proposed additive check, **not yet planned**, would refuse `POST /v1/attempts` for projects whose `.workflow/project-state.json` is `parked` or `archived` (409 `project_parked`) unless the caller supplies an explicit override plus a reason. It is marked “proposed, aligns with workflow docs/18-parking-projects.md (MR.INDIA, in progress).” See [`contract/v1/proposals/project-parked.md`](contract/v1/proposals/project-parked.md).
+The project-state dispatch gate from workflow `docs/18-parking-projects.md` is implemented in the `/v1` reference only, not in launcher 0.1.15. `POST /v1/attempts` with a `project` reads that project's `.workflow/project-state.json` and refuses parked or archived projects (409 `project_parked` / `project_archived`), unless an override flag plus a reason is given. The override is persisted and attributed to the authenticated caller. It also requires `project_state_generation` (409 `project_state_changed`), fails closed on invalid files, and checks `snapshot_path` containment. See [`contract/v1/README.md`](contract/v1/README.md#project-state-dispatch-gate-reference-only).
 
-Nothing below the first row ships in the launcher yet. `GET /v1/attempts/{attempt_id}/artifact` is implemented and tested only in the `/v1` reference (`contract/v1/reference.py`); `GET /v1/version` and `/v1/leases` are specified but unimplemented; parking is proposed. Coordinators should not read raw result files or runtime paths; they should use the artifact endpoint once the launcher ships it.
+Nothing below the first row ships in the launcher yet. `GET /v1/attempts/{attempt_id}/artifact` is implemented and tested only in the `/v1` reference (`contract/v1/reference.py`); `GET /v1/version` and `/v1/leases` are specified but unimplemented; the project-state gate (parking) is reference-only. Coordinators should not read raw result files or runtime paths; they should use the artifact endpoint once the launcher ships it.
 
 <!-- status:begin (generated from contract/v1/STATUS.json; python -m contract.v1.status --write) -->
 | Status | Endpoints | Features |
 | --- | --- | --- |
 | **Implemented in launcher 0.1.15** (`launcher-0.1.15`) | `GET /v1/health`, `GET /v1/attempts`, `POST /v1/attempts`, `GET /v1/attempts/{attempt_id}`, `GET /v1/attempts/{attempt_id}/events`, `GET /v1/attempts/{attempt_id}/result`, `POST /v1/attempts/{attempt_id}/review`, `POST /v1/attempts/{attempt_id}/cancel`, `GET /v1/projects`, `GET /v1/containers`, `POST /v1/config` | host bearer token on every route; priority_routing (deepseek: or priority high to DeepSeek official); go_fallback (automatic DeepSeek fallback on Go limits) |
-| **Implemented in the /v1 reference only** (`reference`) | `GET /v1/attempts/{attempt_id}/artifact` | artifact_fetch (hyvv.worker-artifact/1); per-coordinator keys plus per-attempt artifact capability; result_sha256 pinned on first read; owner-only result files (POSIX 0600, Windows owner-only ACL); bee.usage/v1 records in the artifact payload |
+| **Implemented in the /v1 reference only** (`reference`) | `GET /v1/attempts/{attempt_id}/artifact` | artifact_fetch (hyvv.worker-artifact/1); per-coordinator keys plus per-attempt artifact capability; result_sha256 pinned on first read; owner-only result files (POSIX 0600, Windows owner-only ACL); bee.usage/v1 records in the artifact payload; project-state dispatch gate (409 project_parked / project_archived / project_state_changed, override plus reason, snapshot_path containment) |
 | **Specified, not implemented** (`specified`) | `GET /v1/version`, `GET /v1/leases`, `POST /v1/leases`, `DELETE /v1/leases/{lease_id}`, `POST /v1/leases/{lease_id}/renew` | GET /v1/version capabilities list; bee-slot leases (capability leases, 429 capacity_exhausted) |
-| **Proposed** (`proposed`) | — | project_parked refusal (409); coordinator-signed briefs (HMAC over the canonical brief with the per-coordinator key, verified at settle) |
+| **Proposed** (`proposed`) | — | coordinator-signed briefs (HMAC over the canonical brief with the per-coordinator key, verified at settle) |
 <!-- status:end -->
 
 ## Install

@@ -31,8 +31,10 @@ from typing import Any
 
 try:
     from .privatefs import write_private
+    from .project_state import DispatchRefused, check_dispatch
 except ImportError:  # loaded by path
     from contract.v1.privatefs import write_private
+    from contract.v1.project_state import DispatchRefused, check_dispatch
 
 SCHEMA = "hyvv.worker-artifact/1"
 DEFAULT_MAX_BYTES = 8 * 1024 * 1024  # 8 MiB
@@ -95,7 +97,8 @@ class ArtifactStore:
     """Coordinator-only artifact store with first-read pinning and safe files."""
 
     def __init__(self, root: Path | None = None, max_bytes: int | None = None, *,
-                 principals: dict[str, str] | None = None, capability_ttl_s: float | None = None, clock=time.time):
+                 principals: dict[str, str] | None = None, capability_ttl_s: float | None = None, clock=time.time,
+                 project_roots: dict[str, Path | str] | None = None):
         self.root = Path(root or tempfile.mkdtemp(prefix="hyvv-artifact-"))
         self.results = self.root / "results"
         self.results.mkdir(parents=True, exist_ok=True)
@@ -114,8 +117,13 @@ class ArtifactStore:
         self.bodies: dict[str, bytes] = {}  # in-memory cache of pinned response bytes (not persisted)
         self.disconnected = False
         self.logs: list[str] = []
+        # Project name -> primary repo root holding .workflow/project-state.json.
+        self.project_roots = {k: Path(v) for k, v in (project_roots or {}).items()}
+        self.override_path = self.root / "dispatch-overrides.json"
+        self.overrides: dict[str, dict[str, Any]] = {}
         self._load_pins()
         self._load_caps()
+        self._load_overrides()
 
     def _load_pins(self) -> None:
         if not self.pin_path.exists():
@@ -139,6 +147,32 @@ class ArtifactStore:
     def _save_pins(self) -> None:
         payload = {"pins": self.pins}
         write_private(self.pin_path, json.dumps(payload, indent=1).encode("utf-8"))
+
+    def _load_overrides(self) -> None:
+        if not self.override_path.exists():
+            return
+        try:
+            self.overrides = dict(json.loads(self.override_path.read_text(encoding="utf-8")).get("overrides") or {})
+        except Exception:
+            self.overrides = {}
+
+    def _save_overrides(self) -> None:
+        write_private(self.override_path, json.dumps({"overrides": self.overrides}, indent=1).encode("utf-8"))
+
+    def _gate_project(self, project: Any, owner: str, attempt_id: str, *, generation: Any, override: Any,
+                      override_reason: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """workflow.project-state/v1 gate (docs/18). Raises DispatchRefused; never cancels anything."""
+        if not isinstance(project, str) or project not in self.project_roots:
+            raise DispatchRefused(403, "project_not_authorized", "project is not authorized on this host")
+        rec = check_dispatch(self.project_roots[project], project, generation=generation,
+                             override=override, override_reason=override_reason)
+        ov = None
+        if "override_reason" in rec:
+            ov = {"reason": rec.pop("override_reason"), "by": owner,
+                  "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock())),
+                  "project": project, "state": rec["state"], "generation": rec["generation"],
+                  "state_at": rec["at"], "state_by": rec["by"], "state_reason": rec["reason"]}
+        return rec, ov
 
     # --- principals and capabilities -------------------------------------
     def _load_caps(self) -> None:
@@ -181,12 +215,32 @@ class ArtifactStore:
             self._validate_id(attempt_id)
         except ArtifactError as exc:
             return exc.http, exc.body()
+        kwargs.pop("coordinator", None)  # deprecated request field; never used for auth or attribution
+        project = kwargs.pop("project", None)
+        generation = kwargs.pop("project_state_generation", None)
+        override = kwargs.pop("project_parked_override", False)
+        override_reason = kwargs.pop("project_parked_override_reason", None)
         if attempt_id in self.attempts:
             a = self.attempts[attempt_id]
             if a["coordinator"] != owner:
                 return 403, ArtifactError("not_owner").body()
             return 200, {"attempt_id": attempt_id, "state": a["state"]}  # idempotent re-submit: no capability again
+        gate = ov = None
+        if project is not None:
+            try:
+                gate, ov = self._gate_project(project, owner, attempt_id, generation=generation,
+                                              override=override, override_reason=override_reason)
+            except DispatchRefused as exc:
+                return exc.http, exc.body()
+            if ov is not None:
+                self.overrides[attempt_id] = ov
+                self._save_overrides()  # persisted before the attempt exists
         cap = self.add_attempt(attempt_id, coordinator=owner, state=state, source_rev=source_rev, **kwargs)
+        if gate is not None:
+            self.attempts[attempt_id]["project"] = project
+            self.attempts[attempt_id]["project_state"] = gate
+            if ov is not None:
+                self.attempts[attempt_id]["project_parked_override"] = ov
         out = {"attempt_id": attempt_id, "state": state, "artifact_capability": cap}
         exp = self.caps[attempt_id]["expires_at"]
         if exp:
