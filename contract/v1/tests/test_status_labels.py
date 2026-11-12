@@ -52,6 +52,10 @@ class Labels(unittest.TestCase):
         for k, v in {**S.STATUS["endpoints"], **S.STATUS["features"]}.items():
             self.assertIn(v, LABELS, k)
 
+    def test_version_is_labelled_implemented_in_the_launcher(self):
+        self.assertEqual(S.STATUS["endpoints"]["GET /v1/version"], "launcher-0.1.15")
+        self.assertEqual(S.STATUS["features"]["GET /v1/version capabilities list"], "launcher-0.1.15")
+
     def test_openapi_matches_status_json(self):
         ops = openapi_ops()
         self.assertEqual(ops, S.STATUS["endpoints"])

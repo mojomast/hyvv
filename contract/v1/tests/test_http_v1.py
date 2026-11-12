@@ -216,12 +216,20 @@ class ReadEndpoints(unittest.TestCase):
         st, _ = T.request("GET", "/v1/no-such-route")
         self.assertEqual(st, 404)
 
-    def test_version_when_implemented(self):
+    def test_version_returns_package_and_contract_versions(self):
         st, b = T.request("GET", "/v1/version")
-        if st == 404:
-            self.skipTest("GET /v1/version is planned, not implemented by this host")
         self.assertEqual(st, 200)
         self.assertEqual(_schema_errors(_schema("version.json"), b), [])
+        self.assertEqual(b["api_version"], "v1")
+        self.assertIsInstance(b["version"], str)
+        self.assertTrue(b["version"])
+        self.assertIn("priority_routing", b["capabilities"])
+        self.assertIn("go_fallback", b["capabilities"])
+
+    def test_version_requires_auth(self):
+        st, b = T.request("GET", "/v1/version", token=None)
+        self.assertEqual(st, 401)
+        self.assertIsInstance(b.get("error"), str)
 
 
 class RejectedWrites(unittest.TestCase):
