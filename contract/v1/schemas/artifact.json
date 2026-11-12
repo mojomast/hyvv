@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mojomast/hyvv/main/contract/v1/schemas/artifact.json",
+  "title": "hyvv.worker-artifact/1",
+  "description": "Coordinator-only artifact returned by GET /v1/attempts/{attempt_id}/artifact. source_rev is the brief's revision (trusted). Patch content is untrusted; patch_sha256 is the sha256 of the exact patch text. result_sha256 is pinned on first successful read. The response never contains host names, URLs, IPs, or runtime/work-dir paths.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "attempt_id",
+    "state",
+    "source_rev",
+    "patch",
+    "patch_sha256",
+    "result_sha256",
+    "observed",
+    "usage",
+    "usage_status",
+    "worker_claims_untrusted"
+  ],
+  "properties": {
+    "schema": {
+      "const": "hyvv.worker-artifact/1"
+    },
+    "attempt_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "state": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_rev": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "From the brief, not from the worker."
+    },
+    "patch": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "patch_sha256": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      ]
+    },
+    "result_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "observed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "base_rev",
+        "tool_calls",
+        "stop_reason",
+        "files",
+        "scope_flags"
+      ],
+      "properties": {
+        "base_rev": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tool_calls": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "stop_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path"
+            ],
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Repo-relative path only. Never an absolute or host path."
+              },
+              "sha256": {
+                "anyOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  }
+                ]
+              },
+              "change": {
+                "enum": [
+                  "added",
+                  "changed",
+                  "deleted",
+                  null
+                ]
+              },
+              "size": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "in_assigned_scope": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            }
+          }
+        },
+        "scope_flags": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "has_assigned_scope",
+            "all_in_scope",
+            "scope_violation"
+          ],
+          "properties": {
+            "has_assigned_scope": {
+              "type": "boolean"
+            },
+            "all_in_scope": {
+              "type": "boolean"
+            },
+            "scope_violation": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "usage": {
+      "description": "A bee.usage/v1 record, or null when usage is unknown.",
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "usage.json"
+        }
+      ]
+    },
+    "usage_status": {
+      "enum": [
+        "known",
+        "partial",
+        "unknown"
+      ],
+      "description": "Must be unknown when usage is null. Never invent a 0 for unknown counters."
+    },
+    "worker_claims_untrusted": {
+      "description": "The worker's own summary. Never evidence.",
+      "type": [
+        "object",
+        "string",
+        "null"
+      ]
+    }
+  }
+}

@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mojomast/hyvv/main/contract/v1/schemas/attempt.json",
+  "title": "hyvv.v1 attempt (public / listing)",
+  "description": "Public attempt fields returned by GET/POST /v1/attempts. Listing also includes lease fields needed for overlap checks. These objects must never include patch text, brief objective text, host names, or runtime paths.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "attempt_id",
+    "state"
+  ],
+  "properties": {
+    "attempt_id": {
+      "type": "string"
+    },
+    "kind": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mode": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tier": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "state": {
+      "type": "string"
+    },
+    "detail": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sandbox": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Sandbox name, never a host path."
+    },
+    "created_at": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "updated_at": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "lseq": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "queue_position": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "retry_at": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "rate_limited": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "fallback": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "pool": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model_history": {
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "project": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "branch": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "assigned_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reviewed": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "accepted": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "coordinator": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Owning coordinator. Planned for artifact auth."
+    },
+    "result_available": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "log_available": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "project_parked_override": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "Proposed. True when this attempt was created with an explicit override of a parked or archived project."
+    },
+    "project_parked_override_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Proposed. Reason recorded with the override."
+    },
+    "project_state": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Proposed. Snapshot of .workflow/project-state.json at override time."
+    }
+  }
+}

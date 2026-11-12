@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mojomast/hyvv/main/contract/v1/schemas/error.json",
+  "title": "hyvv.v1 error",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "code",
+    "error"
+  ],
+  "properties": {
+    "code": {
+      "type": "string",
+      "enum": [
+        "invalid_attempt_id",
+        "unauthorized",
+        "not_owner",
+        "unknown_attempt",
+        "result_missing",
+        "result_pending",
+        "no_result_for_state",
+        "artifact_mismatch",
+        "artifact_changed",
+        "artifact_unsafe",
+        "artifact_oversized",
+        "artifact_malformed",
+        "worker_disconnected",
+        "project_parked",
+        "override_reason_required",
+        "invalid_project_state",
+        "capacity_exhausted"
+      ]
+    },
+    "error": {
+      "type": "string",
+      "enum": [
+        "invalid_attempt_id",
+        "unauthorized",
+        "not_owner",
+        "unknown_attempt",
+        "result_missing",
+        "result_pending",
+        "no_result_for_state",
+        "artifact_mismatch",
+        "artifact_changed",
+        "artifact_unsafe",
+        "artifact_oversized",
+        "artifact_malformed",
+        "worker_disconnected",
+        "project_parked",
+        "override_reason_required",
+        "invalid_project_state",
+        "capacity_exhausted"
+      ]
+    },
+    "message": {
+      "type": "string"
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "state": {
+      "type": "string"
+    }
+  }
+}

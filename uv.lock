@@ -1,0 +1,30 @@
+version = 1
+revision = 5
+requires-python = ">=3.12"
+
+[[package]]
+name = "cua"
+version = "0.5.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e3/a7/590b6c9209289378eac8d1dd5e5364158676502d664d197737e7a7136fa1/cua-0.5.0-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:a0e0caecfd56327f5421c098fd63591ac046e4f9327c8821bfb104ef5f1c2c0a", size = 77447467, upload-time = "2026-10-19T05:23:39.882Z" },
+    { url = "https://files.pythonhosted.org/packages/97/83/7d1031bf1ac4680f6ed5bff17d3bdb7891c16d97ce17077819ac22c72738/cua-0.5.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:d5a208a443dbae80e441186ce308fb801b37bf0689a4be32a2346f9730f9785b", size = 71948695, upload-time = "2026-10-19T05:23:35.376Z" },
+    { url = "https://files.pythonhosted.org/packages/88/ce/e86abf1fb6d87ef0a71f2c40f38c35a8f152dc04b211df4838ba489c88d5/cua-0.5.0-py3-none-manylinux_2_31_aarch64.whl", hash = "sha256:f7ae88c3e00af0800587fe15380e87669c9db89a5e45cb7a44f90cd81d98924a", size = 83923504, upload-time = "2026-10-19T05:23:44.423Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/ab/ae1b4963b1bae5a86f261be0ca0c6bfe8a57d07f167cc2659028d415700a/cua-0.5.0-py3-none-manylinux_2_31_x86_64.whl", hash = "sha256:bda6f8e45e6738278b5e0e98bd719a5c06acf8cd45d3d43dfec6a3d4e6359a03", size = 82779220, upload-time = "2026-10-19T05:23:49.776Z" },
+    { url = "https://files.pythonhosted.org/packages/cc/7e/b1b20852b1be8f5c8a5995eee600df1b49cb03332fb97c6b2cf985ac3f8f/cua-0.5.0-py3-none-win_amd64.whl", hash = "sha256:54583bccc9f7d0e72f31f778fcf0712b6fd73d2fce306abec0687a31b002b21d", size = 71348369, upload-time = "2026-10-19T05:24:01.198Z" },
+    { url = "https://files.pythonhosted.org/packages/e8/b5/68b1574dd0daf08809d8b41c9a799fee2c9f375782877ab60f5526a8b2b8/cua-0.5.0-py3-none-win_arm64.whl", hash = "sha256:b6a3dda91334931f4561dc84b333d4853adc19ea0c52b9be5d28df6bba771427", size = 65965759, upload-time = "2026-10-19T05:23:56.358Z" },
+]
+
+[[package]]
+name = "hyvv"
+version = "0.1.15"
+source = { editable = "." }
+
+[package.optional-dependencies]
+cua = [
+    { name = "cua" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "cua", marker = "extra == 'cua'", specifier = "==0.5.0" }]
+provides-extras = ["cua", "dev"]

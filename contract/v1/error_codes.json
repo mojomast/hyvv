@@ -1,0 +1,66 @@
+{
+  "http": {
+    "400": [
+      "invalid_attempt_id"
+    ],
+    "401": [
+      "unauthorized"
+    ],
+    "403": [
+      "not_owner"
+    ],
+    "404": [
+      "unknown_attempt",
+      "result_missing"
+    ],
+    "409": [
+      "result_pending",
+      "no_result_for_state",
+      "artifact_mismatch",
+      "artifact_changed",
+      "artifact_unsafe"
+    ],
+    "413": [
+      "artifact_oversized"
+    ],
+    "502": [
+      "artifact_malformed"
+    ],
+    "503": [
+      "worker_disconnected"
+    ]
+  },
+  "retryable": [
+    "worker_disconnected"
+  ],
+  "default_artifact_max_bytes": 8388608,
+  "proposed": {
+    "aligns_with": "workflow docs/18-parking-projects.md (MR.INDIA, in progress)",
+    "http": {
+      "400": [
+        "override_reason_required",
+        "invalid_project_state"
+      ],
+      "409": [
+        "project_parked"
+      ]
+    }
+  },
+  "planned": {
+    "leases": {
+      "status": "planned; not implemented in launcher v0.1.15",
+      "http": {
+        "429": [
+          "capacity_exhausted"
+        ]
+      },
+      "retryable": [
+        "capacity_exhausted"
+      ],
+      "defaults": {
+        "global_cap": 12,
+        "ci_cap": 2
+      }
+    }
+  }
+}

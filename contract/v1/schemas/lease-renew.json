@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mojomast/hyvv/main/contract/v1/schemas/lease-renew.json",
+  "title": "POST /v1/leases/{id}/renew request",
+  "description": "Renew a lease. Planned. If ttl is omitted, the original ttl is applied from now.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "ttl": {
+      "type": "integer",
+      "minimum": 1
+    }
+  }
+}

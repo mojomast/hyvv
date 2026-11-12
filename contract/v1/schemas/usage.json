@@ -1,0 +1,423 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mojomast/hyvv/main/contract/v1/schemas/usage.json",
+  "title": "bee.usage/v1",
+  "description": "Frozen usage record schema bee.usage/v1. Every key is always present. Use null when unknown; never use 0 as a stand-in for unknown usage. Records must not contain prompt or objective text, completions, tool arguments, file contents, hostnames, URLs, IPs, absolute paths, keys or tokens.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "key",
+    "attempt_id",
+    "card_id",
+    "run_id",
+    "project",
+    "role",
+    "join_complete",
+    "verify_of",
+    "retry_of",
+    "ts_start",
+    "ts_end",
+    "duration_s",
+    "queue_s",
+    "trace_id",
+    "requested_model",
+    "served_model",
+    "served_model_source",
+    "provider",
+    "route",
+    "route_source",
+    "fallback",
+    "fallback_reason",
+    "http_429_count",
+    "retry_count",
+    "error_type",
+    "stop_reason",
+    "tool_calls",
+    "usage_status",
+    "input_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "usage_raw",
+    "cost_usd_list",
+    "cost_status",
+    "billing_mode",
+    "price_table_version",
+    "price_period",
+    "go_allowance",
+    "gen_ai.operation.name",
+    "gen_ai.agent.name",
+    "gen_ai.provider.name",
+    "gen_ai.request.model",
+    "gen_ai.response.model",
+    "gen_ai.usage.input_tokens",
+    "gen_ai.usage.cache_read.input_tokens",
+    "gen_ai.usage.cache_write.input_tokens",
+    "gen_ai.usage.output_tokens",
+    "gen_ai.usage.reasoning.output_tokens",
+    "launcher",
+    "harness"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "bee.usage/v1"
+    },
+    "key": {
+      "type": "string",
+      "minLength": 1,
+      "description": "attempt:<attempt_id> or coord:<session_id>:<served_model>"
+    },
+    "attempt_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Coordinator rows use coord:<session_id>."
+    },
+    "card_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "project": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Coordinator rows use beekeeper."
+    },
+    "role": {
+      "enum": [
+        "work",
+        "verify",
+        "coordinator"
+      ]
+    },
+    "join_complete": {
+      "type": "boolean"
+    },
+    "verify_of": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "retry_of": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "ts_start": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "ISO-8601 UTC ending in Z, or null."
+    },
+    "ts_end": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "ISO-8601 UTC ending in Z, or null."
+    },
+    "duration_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "queue_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "trace_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "32 lowercase hex (first 32 hex of sha256(card_id)), or null when card_id is unknown."
+    },
+    "requested_model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "served_model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "served_model_source": {
+      "enum": [
+        "explicit",
+        "inferred",
+        null
+      ]
+    },
+    "provider": {
+      "enum": [
+        "opencode",
+        "deepseek",
+        "unknown"
+      ]
+    },
+    "route": {
+      "enum": [
+        "go",
+        "deepseek",
+        "unknown"
+      ]
+    },
+    "route_source": {
+      "enum": [
+        "explicit",
+        "inferred",
+        null
+      ]
+    },
+    "fallback": {
+      "enum": [
+        "deepseek",
+        null
+      ]
+    },
+    "fallback_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "http_429_count": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "retry_count": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "error_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "stop_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_calls": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "usage_status": {
+      "enum": [
+        "known",
+        "partial",
+        "unknown"
+      ]
+    },
+    "input_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Includes cached reads."
+    },
+    "cache_read_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "cache_write_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "output_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Includes reasoning tokens."
+    },
+    "reasoning_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "usage_raw": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Original usage object, numeric values only, or null."
+    },
+    "cost_usd_list": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "description": "List-price estimate, rounded to 8 places, or null."
+    },
+    "cost_status": {
+      "enum": [
+        "estimated",
+        "actual",
+        "unknown"
+      ]
+    },
+    "billing_mode": {
+      "enum": [
+        "metered",
+        "subscription_allowance",
+        "unknown"
+      ]
+    },
+    "price_table_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "price_period": {
+      "enum": [
+        "peak",
+        "off_peak",
+        null
+      ]
+    },
+    "go_allowance": {
+      "description": "Null unless route is go.",
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "raw",
+            "pct_used",
+            "pct_source",
+            "allowance_usd"
+          ],
+          "properties": {
+            "raw": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "pct_used": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "pct_source": {
+              "enum": [
+                "opencode.allowance",
+                "derived_list_price",
+                null
+              ]
+            },
+            "allowance_usd": {
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "gen_ai.operation.name": {
+      "const": "invoke_agent"
+    },
+    "gen_ai.agent.name": {
+      "enum": [
+        "bee-work",
+        "bee-verify",
+        "beekeeper"
+      ]
+    },
+    "gen_ai.provider.name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "gen_ai.request.model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "gen_ai.response.model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "gen_ai.usage.input_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "gen_ai.usage.cache_read.input_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "gen_ai.usage.cache_write.input_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "gen_ai.usage.output_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "gen_ai.usage.reasoning.output_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "launcher": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "harness": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

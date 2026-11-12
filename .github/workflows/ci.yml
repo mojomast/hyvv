@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, "feat/**"]
+
+# Least privilege at the workflow level; jobs request only what they need.
+permissions: {}
+
+jobs:
+  test:
+    name: test
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
+        python-version: ["3.12", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Sync and test
+        run: |
+          uv sync --frozen --no-dev || uv sync --no-dev
+          uv run python -m unittest discover -s tests -v
+          uv run python -m unittest discover -s contract/v1/tests -v
+
+      - name: Installer dry run
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            pwsh -File scripts/install.ps1 -WhatIf
+          else
+            sh scripts/install.sh --dry-run
+          fi
+
+  scan:
+    name: scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: gitleaks
+        run: |
+          set -euo pipefail
+          ver=8.28.0
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${ver}/gitleaks_${ver}_linux_x64.tar.gz" -o /tmp/gitleaks.tgz
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          /tmp/gitleaks detect --source . --redact --verbose --exit-code 1
+
+      - name: Host and tailnet grep
+        run: bash scripts/scan-secrets.sh
+
+  ci:
+    name: CI
+    if: always()
+    needs: [test, scan]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require test and scan
+        run: |
+          test "${{ needs.test.result }}" = "success"
+          test "${{ needs.scan.result }}" = "success"

@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mojomast/hyvv/main/contract/v1/schemas/lease.json",
+  "title": "hyvv.lease/1",
+  "description": "A bee-slot lease issued by the hyvv host, which is the shared dispatch point for the global cap. Planned in /v1; not implemented in launcher v0.1.15. Orbit and bundlebees are clients.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "coordinator",
+    "project",
+    "role",
+    "count",
+    "purpose",
+    "ttl_s",
+    "expires_at",
+    "created_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque lease id minted by the host."
+    },
+    "coordinator": {
+      "type": "string",
+      "minLength": 1
+    },
+    "project": {
+      "type": "string",
+      "minLength": 1
+    },
+    "role": {
+      "enum": [
+        "work",
+        "verify",
+        "coordinator"
+      ]
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Number of bee slots this lease occupies."
+    },
+    "purpose": {
+      "enum": [
+        "work",
+        "verify",
+        "ci"
+      ]
+    },
+    "ttl_s": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Time to live in seconds from the last acquire or renew."
+    },
+    "expires_at": {
+      "type": "string",
+      "description": "ISO-8601 UTC ending in Z."
+    },
+    "created_at": {
+      "type": "string",
+      "description": "ISO-8601 UTC ending in Z."
+    },
+    "renewed_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

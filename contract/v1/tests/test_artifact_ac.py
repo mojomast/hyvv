@@ -1,0 +1,337 @@
+"""Conformance tests for GET /v1/attempts/{attempt_id}/artifact.
+
+Reuses OA1 acceptance criteria AC-001 through AC-009 and the error codes
+verbatim. These tests run against contract/v1/reference.py because
+artifact_fetch is planned and is not in launcher v0.1.15.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import stat
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
+
+from contract.v1.reference import (  # noqa: E402
+    DEFAULT_MAX_BYTES,
+    ERROR_HTTP,
+    ArtifactStore,
+    usage_unknown_template,
+)
+
+CODES = json.loads((ROOT / "contract/v1/error_codes.json").read_text(encoding="utf-8"))
+TOKEN = "test-token-hyvv-conformance-0001"
+OWNER = "coordinator-a"
+OTHER = "coordinator-b"
+REV = "47f2fc93565a53a767c3ff2d498ebf604fd0b4f9"
+PATCH = "diff --git a/foo.py b/foo.py\n+hello\n"
+
+
+def _manifest(attempt_id="att_deadbeefcafebabe", source_rev=REV, patch=PATCH, files=None, usage=None, extra_observed=None):
+    files = files or [{"path": "foo.py", "sha256": "a" * 64, "change": "changed", "size": 5, "in_assigned_scope": True}]
+    observed = {
+        "local_base_rev": "abc1234",
+        "tool_calls": 3,
+        "stop_reason": "end_turn",
+        "files": files,
+        "usage": {"prompt_tokens": 10},  # legacy blob, not bee.usage/v1
+    }
+    if extra_observed:
+        observed.update(extra_observed)
+    return {
+        "schema": "orbit.local-worker.result/v1",
+        "attempt_id": attempt_id,
+        "source": {"project": "demo", "repo_rev": source_rev, "harness": "opencode", "launcher": "0.1.15"},
+        "observed": observed,
+        "patch": {"diff": patch, "files": files},
+        "worker_claims": {"summary": "did the work"},
+        "note": "worker_claims are self-reported",
+    }
+
+
+def _store(tmp, **kwargs):
+    return ArtifactStore(root=tmp, token=TOKEN, **kwargs)
+
+
+def _get(store, attempt_id, bearer=TOKEN, coordinator=OWNER):
+    return store.get_artifact(attempt_id, bearer=bearer, coordinator=coordinator)
+
+
+def _json(body: bytes):
+    return json.loads(body.decode("utf-8"))
+
+
+class AC001SucceededArtifact(unittest.TestCase):
+    def test_AC_001_succeeded_attempt_patch_sha256_coordinator_source_rev_and_observed_metadata_are_returned(self):
+        """AC-001 succeeded attempt: patch, its sha256, coordinator source_rev and observed metadata are returned."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s = _store(tmp)
+            mid = "att_deadbeefcafebabe"
+            usage = usage_unknown_template(
+                key=f"attempt:{mid}",
+                attempt_id=mid,
+                usage_status="known",
+                input_tokens=10,
+                cache_read_tokens=0,
+                cache_write_tokens=0,
+                output_tokens=4,
+                reasoning_tokens=0,
+                provider="opencode",
+                route="go",
+                go_allowance={"raw": None, "pct_used": None, "pct_source": None, "allowance_usd": None},
+            )
+            man = _manifest(mid)
+            man["usage"] = usage
+            s.add_attempt(mid, coordinator=OWNER, state="succeeded", source_rev=REV, result=man)
+            status, body = _get(s, mid)
+            self.assertEqual(status, 200)
+            art = _json(body)
+            self.assertEqual(art["schema"], "hyvv.worker-artifact/1")
+            self.assertEqual(art["attempt_id"], mid)
+            self.assertEqual(art["state"], "succeeded")
+            self.assertEqual(art["source_rev"], REV)
+            self.assertEqual(art["patch"], PATCH)
+            self.assertEqual(art["patch_sha256"], hashlib.sha256(PATCH.encode()).hexdigest())
+            self.assertEqual(len(art["result_sha256"]), 64)
+            self.assertEqual(art["observed"]["base_rev"], "abc1234")
+            self.assertEqual(art["observed"]["tool_calls"], 3)
+            self.assertEqual(art["observed"]["stop_reason"], "end_turn")
+            self.assertEqual(art["observed"]["files"][0]["path"], "foo.py")
+            self.assertFalse(art["observed"]["scope_flags"]["scope_violation"])
+            self.assertEqual(art["usage"]["schema_version"], "bee.usage/v1")
+            self.assertEqual(art["worker_claims_untrusted"]["summary"], "did the work")
+            dumped = json.dumps(art)
+            self.assertNotRegex(dumped, r"100\.\d+\.\d+\.\d+")
+            self.assertNotIn("/results/", dumped)
+            self.assertNotIn("result_file", dumped)
+            self.assertNotIn("workdir", dumped)
+
+
+class AC002Auth(unittest.TestCase):
+    def test_AC_002_only_the_coordinator_key_on_loopback_and_only_the_owning_coordinator_may_read_an_artifact(self):
+        """AC-002 only the coordinator key on loopback, and only the owning coordinator, may read an artifact."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s = _store(tmp)
+            mid = "att_auth0000000001"
+            s.add_attempt(mid, coordinator=OWNER, state="succeeded", source_rev=REV, result=_manifest(mid))
+            st, body = _get(s, mid, bearer="wrong-token")
+            self.assertEqual(st, 401)
+            self.assertEqual(_json(body)["code"], "unauthorized")
+            self.assertEqual(_json(body)["error"], "unauthorized")
+            st, body = _get(s, mid, bearer=None)
+            self.assertEqual(st, 401)
+            self.assertEqual(_json(body)["code"], "unauthorized")
+            st, body = _get(s, mid, coordinator=OTHER)
+            self.assertEqual(st, 403)
+            self.assertEqual(_json(body)["code"], "not_owner")
+            self.assertEqual(_json(body)["error"], "not_owner")
+            st, body = _get(s, mid, coordinator=None)
+            self.assertEqual(st, 403)
+            self.assertEqual(_json(body)["code"], "not_owner")
+            st, body = _get(s, mid)
+            self.assertEqual(st, 200)
+
+
+class AC003Ids(unittest.TestCase):
+    def test_AC_003_attempt_ids_are_validated_traversal_unknown_and_malformed_ids_are_refused(self):
+        """AC-003 attempt ids are validated: traversal, unknown and malformed ids are refused."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s = _store(tmp)
+            for bad in ("../etc/passwd", "att_/../../secret", "short", "bad id", "att_" + "a" * 80, ""):
+                st, body = _get(s, bad)
+                self.assertEqual(st, 400, bad)
+                self.assertEqual(_json(body)["code"], "invalid_attempt_id")
+                self.assertEqual(_json(body)["error"], "invalid_attempt_id")
+            st, body = _get(s, "att_missing00000001")
+            self.assertEqual(st, 404)
+            self.assertEqual(_json(body)["code"], "unknown_attempt")
+            # Nothing outside the results dir should have been read or created.
+            self.assertEqual(list(s.results.glob("*")), [])
+
+
+class AC004States(unittest.TestCase):
+    def test_AC_004_pending_disconnected_and_patchless_states_are_explicit(self):
+        """AC-004 pending, disconnected and patchless states are explicit."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s = _store(tmp)
+            s.add_attempt("att_pending00000001", coordinator=OWNER, state="running", source_rev=REV)
+            st, body = _get(s, "att_pending00000001")
+            self.assertEqual(st, 409)
+            self.assertEqual(_json(body)["code"], "result_pending")
+
+            s.disconnected = True
+            st, body = _get(s, "att_pending00000001")
+            self.assertEqual(st, 503)
+            self.assertEqual(_json(body)["code"], "worker_disconnected")
+            self.assertTrue(_json(body)["retryable"])
+            s.disconnected = False
+
+            s.add_attempt("att_cancelled000001", coordinator=OWNER, state="cancelled", source_rev=REV)
+            st, body = _get(s, "att_cancelled000001")
+            self.assertEqual(st, 409)
+            self.assertEqual(_json(body)["code"], "no_result_for_state")
+
+            mid = "att_nullpatch000001"
+            man = _manifest(mid, patch=None)
+            man["patch"] = None
+            s.add_attempt(mid, coordinator=OWNER, state="failed", source_rev=REV, result=man)
+            st, body = _get(s, mid)
+            self.assertEqual(st, 200)
+            art = _json(body)
+            self.assertIsNone(art["patch"])
+            self.assertIsNone(art["patch_sha256"])
+
+
+class AC005Missing(unittest.TestCase):
+    def test_AC_005_missing_results_are_refetched_once_from_the_launcher_still_missing_and_unreachable_are_explicit(self):
+        """AC-005 missing results are refetched once from the launcher (restart recovery); still-missing and unreachable are explicit.
+
+        On the hyvv host itself a missing result file is 404 result_missing.
+        An adapter (Orbit) may refetch once; if the host is down that is
+        503 worker_disconnected.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            s = _store(tmp)
+            mid = "att_missingresult01"
+            s.add_attempt(mid, coordinator=OWNER, state="succeeded", source_rev=REV, result=_manifest(mid))
+            (s.results / f"{mid}.result.json").unlink()
+            st, body = _get(s, mid)
+            self.assertEqual(st, 404)
+            self.assertEqual(_json(body)["code"], "result_missing")
+            s.disconnected = True
+            st, body = _get(s, mid)
+            self.assertEqual(st, 503)
+            self.assertEqual(_json(body)["code"], "worker_disconnected")
+            self.assertTrue(_json(body).get("retryable"))
+
+
+class AC006Unsafe(unittest.TestCase):
+    def test_AC_006_malformed_oversized_and_symlinked_result_files_are_refused(self):
+        """AC-006 malformed, oversized and symlinked result files are refused."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s = _store(tmp)
+            mid = "att_malformed000001"
+            s.add_attempt(mid, coordinator=OWNER, state="succeeded", source_rev=REV, result_bytes=b"not-json{")
+            st, body = _get(s, mid)
+            self.assertEqual(st, 502)
+            self.assertEqual(_json(body)["code"], "artifact_malformed")
+
+            mid = "att_symlink00000001"
+            s.add_attempt(mid, coordinator=OWNER, state="succeeded", source_rev=REV, symlink=True)
+            st, body = _get(s, mid)
+            self.assertEqual(st, 409)
+            self.assertEqual(_json(body)["code"], "artifact_unsafe")
+            self.assertNotIn("secret", body.decode())
+
+    def test_AC_006b_oversized_artifacts_are_refused_before_parsing(self):
+        """AC-006b oversized artifacts are refused before parsing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s = _store(tmp, max_bytes=64)
+            mid = "att_oversized000001"
+            s.add_attempt(mid, coordinator=OWNER, state="succeeded", source_rev=REV, result_bytes=b"x" * 128)
+            st, body = _get(s, mid)
+            self.assertEqual(st, 413)
+            self.assertEqual(_json(body)["code"], "artifact_oversized")
+            self.assertEqual(ERROR_HTTP["artifact_oversized"], 413)
+            self.assertEqual(CODES["default_artifact_max_bytes"], DEFAULT_MAX_BYTES)
+            self.assertEqual(DEFAULT_MAX_BYTES, 8 * 1024 * 1024)
+
+
+class AC007Binding(unittest.TestCase):
+    def test_AC_007_artifacts_are_bound_to_their_attempt_and_source_rev_and_substitution_after_first_read_is_refused(self):
+        """AC-007 artifacts are bound to their attempt and source_rev, and substitution after first read is refused."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s = _store(tmp)
+            mid = "att_bound0000000001"
+            s.add_attempt(mid, coordinator=OWNER, state="succeeded", source_rev=REV, result=_manifest(mid))
+            st, first = _get(s, mid)
+            self.assertEqual(st, 200)
+            st, second = _get(s, mid)
+            self.assertEqual(st, 200)
+            self.assertEqual(first, second)  # byte-identical
+
+            other = _manifest("att_someoneelse0001", source_rev=REV)
+            path = s.results / f"{mid}.result.json"
+            path.write_bytes(json.dumps(other).encode())
+            st, body = _get(s, mid)
+            # The bytes changed, so either artifact_changed (pin) or artifact_mismatch (id).
+            self.assertEqual(st, 409)
+            self.assertIn(_json(body)["code"], ("artifact_changed", "artifact_mismatch"))
+
+            mid2 = "att_revmismatch0001"
+            s.add_attempt(
+                mid2, coordinator=OWNER, state="succeeded", source_rev=REV,
+                result=_manifest(mid2, source_rev="0" * 40),
+            )
+            st, body = _get(s, mid2)
+            self.assertEqual(st, 409)
+            self.assertEqual(_json(body)["code"], "artifact_mismatch")
+
+
+class AC008Restart(unittest.TestCase):
+    def test_AC_008_the_first_read_hash_survives_an_Orbit_restart_idempotent_substitution_still_detected(self):
+        """AC-008 the first-read hash survives an Orbit restart (idempotent, substitution still detected)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s = _store(tmp)
+            mid = "att_restart00000001"
+            man = _manifest(mid)
+            s.add_attempt(mid, coordinator=OWNER, state="succeeded", source_rev=REV, result=man)
+            st, first = _get(s, mid)
+            self.assertEqual(st, 200)
+            pinned = _json(first)["result_sha256"]
+
+            s2 = _store(tmp)  # new process, same data dir
+            s2.add_attempt(mid, coordinator=OWNER, state="succeeded", source_rev=REV)  # metadata only; file still there
+            st, again = _get(s2, mid)
+            self.assertEqual(st, 200)
+            self.assertEqual(again, first)
+            self.assertEqual(_json(again)["result_sha256"], pinned)
+
+            # Substitute the result file after the restart; the pin must still refuse it.
+            changed = _manifest(mid, patch=PATCH + "+extra\n")
+            (s2.results / f"{mid}.result.json").write_text(json.dumps(changed), encoding="utf-8")
+            st, body = _get(s2, mid)
+            self.assertEqual(st, 409)
+            self.assertEqual(_json(body)["code"], "artifact_changed")
+
+
+class AC009NoLeak(unittest.TestCase):
+    def test_AC_009_raw_patches_stay_out_of_list_get_responses_and_logs_result_files_are_private(self):
+        """AC-009 raw patches stay out of list/get responses and logs; result files are private."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s = _store(tmp)
+            mid = "att_noleak000000001"
+            s.add_attempt(mid, coordinator=OWNER, state="succeeded", source_rev=REV, result=_manifest(mid))
+            st, body = _get(s, mid)
+            self.assertEqual(st, 200)
+            listing = json.dumps(s.list_attempts())
+            got = json.dumps(s.get_attempt(mid))
+            logs = "\n".join(s.log_lines())
+            for blob in (listing, got, logs):
+                self.assertNotIn(PATCH, blob)
+                self.assertNotIn("+hello", blob)
+                self.assertNotIn(str(s.results), blob)
+                self.assertNotIn("/results/", blob)
+            self.assertIn(mid, logs)
+            self.assertIn("patch_sha256=", logs)
+            path = s.results / f"{mid}.result.json"
+            mode = stat.S_IMODE(path.stat().st_mode)
+            self.assertEqual(mode, 0o600)
+
+
+class ErrorCodeTable(unittest.TestCase):
+    def test_error_codes_match_the_published_table(self):
+        for http, codes in CODES["http"].items():
+            for code in codes:
+                self.assertEqual(ERROR_HTTP[code], int(http), code)
+        self.assertEqual(CODES["retryable"], ["worker_disconnected"])
+
+
+if __name__ == "__main__":
+    unittest.main()

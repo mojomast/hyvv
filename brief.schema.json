@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "orbit.local-worker.brief/v1",
+  "type": "object",
+  "required": [
+    "objective"
+  ],
+  "properties": {
+    "objective": {
+      "type": "string"
+    },
+    "deliverables": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "acceptance": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "project": {
+      "type": "string",
+      "description": "key in launcher config.projects (must be authorized on the PC)"
+    },
+    "branch": {
+      "type": "string"
+    },
+    "source_rev": {
+      "type": "string",
+      "description": "git commit the worker must start from"
+    },
+    "input_manifest_sha256": {
+      "type": "string"
+    },
+    "assigned_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "workdir": {
+      "type": "string",
+      "description": "path inside the sandbox"
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "budget": {
+      "type": "object",
+      "properties": {
+        "timeout_s": {
+          "type": "integer"
+        },
+        "max_tool_calls": {
+          "type": "integer"
+        }
+      }
+    },
+    "deps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "return_format": {
+      "type": "string",
+      "default": "json-block: summary, changed_files, checks[], open_issues[]"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "opencode",
+        "agy-cua"
+      ],
+      "default": "opencode",
+      "description": "agy-cua: Antigravity CLI (gemini-4-argon) driving this attempt's own Cua sandbox desktop via the orbit-cua MCP server only; no project"
+    }
+  }
+}
