@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
+from contract.v1.privatefs import WELL_KNOWN_BROAD_SIDS, acl_sids, current_user_sid  # noqa: E402
 from contract.v1.reference import (  # noqa: E402
     DEFAULT_MAX_BYTES,
     ERROR_HTTP,
@@ -61,6 +62,18 @@ def _store(tmp, **kwargs):
 
 def _get(store, attempt_id, bearer=TOKEN, coordinator=OWNER):
     return store.get_artifact(attempt_id, bearer=bearer, coordinator=coordinator)
+
+
+def assert_owner_only(tc: unittest.TestCase, path: Path) -> None:
+    """POSIX: mode 0600. Windows: the ACL names only the current user (no groups, no other users)."""
+    if os.name == "nt":
+        sids = acl_sids(path)
+        tc.assertTrue(sids, "file has no ACL entries")
+        tc.assertEqual(set(sids), {current_user_sid()}, f"non-owner principals on a private file: {sorted(set(sids) - {current_user_sid()})}")
+        for sid in WELL_KNOWN_BROAD_SIDS:
+            tc.assertNotIn(sid, sids)
+    else:
+        tc.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
 
 def _json(body: bytes):
@@ -223,7 +236,12 @@ class AC006Unsafe(unittest.TestCase):
             self.assertEqual(_json(body)["code"], "artifact_malformed")
 
             mid = "att_symlink00000001"
-            s.add_attempt(mid, coordinator=OWNER, state="succeeded", source_rev=REV, symlink=True)
+            try:
+                s.add_attempt(mid, coordinator=OWNER, state="succeeded", source_rev=REV, symlink=True)
+            except OSError as exc:  # Windows without SeCreateSymbolicLinkPrivilege (CI runners have it)
+                if getattr(exc, "winerror", None) == 1314:
+                    self.skipTest("symlink sub-case needs the create-symlink privilege on this Windows host")
+                raise
             st, body = _get(s, mid)
             self.assertEqual(st, 409)
             self.assertEqual(_json(body)["code"], "artifact_unsafe")
@@ -321,9 +339,8 @@ class AC009NoLeak(unittest.TestCase):
             self.assertIn(mid, logs)
             self.assertIn("patch_sha256=", logs)
             path = s.results / f"{mid}.result.json"
-            if os.name != "nt":  # POSIX permission bits; Windows ACLs are out of scope for the reference
-                mode = stat.S_IMODE(path.stat().st_mode)
-                self.assertEqual(mode, 0o600)
+            assert_owner_only(self, path)
+            assert_owner_only(self, s.pin_path)
 
 
 class ErrorCodeTable(unittest.TestCase):

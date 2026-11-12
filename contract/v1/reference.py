@@ -15,6 +15,11 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+try:
+    from .privatefs import write_private
+except ImportError:  # loaded by path
+    from contract.v1.privatefs import write_private
+
 SCHEMA = "hyvv.worker-artifact/1"
 DEFAULT_MAX_BYTES = 8 * 1024 * 1024  # 8 MiB
 ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
@@ -89,10 +94,7 @@ class ArtifactStore:
 
     def _save_pins(self) -> None:
         payload = {"pins": self.pins, "bodies": {k: v.decode("utf-8") for k, v in self.bodies.items()}}
-        tmp = self.pin_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
-        os.replace(tmp, self.pin_path)
-        os.chmod(self.pin_path, 0o600)
+        write_private(self.pin_path, json.dumps(payload, indent=1).encode("utf-8"))
 
     def add_attempt(
         self,
@@ -123,17 +125,11 @@ class ArtifactStore:
         self._write_result(path, data, mode=mode)
 
     def _write_result(self, path: Path, data: bytes, mode: int = 0o600) -> None:
-        tmp = path.with_suffix(".result.json.tmp")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(tmp, flags, mode)
-        try:
-            os.write(fd, data)
-            if hasattr(os, "fchmod"):  # POSIX; Windows has no fchmod, os.chmod below still applies
-                os.fchmod(fd, mode)
-        finally:
-            os.close(fd)
-        os.replace(tmp, path)
+        if mode == 0o600:
+            write_private(path, data)
+            return
+        # Test seam only: deliberately non-private files (never used by the host).
+        path.write_bytes(data)
         os.chmod(path, mode)
 
     def list_attempts(self) -> list[dict[str, Any]]:

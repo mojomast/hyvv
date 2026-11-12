@@ -47,7 +47,7 @@ Planned (specified here, not in launcher v0.1.15):
 - Auth: Bearer token; peer is loopback or Tailscale; `X-Hyvv-Coordinator` (or `coordinator` query) must match the attempt's coordinator.
 - Response schema: `hyvv.worker-artifact/1`.
 - Default size cap: 8 MiB (`HYVV_ARTIFACT_MAX_BYTES`). Oversized results return `413 artifact_oversized` before the body is parsed.
-- Guarantees: idempotent, byte-identical reads; `result_sha256` pinned on first read; result files written mode 0600 via rename and read with `O_NOFOLLOW` plus realpath (Windows uses the equivalent no-reparse-point check). List, get, and logs never carry patch text or host paths.
+- Guarantees: idempotent, byte-identical reads; `result_sha256` pinned on first read; result files written owner-only via rename (POSIX mode 0600; on Windows the ACL is reset to a single full-control entry for the host user's SID, with inheritance removed, before any data is written; see `privatefs.py`) and read with `O_NOFOLLOW` plus realpath (Windows uses the equivalent no-reparse-point check). List, get, and logs never carry patch text or host paths.
 
 Error codes (HTTP → `code`):
 
