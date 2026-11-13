@@ -145,6 +145,13 @@ class Profile:
     allow_cleanup: bool = True
     git_actions: tuple[str, ...] = ("clone", "fetch", "checkout")
     task_scopes: tuple[str, ...] = ()
+    mirrors: tuple[tuple[str, str], ...] = ()
+
+    def mirror_for(self, repo: str) -> str | None:
+        for name, url in self.mirrors:
+            if name == repo:
+                return url
+        return None
 
     def allows_repo(self, repo: str) -> bool:
         for pattern in self.repo_patterns:
@@ -177,6 +184,7 @@ def load_policy(path: Path) -> dict[str, Profile]:
             allow_cleanup=bool(body.get("allow_cleanup", True)),
             git_actions=tuple(str(item) for item in body.get("git_actions") or ("clone", "fetch", "checkout")),
             task_scopes=tuple(str(item) for item in body.get("task_scopes") or []),
+            mirrors=tuple(sorted((str(k), str(v)) for k, v in (body.get("mirrors") or {}).items())),
         )
     return profiles
 
@@ -495,6 +503,8 @@ class Provisioner:
     git: Callable[..., subprocess.CompletedProcess] = default_git
     credential: Callable[[str], str | None] = lambda repo: None
     url_for: Callable[[str], str] = lambda repo: f"https://github.com/{repo}.git"
+    _remotes: dict[str, str] = field(default_factory=dict)
+    _transport: dict[str, str] = field(default_factory=dict)
     now: Callable[[], float] = time.time
     lock_stale_after: float = 300.0
 
@@ -580,7 +590,7 @@ class Provisioner:
         else:
             record["state"] = "preparing"
             self.journal.write(key, record)
-            self._clone(target, identity["repo"], identity["source_rev"])
+            self._clone(target, identity["repo"], identity["source_rev"], profile)
 
         registered = self.registry.get(project)
         adopted = False
@@ -638,22 +648,30 @@ class Provisioner:
 
     # -- steps --------------------------------------------------------------
 
-    def _clone(self, target: Path, repo: str, source_rev: str) -> None:
+    def _clone(self, target: Path, repo: str, source_rev: str, profile: "Profile | None" = None) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         if is_reparse_point(target.parent):
             raise ProvisionError("reparse_point", f"{target.parent} is a reparse point", "Refusing to clone through a link.")
         if self.credential(repo) is None:
             raise ProvisionError("credential_unavailable", f"the host has no credential for {repo}", "Configure a repository-scoped read-only credential on the worker host.")
-        url = self.url_for(repo)
+        mirror = profile.mirror_for(repo) if profile is not None else None
+        url = mirror or self.url_for(repo)
+        self._remotes[str(target)] = url
+        self._transport[str(target)] = "mirror" if mirror else "origin"
         done = self.git(["clone", "--no-checkout", "--filter=blob:none", url, str(target)], None)
         if done.returncode != 0:
             raise ProvisionError("clone_failed", _tail(done), "Check the repository and host credentials.")
 
         # The pinned commit may not be reachable from the branch tips the clone
-        # fetched, so fetch that exact object before checking it out.
-        fetched = self.git(["-C", str(target), "fetch", "--depth=1", "origin", source_rev], None)
-        if fetched.returncode != 0:
-            fetched = self.git(["-C", str(target), "fetch", "origin", source_rev], None)
+        # fetched. For a governed mirror the accepted refs are the transport, so
+        # fetch that namespace explicitly: servers need not serve raw SHAs.
+        if mirror:
+            fetched = self.git(["-C", str(target), "fetch", "origin",
+                                "+refs/bb/accepted/*:refs/bb/accepted/*"], None)
+        else:
+            fetched = self.git(["-C", str(target), "fetch", "--depth=1", "origin", source_rev], None)
+            if fetched.returncode != 0:
+                fetched = self.git(["-C", str(target), "fetch", "origin", source_rev], None)
         if fetched.returncode != 0:
             raise ProvisionError("fetch_failed", _tail(fetched), "Verify the pinned revision exists in the repository.")
         checkout = self.git(["-C", str(target), "checkout", "--detach", source_rev], None)
@@ -670,7 +688,8 @@ class Provisioner:
         if symbolic.returncode == 0:
             raise ProvisionError("checkout_mismatch", "the checkout is on a branch, not a detached HEAD", "Re-checkout the pinned revision.")
         remote = self.git(["-C", str(target), "config", "--get", "remote.origin.url"], None)
-        if remote.returncode != 0 or not self._remote_matches(remote.stdout.strip(), repo):
+        expected = self._remotes.get(str(target)) or self.url_for(repo)
+        if remote.returncode != 0 or not self._remote_matches(remote.stdout.strip(), repo, expected):
             raise ProvisionError("remote_mismatch", f"remote origin is {remote.stdout.strip()!r}, expected {repo!r}", "Re-provision from the correct repository.")
         state = self.git(["-C", str(target), "status", "--porcelain"], None)
         if state.returncode != 0 or state.stdout.strip():
@@ -686,7 +705,7 @@ class Provisioner:
                 continue
         raise ProvisionError("path_escape", f"{target} is not inside any enrolled workspace root", "Refusing to touch it.")
 
-    def _remote_matches(self, remote: str, repo: str) -> bool:
+    def _remote_matches(self, remote: str, repo: str, expected: str | None = None) -> bool:
         """The remote must be the repository we were told to fetch, by either
         its canonical identity or the exact URL this host uses for it."""
 
@@ -698,7 +717,7 @@ class Provisioner:
 
         if not remote:
             return False
-        return canon(remote) in {canon(repo), canon(self.url_for(repo))}
+        return canon(remote) in {canon(repo), canon(expected or self.url_for(repo))}
 
     def _registration_matches(self, entry: Mapping[str, Any], identity: Mapping[str, Any], target: Path) -> bool:
         return (
@@ -724,6 +743,7 @@ class Provisioner:
             "ttl_hours": profile.ttl_hours,
             "expires_at": _iso(ready_at + profile.ttl_hours * 3600),
             "verified": {"head": source_rev, "detached": True, "clean": True},
+            "transport": self._transport.get(workspace, "origin"),
             "adopted": adopted,
         }
 
@@ -744,6 +764,7 @@ class Provisioner:
             "states": list(STATES),
             "supports_cleanup": any(profile.allow_cleanup for profile in self.policy.values()),
             "supports_receipt_lookup": True,
+            "mirrors": sorted({name for profile in self.policy.values() for name, _ in profile.mirrors}),
             "idempotency": "idempotency_key binds repo, source_rev, profile, project, job_id",
         }
 
