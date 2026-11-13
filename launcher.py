@@ -13,7 +13,7 @@ import argparse, asyncio, bisect, platform, hashlib, hmac, ipaddress, json, os, 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.1.15"
+VERSION = "0.1.16"
 HEARTBEAT_S = 60  # controller emits a heartbeat event after this many quiet seconds
 MAX_WORKERS = 10  # hard ceiling for max_concurrent
 TERMINAL = {"succeeded", "failed", "cancelled"}

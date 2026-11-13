@@ -7,7 +7,7 @@ from hyvv.cli import main
 
 class Cli(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(__version__, "0.1.15")
+        self.assertEqual(__version__, "0.1.16")
         self.assertEqual(main(["version"]), 0)
 
     def test_planned_verb_exits_2(self):
