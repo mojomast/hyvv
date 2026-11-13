@@ -71,7 +71,8 @@ MONTHLY_LIMIT = re.compile(r"GoUsageLimitError|usage limit reached|UsageLimit", 
 MONTHLY_LIMIT_HINT = re.compile(r"monthly|limitName", re.I)
 # ---- task kinds. "opencode" (default) = Cua agents harness in a sandbox; "agy-cua" = Antigravity CLI
 # on the PC host whose ONLY tools are a cua MCP server bound to that attempt's own sandbox.
-KINDS = ("opencode", "agy-cua")
+# "check" = a check-run job: no model; run brief.commands in a container and report exit codes + logs.
+KINDS = ("opencode", "agy-cua", "check")
 # ids from `agy models`, Oct 21 2026 ("gemini-4-argon" is accepted as an alias; status SUCCESS in the smoke test)
 AGY_MODELS = {"gemini-4-argon", "gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high",
               "gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high",
@@ -138,7 +139,141 @@ def load_config(path):
     cfg.setdefault("extra_binds", ["127.0.0.1"])  # loopback listener; memory only, never written back
     cfg.setdefault("agy_exe", str(Path.home() / "AppData" / "Local" / "agy" / "bin" / "agy.exe"))
     cfg.setdefault("agy_permissions", None)  # None = agy_cua_mcp.DEFAULT_PERMS (UI only: no computer:shell/file)
+    cfg.setdefault("security_profiles", {})  # name -> profile for check jobs (see validate_security_profiles)
+    cfg.setdefault("check_security_profile", "default")
+    validate_security_profiles(cfg)
     return cfg
+
+# ---------------------------------------------------------------- security profiles (check jobs)
+# Coding bees (opencode, agy-cua) always run on today's profile: the Cua sandbox with Docker's default
+# seccomp. Cua 0.5.0's SandboxCreateOptions has no security_opt / seccomp / cap field, so a check job
+# with a non-default profile is launched by `docker run` directly (DockerCheckRunner), never through Cua.
+SECURITY_PROFILE_KEYS = {"image", "seccomp", "network", "memory_mb", "cpus", "pids_limit", "description"}
+SECURITY_PROFILE_NETWORKS = ("none", "bridge")
+_FORBIDDEN_ARGV = ("--privileged", "--cap-add", "--userns", "--pid", "--ipc", "--uts", "--device", "--volume", "-v", "--mount")
+_IMAGE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}")
+
+def validate_security_profiles(cfg):
+    """Profiles may only name an image, a seccomp JSON file, a network (none|bridge) and limits.
+    Anything that would widen privilege (privileged, cap_add, unconfined, apparmor, host network) is refused."""
+    profs = cfg.get("security_profiles") or {}
+    if not isinstance(profs, dict): raise ValueError("security_profiles must be an object")
+    for name, p in profs.items():
+        if name == "default": raise ValueError("security_profiles.default is built in and cannot be redefined")
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", str(name)): raise ValueError(f"bad security profile name: {name}")
+        if not isinstance(p, dict): raise ValueError(f"security_profiles.{name} must be an object")
+        extra = set(p) - SECURITY_PROFILE_KEYS
+        if extra: raise ValueError(f"security_profiles.{name}: unsupported keys {sorted(extra)}")
+        if not isinstance(p.get("image"), str) or not _IMAGE_REF.fullmatch(p["image"]): raise ValueError(f"security_profiles.{name}.image must be an image reference")
+        sc = p.get("seccomp")
+        if sc is not None:
+            if not isinstance(sc, str) or not sc.lower().endswith(".json") or "unconfined" in sc.lower() or "=" in sc or sc.startswith("-"):
+                raise ValueError(f"security_profiles.{name}.seccomp must be a path to a seccomp .json file")
+        if p.get("network", "none") not in SECURITY_PROFILE_NETWORKS:
+            raise ValueError(f"security_profiles.{name}.network must be one of {SECURITY_PROFILE_NETWORKS}")
+        for k in ("memory_mb", "cpus", "pids_limit"):
+            if k in p and not (isinstance(p[k], int) and p[k] > 0): raise ValueError(f"security_profiles.{name}.{k} must be a positive integer")
+        if any(x in json.dumps(p).lower() for x in ("privileged", "unconfined", "sys_admin")):
+            raise ValueError(f"security_profiles.{name} must not widen privileges")
+    csp = cfg.get("check_security_profile") or "default"
+    if csp != "default" and csp not in profs: raise ValueError(f"check_security_profile {csp} is not defined")
+
+def resolve_security_profile(cfg, kind, brief):
+    """Pick the security profile for one job. Coding bees can only use "default"; check jobs may name any
+    profile defined in launcher config (brief.security_profile, else cfg.check_security_profile)."""
+    want = (brief or {}).get("security_profile")
+    if want is not None and not isinstance(want, str): raise ValueError("brief.security_profile must be a string")
+    if kind != "check":
+        if want not in (None, "default"):
+            raise ValueError("security_profile applies to check jobs only; coding bees use the default profile")
+        return "default"
+    name = want or cfg.get("check_security_profile") or "default"
+    if name != "default" and name not in (cfg.get("security_profiles") or {}):
+        raise ValueError(f"unknown security_profile: {name} (configured: {', '.join(['default'] + sorted(cfg.get('security_profiles') or {}))})")
+    return name
+
+def security_profile(cfg, name):
+    if name == "default":
+        return {"image": cfg["image"], "seccomp": None, "network": "none"}
+    return dict(cfg["security_profiles"][name])
+
+def docker_check_argv(cfg, profile_name, name):
+    """`docker run` argv for a check-job container. Only adds limits and, for a non-default profile, its seccomp
+    file; never privileged, never extra caps, never host namespaces or bind mounts."""
+    p = security_profile(cfg, profile_name)
+    argv = ["docker", "run", "-d", "--name", name, "--label", "io.hyvv.role=check", "--label", f"io.hyvv.security-profile={profile_name}",
+            "--memory", f"{int(p.get('memory_mb') or cfg.get('memory_mb') or 4096)}m", "--cpus", str(int(p.get("cpus") or cfg.get("cpus") or 2)),
+            "--pids-limit", str(int(p.get("pids_limit") or 4096)), "--network", p.get("network") or "none"]
+    if p.get("seccomp"): argv += ["--security-opt", "seccomp=" + str(p["seccomp"])]
+    argv += ["--entrypoint", "/bin/sh", p["image"], "-c", "sleep infinity"]
+    for a in (x.lower() for x in argv):
+        if "unconfined" in a or "apparmor" in a or any(a == f or a.startswith(f + "=") for f in _FORBIDDEN_ARGV):
+            raise ValueError(f"refusing check container argv containing {a}")
+    return argv
+
+def _proc_run(argv, input=None, timeout=None):
+    import subprocess
+    r = subprocess.run(argv, input=input, capture_output=True, timeout=timeout)
+    dec = lambda v: (v or b"").decode("utf-8", "replace")
+    return r.returncode, dec(r.stdout), dec(r.stderr)
+
+CHECK_TAIL = 16_000  # chars of stdout/stderr kept per check in the result (full log on disk)
+CHECK_TIMEOUT_S = (10, 1800, 7200)  # min, default, max for brief.budget.timeout_s per command
+
+class DockerCheckRunner:
+    """Runs a check job: one throwaway container per attempt (security profile applied at `docker run`), the project
+    seeded at /work/<project> as a fresh git repo, then each brief.commands entry via `docker exec`. The result is
+    exit codes + logs, not a diff. Cleanup removes only this attempt's own container."""
+    def __init__(self, cfg, run=None):
+        self.cfg, self._run = cfg, run or _proc_run
+
+    async def _call(self, argv, input=None, timeout=None):
+        return await asyncio.to_thread(self._run, argv, input, timeout)
+
+    async def start(self, a):
+        cfg, b = self.cfg, a["brief"]
+        prof = a.get("security_profile") or resolve_security_profile(cfg, "check", b)
+        name = a.get("sandbox") or ("hyvv-check-" + re.sub(r"[^A-Za-z0-9_-]", "", a["attempt_id"])[:48])
+        a["sandbox"] = name
+        c, _, e = await self._call(docker_check_argv(cfg, prof, name), timeout=300)
+        if c != 0: raise RuntimeError(f"docker run failed: {redact(e)[-300:]}")
+        wd, rev, seed = None, None, None
+        proj = cfg["projects"].get(b.get("project", ""), {})
+        if proj.get("path"):
+            rev, tar = export_project(proj["path"], sync_branch=proj.get("sync_branch"), source_rev=b.get("source_rev"), branch=b.get("branch"))
+            wd = "/work/" + re.sub(r"[^A-Za-z0-9._-]", "_", b["project"])
+            c, _, e = await self._call(["docker", "exec", "-i", name, "sh", "-c", f"mkdir -p '{wd}' && tar -xf - -C '{wd}'"], input=tar, timeout=300)
+            if c != 0: raise RuntimeError(f"seeding check container failed: {redact(e)[-300:]}")
+            c, o, e = await self._call(["docker", "exec", "-w", wd, name, "sh", "-c",
+                                        f"git init -q && git add -A && git -c user.name=orbit -c user.email=orbit@local commit -qm 'base {rev}' && git update-ref refs/hyvv/seed HEAD && git rev-parse HEAD"], timeout=300)
+            if c != 0: raise RuntimeError(f"seeding check container failed: {redact(e)[-300:]}")
+            seed = (o.strip().splitlines() or [""])[-1][:64]
+        return {"sandbox": name, "sandbox_id": name, "run_id": "check-" + uuid.uuid4().hex[:8], "workdir": wd,
+                "local_base_rev": rev, "seed_commit": seed, "security_profile": prof}
+
+    async def run_checks(self, a):
+        b = a["brief"]; out = []
+        t = int(((b.get("budget") or {}).get("timeout_s")) or CHECK_TIMEOUT_S[1]); t = max(CHECK_TIMEOUT_S[0], min(CHECK_TIMEOUT_S[2], t))
+        logs = Path(self.cfg["data_dir"]) / "attempts"
+        for i, cmd in enumerate(b.get("commands") or []):
+            if a.get("cancel"): break
+            t0 = time.time()
+            argv = ["docker", "exec"] + (["-w", a["workdir"]] if a.get("workdir") else []) + [a["sandbox"], "bash", "-lc", cmd]
+            try: c, o, e = await self._call(argv, timeout=t)
+            except Exception as ex: c, o, e = None, "", f"{type(ex).__name__}: timed out or failed to run"
+            o, e = redact(o), redact(e)
+            log = logs / f"{a['attempt_id']}.check-{i + 1}.log"
+            try: log.write_text(f"$ {cmd}\n--- stdout\n{o}\n--- stderr\n{e}\n--- exit {c}\n", "utf-8")
+            except OSError: log = None
+            out.append({"name": f"check-{i + 1}", "command": cmd, "exit_code": c, "duration_s": round(time.time() - t0, 3),
+                        "stdout_tail": o[-CHECK_TAIL:], "stderr_tail": e[-CHECK_TAIL:], "log_file": str(log) if log else None})
+        return out
+
+    async def cleanup(self, a):
+        name = a.get("sandbox")
+        if not name or not name.startswith("hyvv-check-"): return
+        try: await self._call(["docker", "rm", "-f", name], timeout=120)
+        except Exception: pass
 
 def check_bind(host):
     ip = ipaddress.ip_address(host)
@@ -241,6 +376,11 @@ class CuaBackend:
         self._sb = {}
         self._sdc = {}
         self.agy = AgyCuaRunner(self)
+        self.checks = DockerCheckRunner(cfg)  # check jobs: docker directly (Cua cannot set a seccomp profile)
+
+    async def check_start(self, a): return await self.checks.start(a)
+    async def run_checks(self, a): return await self.checks.run_checks(a)
+    async def check_cleanup(self, a): return await self.checks.cleanup(a)
 
     async def _sandbox(self, name):
         if name not in self._sb:  # reattach after restart: connect by name, never get() (SandboxInfo)
@@ -260,7 +400,10 @@ class CuaBackend:
         return dec(out.stdout) + dec(out.pty), dec(out.stderr), code
 
     async def _seed_project(self, sb, proj, name, source_rev=None, branch=None):
-        """Copy an authorized local git repo into the sandbox; returns (workdir, base_rev).
+        """Copy an authorized local git repo into the sandbox; returns (workdir, base_rev, seed_commit).
+
+        seed_commit is the in-sandbox commit the copy starts from (also kept as refs/hyvv/seed); the patch
+        collector diffs against it, so a bee that commits or moves HEAD does not empty the patch.
 
         Prefer brief source_rev (optionally after fetching branch); otherwise sync_branch / HEAD.
         """
@@ -273,9 +416,10 @@ class CuaBackend:
         await (await self._sd(sb)).upload("/tmp/orbit-src.tar", tar, None)
         o, e, c = await self._sh(sb, f"cd '{wd}' && tar -xf /tmp/orbit-src.tar && git init -q && "
                                      f"printf '__pycache__/\\n*.pyc\\n.pytest_cache/\\nnode_modules/\\n' >> .git/info/exclude && git add -A && "
-                                     f"git -c user.name=orbit -c user.email=orbit@local commit -qm 'base {rev}' && git rev-parse HEAD")
+                                     f"git -c user.name=orbit -c user.email=orbit@local commit -qm 'base {rev}' && git update-ref refs/hyvv/seed HEAD && git rev-parse HEAD")
         if c not in (0, None): raise RuntimeError(f"seeding project failed: {e[-300:]}")
-        return wd, rev
+        seed = (o.strip().splitlines() or [""])[-1].strip()
+        return wd, rev, (seed if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", seed) else None)
 
     async def environment(self, a):
         if a.get("kind") == "agy-cua": return await self.agy.environment(a)
@@ -291,9 +435,13 @@ class CuaBackend:
         if not a.get("workdir"): return None
         sb = await self.agy.sandbox(a) if a.get("kind") == "agy-cua" else await self._sandbox(a["sandbox"])
         wd = a["workdir"]
+        # Diff against the seed commit recorded at start, not HEAD: a bee that commits (or `git checkout -B`)
+        # moves HEAD, and a HEAD diff would then come back empty. Older attempts without a seed use HEAD.
+        seed = a.get("seed_commit")
+        base = seed if isinstance(seed, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", seed) else "HEAD"
         await self._sh(sb, f"cd '{wd}' && git add -A")
-        diff = (await self._sh(sb, f"cd '{wd}' && git diff --cached --binary HEAD"))[0]
-        names = (await self._sh(sb, f"cd '{wd}' && git diff --cached --name-status HEAD"))[0]
+        diff = (await self._sh(sb, f"cd '{wd}' && git diff --cached --binary {base}"))[0]
+        names = (await self._sh(sb, f"cd '{wd}' && git diff --cached --name-status --no-renames {base}"))[0]
         files = []
         for l in names.splitlines():
             st, _, path = l.partition("\t")
@@ -301,7 +449,7 @@ class CuaBackend:
             sha = None if st.startswith("D") else ((await self._sh(sb, f"cd '{wd}' && sha256sum -- '{path}' | cut -d' ' -f1"))[0].strip()[:64] or None)
             files.append({"path": path, "status": st, "sha256": sha, "change": "deleted" if st.startswith("D") else ("added" if st.startswith("A") else "changed"),
                           "in_assigned_scope": in_assigned_scope(path, a["brief"].get("assigned_files"))})
-        return {"diff": diff, "files": files}
+        return {"diff": diff, "files": files, "base": base}
 
     async def _inject_bbs_token(self, sb, attempt):
         """Mint via bbs-beetest/mint-token.ps1 (DPAPI refresh credential stays on this PC), upload only the access
@@ -336,9 +484,9 @@ class CuaBackend:
             memory_mb=cfg["memory_mb"], cpus=cfg.get("cpus", 2), wait_for=[cua.ReadinessProbe(service="env")]))
         self._sb[name] = sb
         proj = cfg["projects"].get(b.get("project", ""), {})
-        wd, base = (None, None)
+        wd, base, seed = (None, None, None)
         if proj.get("path"):
-            wd, base = await self._seed_project(sb, proj, b["project"], source_rev=b.get("source_rev"), branch=b.get("branch"))
+            wd, base, seed = await self._seed_project(sb, proj, b["project"], source_rev=b.get("source_rev"), branch=b.get("branch"))
         spec = model_spec(cfg, attempt.get("model"), attempt.get("brief"))
         env = {"OPENCODE_CONFIG_CONTENT": json.dumps(dict(WORKER_OPENCODE_CONFIG, **({"model": spec["model"]} if spec["key"] == "none" else {})))}
         if spec["key"] in ("go", "deepseek"): env["OPENAI_API_KEY"] = key  # OpenAI-compatible: DeepSeek official or OpenCode Go
@@ -360,7 +508,7 @@ class CuaBackend:
             exit_when_idle=True, label=attempt["attempt_id"])
         agents = await sb.agents()
         run = await agents.run("opencode", prompt, opts)
-        return {"sandbox": name, "sandbox_id": sb.id(), "run_id": run.run_id(), "workdir": wd, "local_base_rev": base}
+        return {"sandbox": name, "sandbox_id": sb.id(), "run_id": run.run_id(), "workdir": wd, "local_base_rev": base, "seed_commit": seed}
 
     async def _run(self, a):
         agents = await (await self._sandbox(a["sandbox"])).agents()
@@ -532,7 +680,7 @@ class AgyCuaRunner:
         if mode == "code":  # same seeding as opencode bees: source_rev, else sync_branch / HEAD -> git repo in the sandbox
             proj = cfg["projects"].get(b.get("project", ""), {})
             if not proj.get("path"): raise ValueError("agy-cua code mode needs a project with a local path on this PC")
-            wd, base = await self.be._seed_project(sb, proj, b["project"], source_rev=b.get("source_rev"), branch=b.get("branch"))
+            wd, base, seed = await self.be._seed_project(sb, proj, b["project"], source_rev=b.get("source_rev"), branch=b.get("branch"))
         timeout = agy_timeout(b, mode)
         prompt = render_agy_code_prompt(b, wd) if mode == "code" else render_agy_prompt(b)
         argv = agy_argv(cfg, prompt, a.get("model") or AGY_DEFAULT_MODEL, timeout)
@@ -545,7 +693,7 @@ class AgyCuaRunner:
         run_id = f"agy-{p.pid}-{uuid.uuid4().hex[:6]}"
         self.procs[run_id] = {"p": p, "t0": time.time(), "timeout": timeout, "emitted": 0}
         return {"sandbox": name, "sandbox_id": sb.id(), "run_id": run_id, "cua_state_dir": str(state),
-                "agy_dir": str(d), "agy_timeout_s": timeout, "workdir": wd, "local_base_rev": base}
+                "agy_dir": str(d), "agy_timeout_s": timeout, "workdir": wd, "local_base_rev": base, "seed_commit": seed if mode == "code" and proj.get("path") else None}
 
     def _cua_exe(self):
         import shutil
@@ -651,6 +799,14 @@ class FakeBackend:
     async def result(self, a): return {"status": "completed", "text": "done", "artifacts": [{"path": "out.txt", "size": 2}], "tool_calls": 1}
     async def file_sha256(self, a, path): return hashlib.sha256(path.encode()).hexdigest()
     async def cleanup(self, a): pass
+    async def check_start(self, a):
+        return {"sandbox": "hyvv-check-fake", "sandbox_id": "fake", "run_id": "check-" + uuid.uuid4().hex[:8], "workdir": None,
+                "local_base_rev": None, "seed_commit": None, "security_profile": a.get("security_profile")}
+    async def run_checks(self, a):
+        exits = (a["brief"].get("fake") or {}).get("check_exits") or []
+        return [{"name": f"check-{i + 1}", "command": c, "exit_code": exits[i] if i < len(exits) else 0, "duration_s": 0.0,
+                 "stdout_tail": "", "stderr_tail": "", "log_file": None} for i, c in enumerate(a["brief"].get("commands") or [])]
+    async def check_cleanup(self, a): pass
 
 def render_prompt(b):
     parts = [f"# Objective\n{b['objective']}"]
@@ -817,6 +973,15 @@ class Launcher:
             if aid in self.attempts: return self.attempts[aid], False  # idempotent: never a second controller
             kind = kind or brief.get("kind") or "opencode"
             if kind not in KINDS: raise ValueError(f"unknown kind: {kind} (allowed: {', '.join(KINDS)})")
+            prof = resolve_security_profile(self.cfg, kind, brief)  # ValueError -> 400; coding bees: "default" only
+            if kind == "check":
+                if not brief.get("commands"): raise ValueError("check jobs need brief.commands (a non-empty list of strings)")
+                if brief.get("verify_of") is not None: raise ValueError("verify_of applies to opencode attempts only")
+                now = time.time()
+                a = {"attempt_id": aid, "kind": kind, "brief": brief, "state": "queued", "detail": "waiting for a worker slot", "created_at": now,
+                     "updated_at": now, "lseq": 0, "cursor": 0, "rate_limited": 0, "model": None, "security_profile": prof}
+                self.attempts[aid] = a; self._save(a)
+                self.kick(); return a, True
             if kind == "agy-cua":
                 sel = model or brief.get("tier") or brief.get("model") or AGY_DEFAULT_TIER
                 m = AGY_TIERS.get(sel, sel)
@@ -877,6 +1042,7 @@ class Launcher:
     async def _control(self, a):
         aid = a["attempt_id"]
         try:
+            if a.get("kind") == "check": return await self._control_check(a)
             if not a.get("run_id"):
                 agy = a.get("kind") == "agy-cua"
                 if a.get("pool") and not a.get("model"):
@@ -925,6 +1091,36 @@ class Launcher:
             except Exception: pass
         finally:
             self.controllers.pop(aid, None); self.kick()
+
+    async def _control_check(self, a):
+        """Check-run job: start the container, run brief.commands, record exit codes + logs. The result never
+        depends on a diff, so `git checkout -B` inside a check cannot hide anything."""
+        if a.get("run_id"):  # was running when the launcher stopped: the docker exec stream is gone
+            self._set(a, "failed", "launcher restarted during a check run (retry from Orbit)")
+            await self.backend.check_cleanup(a); return
+        try:
+            ids = await self.backend.check_start(a)
+            a.update(ids); self._set(a, "running", "check run started", {"run_id": ids["run_id"]})
+            checks = await self.backend.run_checks(a)
+            if a.get("cancel"):
+                self._set(a, "cancelled", "cancelled between checks"); return
+            bad = [c["name"] for c in checks if c.get("exit_code") != 0]
+            conclusion = "failure" if bad or not checks else "success"
+            prof = security_profile(self.cfg, a.get("security_profile") or "default")
+            b = a["brief"]
+            manifest = {"schema": "orbit.local-worker.check-result/v1", "attempt_id": a["attempt_id"],
+                        "source": {"project": b.get("project"), "repo_rev": b.get("source_rev"), "image": prof.get("image"), "kind": "check",
+                                   "security_profile": a.get("security_profile"), "launcher": VERSION},
+                        "observed": {"node": platform.node(), "run_id": a.get("run_id"), "sandbox_id": a.get("sandbox_id"), "workdir": a.get("workdir"),
+                                     "local_base_rev": a.get("local_base_rev"), "seed_commit": a.get("seed_commit"),
+                                     "result_file": str(self.dir / "attempts" / f"{a['attempt_id']}.result.json")},
+                        "check_run": {"security_profile": a.get("security_profile"), "conclusion": conclusion, "checks": checks},
+                        "patch": None, "note": "check_run is measured by the launcher (exit codes and logs); there is no model and no diff"}
+            (self.dir / "attempts" / f"{a['attempt_id']}.result.json").write_text(json.dumps(manifest, indent=1), "utf-8")
+            self._set(a, "succeeded" if conclusion == "success" else "failed",
+                      "checks passed" if conclusion == "success" else ("checks failed: " + ", ".join(bad) if bad else "no checks ran"))
+        finally:
+            await self.backend.check_cleanup(a)
 
     def _pick_free(self, a):
         """Least-recently-rate-limited free model not yet tried by this attempt (ties: least recently used)."""
@@ -1041,7 +1237,8 @@ def make_handler(L, token):
             if p == ["v1", "projects"]:  # names only: no paths, repos or branches
                 return self._send(200, {"projects": [{"name": k} for k in sorted(L.cfg["projects"])]})
             if p == ["v1", "containers"]:  # the sandbox image profile, not live containers
-                return self._send(200, {"containers": [{"image": L.cfg.get("image"), "runtime": L.cfg.get("runtime"), "memory_mb": L.cfg.get("memory_mb")}]})
+                return self._send(200, {"containers": [{"image": L.cfg.get("image"), "runtime": L.cfg.get("runtime"), "memory_mb": L.cfg.get("memory_mb")}],
+                                        "security_profiles": ["default"] + sorted(L.cfg.get("security_profiles") or {})})
             if p == ["v1", "version"]:
                 return self._send(200, {"api_version": "v1", "version": VERSION,
                                         "capabilities": ["priority_routing", "go_fallback"]})
