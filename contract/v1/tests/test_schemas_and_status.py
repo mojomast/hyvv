@@ -91,9 +91,10 @@ class SemverPolicy(unittest.TestCase):
 
 
 class LauncherStatus(unittest.TestCase):
-    def test_launcher_v0115_has_version_but_no_artifact_route(self):
+    def test_launcher_has_version_but_no_artifact_route(self):
         src = (ROOT / "launcher.py").read_text(encoding="utf-8")
-        self.assertIn('VERSION = "0.1.15"', src)
+        # Capability, not a pinned release: the launcher declares a semver VERSION.
+        self.assertRegex(src, r'VERSION = "\d+\.\d+\.\d+"')
         # The live 0.1.15 handler has health and /v1/version, not /artifact.
         self.assertIn('["v1", "health"]', src)
         self.assertIn('["v1", "version"]', src)

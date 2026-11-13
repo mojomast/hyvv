@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hyvv"
-version = "0.1.15"
+version = "0.1.16"
 description = "Worker-host runtime for local agent sandboxes. hyvv speaks a versioned /v1 contract."
 readme = "README.md"
 license = "MIT"
