@@ -1,22 +1,17 @@
-"""HTTP-level provisioning tests against the launcher handler.
-
-No launcher process is started: the handler is mounted on a stub Launcher, which
-is enough to prove routing, auth, duplicate-request behaviour and durable
-registration without a restart.
-"""
+"""HTTP-level provisioning tests against the launcher handler (stdlib unittest)."""
 
 from __future__ import annotations
 
 import json
 import subprocess
+import tempfile
 import threading
+import unittest
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-
-import pytest
 
 import launcher
 import provisioning as P
@@ -42,87 +37,77 @@ class FakeGit:
                 return subprocess.CompletedProcess(args, 0, SHA + "\n", "")
             if "config" in args:
                 return subprocess.CompletedProcess(args, 0, "https://github.com/mojomast/rizzstack-smoke.git\n", "")
-            return subprocess.CompletedProcess(args, 0, "", "")
         return subprocess.CompletedProcess(args, 0, "", "")
 
 
-@pytest.fixture()
-def service(tmp_path):
-    root = tmp_path / "fixtures"
-    root.mkdir()
-    policy_path = tmp_path / "policy.json"
-    policy_path.write_text(json.dumps({
-        "schema": P.SCHEMA,
-        "profiles": {"smoke": {"repo_patterns": ["mojomast/rizzstack-smoke"], "workspace_root": str(root), "allow_cleanup": True}},
-    }))
-    config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps({"projects": {"existing": {"repo": "mojomast/workflow", "path": str(tmp_path / "existing")}}}))
-    cfg = {"projects": {"existing": {"repo": "mojomast/workflow", "path": str(tmp_path / "existing")}},
-           "_config_path": str(config_path),
-           "provisioning": {"enabled": True, "policy": str(policy_path), "journal": str(tmp_path / "journal"),
-                            "credential_ready_repos": ["mojomast/rizzstack-smoke"]}}
+class ApiTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        tmp = Path(self._tmp.name)
+        (tmp / "fixtures").mkdir()
+        policy_path = tmp / "policy.json"
+        policy_path.write_text(json.dumps({
+            "schema": P.SCHEMA,
+            "profiles": {"smoke": {"repo_patterns": ["mojomast/rizzstack-smoke"], "workspace_root": str(tmp / "fixtures"), "allow_cleanup": True}},
+        }))
+        self.config_path = tmp / "config.json"
+        existing = {"repo": "mojomast/workflow", "path": str(tmp / "existing")}
+        self.config_path.write_text(json.dumps({"projects": {"existing": existing}}))
+        self.cfg = {
+            "projects": {"existing": dict(existing)},
+            "_config_path": str(self.config_path),
+            "provisioning": {"enabled": True, "policy": str(policy_path), "journal": str(tmp / "journal"),
+                             "credential_ready_repos": ["mojomast/rizzstack-smoke"]},
+        }
+        self.svc = launcher.build_provisioner(self.cfg)
+        self.svc.git = FakeGit()
+        stub = SimpleNamespace(cfg=self.cfg, attempts={}, provisioner=self.svc)
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), launcher.make_handler(stub, TOKEN))
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.httpd.server_port}"
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
 
-    svc = launcher.build_provisioner(cfg)
-    svc.git = FakeGit()
-    stub = SimpleNamespace(cfg=cfg, attempts={}, provisioner=svc)
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), launcher.make_handler(stub, TOKEN))
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{httpd.server_port}", cfg, config_path, svc
-    httpd.shutdown()
-    httpd.server_close()
+    def post(self, path, body, token=TOKEN):
+        request = urllib.request.Request(self.url + path, data=json.dumps(body).encode(), method="POST",
+                                         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read() or b"{}")
 
+    def request(self, **overrides):
+        body = {"repo": "mojomast/rizzstack-smoke", "source_rev": SHA, "profile": "smoke",
+                "job_id": "job_smoke", "idempotency_key": "prov_1", "project": "rizzstack-smoke"}
+        body.update(overrides)
+        return body
 
-def post(url: str, path: str, body: dict, token: str = TOKEN):
-    request = urllib.request.Request(url + path, data=json.dumps(body).encode(), method="POST",
-                                     headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            return response.status, json.loads(response.read())
-    except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read() or b"{}")
+    def test_provision_registers_durably_without_a_restart(self):
+        status, receipt = self.post("/v1/provision/project", self.request())
 
+        self.assertEqual(status, 200)
+        self.assertEqual(receipt["status"], "ready")
+        self.assertEqual(receipt["resolved_revision"], SHA)
+        self.assertEqual(self.cfg["projects"]["rizzstack-smoke"]["source_rev"], SHA)
+        on_disk = json.loads(self.config_path.read_text())
+        self.assertEqual(on_disk["projects"]["rizzstack-smoke"]["source_rev"], SHA)
+        self.assertEqual(on_disk["projects"]["existing"]["repo"], "mojomast/workflow")
+        # A fresh process built from the same file sees the registration.
+        fresh = launcher.build_provisioner(dict(self.cfg, projects=dict(on_disk["projects"])))
+        self.assertIn("rizzstack-smoke", fresh.projects)
 
-def request(**overrides):
-    body = {"repo": "mojomast/rizzstack-smoke", "source_rev": SHA, "profile": "smoke",
-            "job_id": "job_smoke", "idempotency_key": "prov_1", "project": "rizzstack-smoke"}
-    body.update(overrides)
-    return body
+    def test_unauthenticated_requests_are_refused(self):
+        status, _ = self.post("/v1/provision/project", self.request(), token="wrong")
+        self.assertEqual(status, 401)
+        self.assertNotIn("rizzstack-smoke", self.cfg["projects"])
 
-
-class Routes:
-    __test__ = True
-
-    def test_provision_registers_durably_without_a_restart(self, service):
-        url, cfg, config_path, svc = service
-
-        status, receipt = post(url, "/v1/provision/project", request())
-
-        assert status == 200
-        assert receipt["status"] == "ready"
-        assert receipt["resolved_revision"] == SHA
-        # Live registry (what dispatch reads) and the file on disk both have it.
-        assert cfg["projects"]["rizzstack-smoke"]["source_rev"] == SHA
-        on_disk = json.loads(config_path.read_text())
-        assert on_disk["projects"]["rizzstack-smoke"]["source_rev"] == SHA
-        assert on_disk["projects"]["existing"]["repo"] == "mojomast/workflow"  # untouched
-        # Simulate a restart: a fresh provisioner built from the same file sees it.
-        cfg2 = dict(cfg, projects=dict(on_disk["projects"]))
-        svc2 = launcher.build_provisioner(cfg2)
-        assert "rizzstack-smoke" in svc2.projects
-
-    def test_unauthenticated_requests_are_refused(self, service):
-        url, cfg, config_path, svc = service
-        status, _ = post(url, "/v1/provision/project", request(), token="wrong")
-        assert status == 401
-        assert "rizzstack-smoke" not in cfg["projects"]
-
-    def test_duplicate_concurrent_requests_create_one_fixture(self, service):
-        url, cfg, config_path, svc = service
+    def test_duplicate_concurrent_requests_create_one_fixture(self):
         statuses = []
 
         def attempt():
-            statuses.append(post(url, "/v1/provision/project", request())[0])
+            statuses.append(self.post("/v1/provision/project", self.request())[0])
 
         threads = [threading.Thread(target=attempt) for _ in range(4)]
         for t in threads:
@@ -130,32 +115,32 @@ class Routes:
         for t in threads:
             t.join()
 
-        clones = [c for c in svc.git.calls if c[0] == "clone"]
-        assert len(clones) == 1, f"expected one clone, saw {len(clones)}"
-        assert set(statuses) <= {200, 409}
+        clones = [c for c in self.svc.git.calls if c[0] == "clone"]
+        self.assertEqual(len(clones), 1, f"expected one clone, saw {len(clones)}")
+        self.assertLessEqual(set(statuses), {200, 409})
 
-    def test_a_traversal_project_name_is_refused(self, service):
-        url, cfg, config_path, svc = service
-        status, body = post(url, "/v1/provision/project", request(project="../escape"))
+    def test_a_traversal_project_name_is_refused(self):
+        status, body = self.post("/v1/provision/project", self.request(project="../escape"))
+        self.assertEqual(status, 400)
+        self.assertIn(body["error"], {"invalid_project_name", "path_escape"})
+        self.assertNotIn("rizzstack-smoke", self.cfg["projects"])
 
-        assert status == 400
-        assert body["error"] in {"invalid_project_name", "path_escape"}
-        assert "rizzstack-smoke" not in cfg["projects"]
+    def test_a_repository_outside_the_policy_is_refused(self):
+        status, body = self.post("/v1/provision/project", self.request(repo="attacker/evil"))
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "repo_not_allowed")
 
-    def test_a_repository_outside_the_policy_is_refused(self, service):
-        url, cfg, config_path, svc = service
-        status, body = post(url, "/v1/provision/project", request(repo="attacker/evil"))
-        assert status == 400
-        assert body["error"] == "repo_not_allowed"
+    def test_cleanup_removes_registration_and_workspace(self):
+        self.post("/v1/provision/project", self.request())
+        workspace = Path(self.cfg["projects"]["rizzstack-smoke"]["path"])
 
-    def test_cleanup_removes_registration_and_workspace(self, service):
-        url, cfg, config_path, svc = service
-        post(url, "/v1/provision/project", request())
-        workspace = Path(cfg["projects"]["rizzstack-smoke"]["path"])
+        status, result = self.post("/v1/provision/cleanup", {"project": "rizzstack-smoke"})
 
-        status, result = post(url, "/v1/provision/cleanup", {"project": "rizzstack-smoke"})
+        self.assertEqual(status, 200)
+        self.assertEqual(result["state"], "cleaned")
+        self.assertNotIn("rizzstack-smoke", self.cfg["projects"])
+        self.assertFalse(workspace.exists())
 
-        assert status == 200
-        assert result["state"] == "cleaned"
-        assert "rizzstack-smoke" not in cfg["projects"]
-        assert not workspace.exists()
+
+if __name__ == "__main__":
+    unittest.main()
