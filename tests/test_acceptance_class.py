@@ -47,7 +47,7 @@ class SeccompProfile(unittest.TestCase):
         up = json.loads(UPSTREAM.read_text("utf-8"))
         self.assertEqual(d.derive(up), json.loads(PROFILE.read_text("utf-8")))
 
-    def test_profile_differs_only_by_unshare_and_clone_newuser(self):
+    def test_profile_differs_only_by_bwrap_needs(self):
         up = json.loads(UPSTREAM.read_text("utf-8"))
         acc = json.loads(PROFILE.read_text("utf-8"))
         for k in ("defaultAction", "defaultErrnoRet", "archMap"):
@@ -63,7 +63,9 @@ class SeccompProfile(unittest.TestCase):
         changed = [s for s in added if s["names"] == ["clone"]]
         self.assertEqual(len(changed), 2)
         for s in changed:
-            self.assertEqual(s["args"][0]["value"], 0x6E020000)
+            # CLONE_NEWUSER (0x10000000) and CLONE_NEWNS (0x00020000) dropped from the mask: bwrap
+            # always does clone(CLONE_NEWNS|CLONE_NEWUSER)
+            self.assertEqual(s["args"][0]["value"], 0x6E000000)
             self.assertEqual(s["action"], "SCMP_ACT_ALLOW")
             self.assertEqual(s["args"][0]["op"], "SCMP_CMP_MASKED_EQ")
             # same rule otherwise (index, excludes/includes untouched)
@@ -73,14 +75,26 @@ class SeccompProfile(unittest.TestCase):
             self.assertEqual(o2, s2)
         new = [s for s in added if s["names"] != ["clone"]]
         self.assertEqual(len(new), 1)
-        self.assertEqual(new[0]["names"], ["unshare"])
+        self.assertEqual(new[0]["names"], ["mount", "pivot_root", "umount2", "unshare"])
         self.assertEqual(new[0]["action"], "SCMP_ACT_ALLOW")
         self.assertNotIn("args", new[0])
         self.assertNotIn("includes", new[0])
-        # nothing else became allowed: setns, mount, clone3 stay as upstream
+        # nothing else became allowed: setns, clone3, bpf, open_tree, move_mount, ... stay as upstream
         for s in acc["syscalls"]:
             if s not in up["syscalls"]:
-                self.assertTrue(set(s["names"]) <= {"clone", "unshare"})
+                self.assertTrue(set(s["names"]) <= {"clone", "unshare", "mount", "umount2", "pivot_root"})
+        allowed = {n for s in acc["syscalls"] if s["action"] == "SCMP_ACT_ALLOW" and not s.get("includes") for n in s["names"]}
+        for n in ("setns", "clone3", "bpf", "move_mount", "open_tree", "fsmount", "fsopen", "mount_setattr", "umount"):
+            self.assertNotIn(n, allowed - {x for s in up["syscalls"] if s["action"] == "SCMP_ACT_ALLOW" and not s.get("includes") for x in s["names"]})
+
+    def test_default_profile_file_untouched(self):
+        # the upstream (default) profile copy is never edited; only acceptance.json differs
+        self.assertNotEqual(UPSTREAM.read_bytes(), PROFILE.read_bytes())
+
+    def test_derive_constants(self):
+        d = _load_derive()
+        self.assertEqual((d.OLD_MASK, d.NEW_MASK), (0x7E020000, 0x6E000000))
+        self.assertEqual(sorted(d.ALLOW_SYSCALLS), ["mount", "pivot_root", "umount2", "unshare"])
 
     def test_check_mode_passes(self):
         r = subprocess.run([sys.executable, str(ACC / "derive_seccomp.py"), "--check"], capture_output=True, text=True)
