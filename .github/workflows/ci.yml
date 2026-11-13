@@ -12,12 +12,15 @@ jobs:
   test:
     name: test
     runs-on: ${{ matrix.os }}
+    # Windows legs are deferred (Kyle, Nov 12): windows-latest is out of the matrix.
+    # A job-level `if` cannot read `matrix`, and GitHub rejects the whole workflow
+    # when it tries, so the leg is removed rather than skipped. Re-add it here.
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
         python-version: ["3.12", "3.13"]
     steps:
       - name: Checkout
