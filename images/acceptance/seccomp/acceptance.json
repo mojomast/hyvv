@@ -644,7 +644,7 @@
 			"args": [
 				{
 					"index": 0,
-					"value": 1845624832,
+					"value": 1845493760,
 					"op": "SCMP_CMP_MASKED_EQ"
 				}
 			],
@@ -666,7 +666,7 @@
 			"args": [
 				{
 					"index": 1,
-					"value": 1845624832,
+					"value": 1845493760,
 					"op": "SCMP_CMP_MASKED_EQ"
 				}
 			],
@@ -843,10 +843,13 @@
 		},
 		{
 			"names": [
+				"mount",
+				"pivot_root",
+				"umount2",
 				"unshare"
 			],
 			"action": "SCMP_ACT_ALLOW",
-			"comment": "hyvv acceptance: allow unshare(2) without CAP_SYS_ADMIN so bwrap / unshare -U can create a user namespace"
+			"comment": "hyvv acceptance: bwrap / unshare -U need these without CAP_SYS_ADMIN to build a user+mount namespace sandbox"
 		}
 	]
 }
