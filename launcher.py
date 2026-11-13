@@ -10,6 +10,11 @@ narrow token-scoped HTTP API on loopback or a Tailscale address only.
 """
 from __future__ import annotations
 import argparse, asyncio, bisect, platform, hashlib, hmac, ipaddress, json, os, re, sys, threading, time, uuid
+
+try:
+    import provisioning as _provisioning
+except ImportError:  # pragma: no cover - the module ships beside launcher.py
+    _provisioning = None
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -136,6 +141,7 @@ def load_config(path):
     cfg.setdefault("backoff_s", [30, 60, 120, 240])
     cfg.setdefault("data_dir", str(Path.home() / ".orbit-launcher"))
     cfg.setdefault("projects", {})  # name -> {"repo": url} (authorized projects)
+    cfg.setdefault("provisioning", {})  # {"policy": path, "journal": path, "enabled": bool}
     cfg.setdefault("extra_binds", ["127.0.0.1"])  # loopback listener; memory only, never written back
     cfg.setdefault("agy_exe", str(Path.home() / "AppData" / "Local" / "agy" / "bin" / "agy.exe"))
     cfg.setdefault("agy_permissions", None)  # None = agy_cua_mcp.DEFAULT_PERMS (UI only: no computer:shell/file)
@@ -1206,6 +1212,54 @@ class Launcher:
                 "note": "worker_claims are self-reported by the model; only 'observed' was measured by the launcher"}
 
 # ---------------------------------------------------------------- HTTP API
+
+def save_projects(path, projects):
+    """Atomically persist the project registry, preserving every other key.
+
+    The launcher never rewrote config.json before; provisioning needs durability
+    across restarts without one. Everything else in the file is copied verbatim.
+    """
+    import os as _os
+    target = Path(path)
+    raw = json.loads(target.read_text(encoding="utf-8-sig")) if target.exists() else {}
+    raw["projects"] = projects
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(json.dumps(raw, indent=1), encoding="utf-8")
+    _os.replace(tmp, target)
+
+
+def build_provisioner(cfg):
+    """Construct the provisioning service from config, or return None."""
+    if _provisioning is None:
+        return None
+    block = cfg.get("provisioning") or {}
+    if not block.get("enabled"):
+        return None
+    config_path = Path(cfg.get("_config_path") or "config.json")
+    policy_path = Path(block.get("policy") or config_path.with_name("provisioning-policy.json"))
+    journal_dir = Path(block.get("journal") or (Path(cfg["data_dir"]) / "provisioning"))
+    policy = _provisioning.load_policy(policy_path)
+    registry = cfg.setdefault("projects", {})
+
+    def persist(projects):
+        save_projects(config_path, projects)
+
+    def credential(repo):
+        # Authentication is delegated to the host's git credential helper. We only
+        # report whether the host claims to have one; the secret never enters here.
+        if block.get("credential_ready_repos") and repo in block["credential_ready_repos"]:
+            return "host-credential-helper"
+        return None
+
+    return _provisioning.Provisioner(
+        policy=policy,
+        journal=_provisioning.Journal(journal_dir),
+        projects=registry,
+        persist_registry=persist,
+        credential=credential,
+    )
+
+
 def make_handler(L, token):
     class H(BaseHTTPRequestHandler):
         server_version = "orbit-launcher/" + VERSION
@@ -1234,6 +1288,10 @@ def make_handler(L, token):
                 rows = sorted(L.attempts.values(), key=lambda x: x.get("created_at") or 0, reverse=True)
                 if q.get("active") in ("1", "true"): rows = [x for x in rows if x["state"] not in TERMINAL]
                 return self._send(200, {"attempts": [L.listing(x) for x in rows[:200]]})
+            if p == ["v1", "provision", "receipts"]:
+                svc = getattr(L, "provisioner", None)
+                if svc is None: return self._send(501, {"error": "provisioning is not enabled on this host"})
+                return self._send(200, {"receipts": [{"idempotency_key": r.get("idempotency_key"), "project": r.get("project"), "state": r.get("state")} for r in svc.journal.all()]})
             if p == ["v1", "projects"]:  # names only: no paths, repos or branches
                 return self._send(200, {"projects": [{"name": k} for k in sorted(L.cfg["projects"])]})
             if p == ["v1", "containers"]:  # the sandbox image profile, not live containers
@@ -1272,6 +1330,19 @@ def make_handler(L, token):
                 try: a, created = L.submit(aid, b["brief"], b.get("model") or b.get("tier"), b.get("kind"), b.get("mode"))
                 except ValueError as ex: return self._send(400, {"error": str(ex)})
                 return self._send(201 if created else 200, L.public(a))
+            if p == ["v1", "provision", "project"]:
+                svc = getattr(L, "provisioner", None)
+                if svc is None: return self._send(501, {"error": "provisioning is not enabled on this host"})
+                try: receipt = svc.provision(b)
+                except _provisioning.ProvisionError as ex: return self._send(409 if ex.code in ("journal_conflict", "project_conflict", "provision_in_progress") else 400, ex.to_dict())
+                return self._send(200, receipt)
+            if p == ["v1", "provision", "cleanup"]:
+                svc = getattr(L, "provisioner", None)
+                if svc is None: return self._send(501, {"error": "provisioning is not enabled on this host"})
+                project = str(b.get("project") or "")
+                try: result = svc.cleanup(project, active_attempts=lambda name: sum(1 for a in L.attempts.values() if a.get("project") == name and a.get("state") not in TERMINAL))
+                except _provisioning.ProvisionError as ex: return self._send(409, ex.to_dict())
+                return self._send(200, result)
             if p == ["v1", "config"]:
                 # runtime-only: set max_concurrent (1..MAX_WORKERS); config.json on disk is unchanged, a restart reverts
                 try: n = int(b.get("max_concurrent"))
@@ -1428,6 +1499,7 @@ def serve(cfg, backend_name="cua"):
     if len(token) < 32: raise SystemExit("api token missing/too short; run scripts/new-token.ps1")
     backend = FakeBackend(cfg) if backend_name == "fake" else CuaBackend(cfg)
     L = Launcher(cfg, backend)
+    L.provisioner = build_provisioner(cfg)
     write_pidfile(cfg)
     threading.Thread(target=L.loop.run_forever, daemon=True).start(); L.kick()
     asyncio.run_coroutine_threadsafe(_lag_probe(L), L.loop)
@@ -1530,7 +1602,10 @@ async def _probe(cfg, model=None):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("cmd", choices=["serve", "doctor", "probe", "sdkcheck", "agysmoke"]); ap.add_argument("--objective", default="Take a screenshot and describe the desktop."); ap.add_argument("--config")
+    _args_for_cfg = None
     ap.add_argument("--backend", default="cua", choices=["cua", "fake"]); ap.add_argument("--model")
     a = ap.parse_args(); cfg = load_config(a.config) if a.config else None
+    if cfg is not None:
+        cfg["_config_path"] = str(a.config)
     if a.cmd == "agysmoke": sys.exit(asyncio.run(agy_smoke(cfg, a.objective)))
     sys.exit((print(json.dumps(sdk_contract_check())) or (1 if sdk_contract_check() else 0)) if a.cmd == "sdkcheck" else doctor(cfg) if a.cmd == "doctor" else asyncio.run(_probe_all(cfg) if a.model == "free-all" else _probe(cfg, a.model)) if a.cmd == "probe" else serve(cfg, a.backend))
