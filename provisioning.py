@@ -254,11 +254,17 @@ def pid_alive(pid: int) -> bool:
     if os.name == "nt":  # pragma: no cover - executed on Windows
         import ctypes
 
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
         if not handle:
             return False
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return True
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == 259  # STILL_ACTIVE; a reaped process keeps a stale object
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -753,13 +759,27 @@ class Provisioner:
 
         self.registry.delete(project)                   # unregister first: no dispatch into a dying tree
 
-        import shutil
-
-        shutil.rmtree(workspace, ignore_errors=False)   # then delete the checkout
+        _rmtree(workspace)   # then delete the checkout
 
         record.update(state="cleaned", cleaned_at=_now())
         self.journal.write(key, record)
         return {"project": project, "state": "cleaned", "workspace": str(workspace), "evidence_preserved": True}
+
+
+def _rmtree(path: Path) -> None:
+    """Delete a checkout, coping with read-only files (git objects on Windows)."""
+
+    import shutil
+    import stat as _stat
+
+    def retry(func, failed, _exc):
+        try:
+            os.chmod(failed, _stat.S_IWRITE)
+            func(failed)
+        except OSError:
+            raise
+
+    shutil.rmtree(path, onerror=retry)
 
 
 def _now() -> float:
