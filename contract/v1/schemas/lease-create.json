@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mojomast/hyvv/main/contract/v1/schemas/lease-create.json",
+  "title": "POST /v1/leases request",
+  "description": "Acquire one or more bee slots. Planned. All listed fields are required.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "coordinator",
+    "project",
+    "role",
+    "count",
+    "ttl",
+    "purpose"
+  ],
+  "properties": {
+    "coordinator": {
+      "type": "string",
+      "minLength": 1
+    },
+    "project": {
+      "type": "string",
+      "minLength": 1
+    },
+    "role": {
+      "enum": [
+        "work",
+        "verify",
+        "coordinator"
+      ]
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "ttl": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Requested time to live, in seconds."
+    },
+    "purpose": {
+      "enum": [
+        "work",
+        "verify",
+        "ci"
+      ]
+    }
+  }
+}

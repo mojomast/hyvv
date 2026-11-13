@@ -1,0 +1,22 @@
+{
+  "bind": "127.0.0.1",
+  "port": 47821,
+  "max_concurrent": 1,
+  "model": "deepseek-v4.1-flash",
+  "base_url": "https://opencode.ai/inference/go/openai/v1",
+  "wire": "openai-chat",
+  "image": "ghcr.io/trycua/linux@sha256:fd00735ceb6c65ab628d962640068c9f63076a49a62d86f6b6eb5ac4bbcbbf6b",
+  "runtime": "runc",
+  "memory_mb": 6144,
+  "backoff_s": [
+    30,
+    60,
+    120,
+    240
+  ],
+  "projects": {
+    "example": {
+      "repo": "https://github.com/mojomast/example.git"
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mojomast/hyvv/main/contract/v1/schemas/version.json",
+  "title": "GET /v1/version",
+  "description": "Implemented in launcher 0.1.15. api_version is the /v1 contract version; version is the hyvv / launcher release; capabilities lists what this host supports.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "api_version",
+    "version",
+    "capabilities"
+  ],
+  "properties": {
+    "api_version": {
+      "const": "v1"
+    },
+    "version": {
+      "type": "string",
+      "description": "hyvv / launcher release version, for example 0.1.15."
+    },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "artifact_fetch",
+          "priority_routing",
+          "go_fallback",
+          "leases"
+        ]
+      },
+      "description": "Known v1 capabilities. Implementations must advertise every capability they support."
+    }
+  }
+}

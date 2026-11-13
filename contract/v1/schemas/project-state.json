@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mojomast/hyvv/main/contract/v1/schemas/project-state.json",
+  "title": "hyvv.project-state/1",
+  "description": "Proposed. Aligns with workflow docs/18-parking-projects.md (MR.INDIA, in progress). File path in an authorized project repo: .workflow/project-state.json. Fields: state (active, parked or archived), reason, at, and by.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "state",
+    "reason",
+    "at",
+    "by"
+  ],
+  "properties": {
+    "state": {
+      "enum": [
+        "active",
+        "parked",
+        "archived"
+      ]
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "When the state was last set, ISO-8601, or null."
+    },
+    "by": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Who set the state, or null."
+    }
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mojomast/hyvv/main/contract/v1/schemas/lease-list.json",
+  "title": "GET /v1/leases response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "leases",
+    "cap"
+  ],
+  "properties": {
+    "leases": {
+      "type": "array",
+      "items": {
+        "$ref": "lease.json"
+      }
+    },
+    "cap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "global",
+        "used",
+        "ci",
+        "ci_used"
+      ],
+      "properties": {
+        "global": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "From config; default 12."
+        },
+        "used": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ci": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "CI purpose cap; default 2."
+        },
+        "ci_used": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "coordinator": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "description": "Optional per-coordinator caps from config."
+        }
+      }
+    }
+  }
+}

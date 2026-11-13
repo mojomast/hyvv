@@ -1,0 +1,596 @@
+openapi: 3.1.0
+info:
+  title: hyvv worker-host API
+  version: v1
+  description: |
+    Versioned worker-host contract for hyvv. `/v1` only ever gets additive
+    changes. A breaking change is published as `/v2` and served alongside
+    `/v1` for at least one release.
+
+    hyvv is a vocabulary, not a dependency on bundlebees.
+
+    Every operation carries `x-hyvv-status`, one of: `launcher-0.1.15`
+    (implemented in launcher 0.1.15), `reference` (implemented only in the
+    /v1 reference, contract/v1/reference.py), `specified` (specified, not
+    implemented), or `proposed`. contract/v1/STATUS.json is the source and
+    tests/test_status_labels.py keeps the labels honest. Items marked
+    `x-proposal` are proposed additions (see contract/v1/proposals/).
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: /
+    description: Local hyvv host (loopback or Tailscale only)
+tags:
+  - name: meta
+  - name: attempts
+  - name: artifacts
+  - name: host
+  - name: leases
+paths:
+  /v1/version:
+    get:
+      tags: [meta]
+      operationId: getVersion
+      summary: API version and capabilities
+      x-hyvv-status: launcher-0.1.15
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Version and capability advertisement
+          content:
+            application/json:
+              schema:
+                $ref: schemas/version.json
+              examples:
+                v1:
+                  value:
+                    api_version: v1
+                    version: "0.1.15"
+                    capabilities:
+                      - priority_routing
+                      - go_fallback
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/health:
+    get:
+      tags: [meta]
+      operationId: getHealth
+      summary: Liveness and host counters
+      x-hyvv-status: launcher-0.1.15
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Health
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, version]
+                properties:
+                  ok: {type: boolean}
+                  version: {type: string}
+                  max_concurrent: {type: integer}
+                  active: {type: integer}
+                  queued: {type: integer}
+                  model: {type: string}
+                  uptime_s: {type: number}
+                  loop_lag_ms: {type: number}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/attempts:
+    get:
+      tags: [attempts]
+      operationId: listAttempts
+      summary: List attempts (public and lease fields only; newest 200)
+      description: Responses never include patch text, brief objective text, host names, or runtime paths.
+      x-hyvv-status: launcher-0.1.15
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: active
+          in: query
+          schema:
+            type: string
+            enum: ["1", "true"]
+          description: If set, only non-terminal attempts are returned.
+      responses:
+        "200":
+          description: Attempt list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [attempts]
+                properties:
+                  attempts:
+                    type: array
+                    items:
+                      $ref: schemas/attempt.json
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [attempts]
+      operationId: createAttempt
+      summary: Create an attempt (idempotent if attempt_id already exists)
+      x-hyvv-status: launcher-0.1.15
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [brief]
+              properties:
+                attempt_id:
+                  type: string
+                  description: If omitted, hyvv mints `att_` plus 16 hex characters.
+                brief:
+                  type: object
+                  required: [objective]
+                  additionalProperties: true
+                  properties:
+                    objective: {type: string}
+                    project: {type: string}
+                    branch: {type: string}
+                    source_rev: {type: string}
+                    assigned_files:
+                      type: array
+                      items: {type: string}
+                    priority:
+                      type: string
+                      description: "high selects the official DeepSeek route (priority_routing)."
+                model: {type: string}
+                kind: {type: string}
+                mode: {type: string}
+                coordinator:
+                  type: string
+                  deprecated: true
+                  description: >
+                    Ignored for authorization. The owning coordinator is the
+                    principal authenticated by the request's coordinator key.
+                project_state_generation:
+                  type: integer
+                  minimum: 0
+                  description: >
+                    Reference only (x-hyvv-status reference; not launcher 0.1.15).
+                    Required with `project`: the `generation` of
+                    .workflow/project-state.json the dispatcher gated on (0 when the
+                    file is absent). hyvv re-reads the file and refuses with 409
+                    project_state_changed if it differs (workflow docs/18, AC-PARK-22).
+                project_parked_override:
+                  type: boolean
+                  description: >
+                    Reference only. Together with a non-empty reason, allows an
+                    attempt on a parked or archived project. Attributed to the
+                    authenticated principal and persisted. Does not bypass an
+                    invalid state file or a generation mismatch.
+                project_parked_override_reason:
+                  type: string
+                  description: Required (non-empty) when project_parked_override is true. Persisted with the override.
+      responses:
+        "200":
+          description: Existing attempt (idempotent replay)
+          content:
+            application/json:
+              schema:
+                $ref: schemas/attempt.json
+        "201":
+          description: >
+            Created. When artifact_fetch is available, the body also carries
+            `artifact_capability` (and `artifact_capability_expires_at` when a
+            TTL applies). It is returned only here, only to the creating
+            principal, and never again (not on idempotent replay, GET or list).
+          content:
+            application/json:
+              schema:
+                $ref: schemas/attempt.json
+        "400":
+          description: >
+            Invalid brief or attempt_id. Reference only: invalid_project_state
+            (the state file is present but invalid, unreadable, oversized, a
+            symlink, or its snapshot_path fails containment; `detail` is one of
+            snapshot_path_invalid, snapshot_path_symlink, snapshot_path_escape,
+            snapshot_missing) and override_reason_required.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Project is not authorized on this host (reference code project_not_authorized)
+        "409":
+          description: >
+            Reference only (contract/v1/project_state.py; not launcher 0.1.15),
+            per workflow docs/18-parking-projects.md at 2bcf0c5.
+            project_parked or project_archived when the project's
+            .workflow/project-state.json is parked or archived and no override
+            plus reason was given; project_state_changed when
+            project_state_generation is missing or differs from the file, or
+            the file's generation is not its history length.
+          x-hyvv-feature-status: reference
+          content:
+            application/json:
+              schema:
+                $ref: schemas/error.json
+              example:
+                code: project_parked
+                error: project_parked
+                message: project is parked
+                state: parked
+                reason: waiting on a review
+                at: "2026-11-12T21:00:00Z"
+                by: human:owner
+                project: example-project
+                generation: 2
+
+  /v1/attempts/{attempt_id}:
+    get:
+      tags: [attempts]
+      operationId: getAttempt
+      summary: Public fields for one attempt (no patch, no host paths)
+      x-hyvv-status: launcher-0.1.15
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/AttemptId"
+      responses:
+        "200":
+          description: Public attempt
+          content:
+            application/json:
+              schema:
+                $ref: schemas/attempt.json
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Unknown attempt
+
+  /v1/attempts/{attempt_id}/events:
+    get:
+      tags: [attempts]
+      operationId: getAttemptEvents
+      summary: Events since a cursor (no patch text)
+      x-hyvv-status: launcher-0.1.15
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/AttemptId"
+        - name: cursor
+          in: query
+          schema: {type: integer, default: 0}
+      responses:
+        "200":
+          description: Event page
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Unknown attempt
+
+  /v1/attempts/{attempt_id}/result:
+    get:
+      tags: [attempts]
+      operationId: getAttemptResultLegacy
+      summary: Legacy full result manifest
+      description: |
+        Historical endpoint. The manifest may include host and work-dir fields.
+        Coordinators must use `GET /v1/attempts/{attempt_id}/artifact` once
+        `artifact_fetch` ships.
+      x-hyvv-status: launcher-0.1.15
+      deprecated: true
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/AttemptId"
+      responses:
+        "200":
+          description: Result manifest (`orbit.local-worker.result/v1`)
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Unknown attempt
+        "409":
+          description: No result yet
+
+  /v1/attempts/{attempt_id}/artifact:
+    get:
+      tags: [artifacts]
+      operationId: getAttemptArtifact
+      summary: Coordinator-only artifact fetch
+      x-hyvv-status: reference
+      x-capability: artifact_fetch
+      security:
+        - coordinatorKey: []
+      parameters:
+        - $ref: "#/components/parameters/AttemptId"
+        - name: X-Hyvv-Capability
+          in: header
+          required: true
+          schema: {type: string, pattern: "^hyvvcap1_[A-Za-z0-9_-]{43}$"}
+          description: >
+            The attempt's scoped capability, returned once in the 201 response
+            to POST /v1/attempts (`artifact_capability`). Bound to this attempt,
+            scoped to its artifact and result, compared by hash in constant
+            time, and subject to expiry and revocation. The caller's
+            coordinator identity comes from its bearer key (`coordinatorKey`),
+            never from a request field.
+      responses:
+        "200":
+          description: `hyvv.worker-artifact/1`
+          content:
+            application/json:
+              schema:
+                $ref: schemas/artifact.json
+        "400":
+          $ref: "#/components/responses/ArtifactError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ArtifactError"
+        "404":
+          $ref: "#/components/responses/ArtifactError"
+        "409":
+          $ref: "#/components/responses/ArtifactError"
+        "413":
+          $ref: "#/components/responses/ArtifactError"
+        "502":
+          $ref: "#/components/responses/ArtifactError"
+        "503":
+          $ref: "#/components/responses/ArtifactError"
+
+  /v1/attempts/{attempt_id}/review:
+    post:
+      tags: [attempts]
+      operationId: reviewAttempt
+      summary: Record a coordinator verdict
+      x-hyvv-status: launcher-0.1.15
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/AttemptId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [accepted]
+              properties:
+                accepted: {type: boolean}
+                note: {type: string}
+      responses:
+        "200":
+          description: Updated attempt
+        "400":
+          description: accepted must be a boolean
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Unknown attempt
+        "409":
+          description: Attempt is not in a reviewable state
+
+  /v1/attempts/{attempt_id}/cancel:
+    post:
+      tags: [attempts]
+      operationId: cancelAttempt
+      summary: Cancel an attempt
+      x-hyvv-status: launcher-0.1.15
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/AttemptId"
+      responses:
+        "202":
+          description: Cancel accepted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Unknown attempt
+
+  /v1/projects:
+    get:
+      tags: [host]
+      operationId: listProjects
+      summary: Authorized project names only (no paths, repos, or branches)
+      x-hyvv-status: launcher-0.1.15
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Project names
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/containers:
+    get:
+      tags: [host]
+      operationId: getContainerProfile
+      summary: Sandbox image profile (not live containers)
+      x-hyvv-status: launcher-0.1.15
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Image profile
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/config:
+    post:
+      tags: [host]
+      operationId: patchRuntimeConfig
+      summary: Runtime-only max_concurrent change (not written to disk)
+      x-hyvv-status: launcher-0.1.15
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [max_concurrent]
+              properties:
+                max_concurrent: {type: integer, minimum: 1, maximum: 10}
+      responses:
+        "200":
+          description: Applied
+        "400":
+          description: Invalid max_concurrent
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/leases:
+    get:
+      tags: [leases]
+      operationId: listLeases
+      summary: List live bee-slot leases and cap usage
+      x-hyvv-status: specified
+      x-capability: leases
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Live leases and caps
+          content:
+            application/json:
+              schema:
+                $ref: schemas/lease-list.json
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [leases]
+      operationId: acquireLease
+      summary: Acquire bee slots
+      x-hyvv-status: specified
+      x-capability: leases
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: schemas/lease-create.json
+      responses:
+        "201":
+          description: Lease issued
+          content:
+            application/json:
+              schema:
+                $ref: schemas/lease.json
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          description: Global, coordinator, or CI cap would be exceeded
+          headers:
+            Retry-After:
+              description: Seconds until a slot is expected to free
+              schema: {type: integer, minimum: 1}
+          content:
+            application/json:
+              schema:
+                $ref: schemas/error.json
+              example:
+                code: capacity_exhausted
+                error: capacity_exhausted
+                message: global cap 12 is full
+                retryable: true
+
+  /v1/leases/{lease_id}:
+    delete:
+      tags: [leases]
+      operationId: releaseLease
+      summary: Release a lease immediately
+      x-hyvv-status: specified
+      x-capability: leases
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: lease_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "204":
+          description: Released
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Unknown lease
+
+  /v1/leases/{lease_id}/renew:
+    post:
+      tags: [leases]
+      operationId: renewLease
+      summary: Renew a live lease
+      x-hyvv-status: specified
+      x-capability: leases
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: lease_id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: schemas/lease-renew.json
+      responses:
+        "200":
+          description: Renewed lease
+          content:
+            application/json:
+              schema:
+                $ref: schemas/lease.json
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Unknown or expired lease
+
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Per-host token from the hyvv data directory. Required on every route.
+    coordinatorKey:
+      type: http
+      scheme: bearer
+      description: >
+        Reference only (x-hyvv-status reference): a per-coordinator key that authenticates a principal. The
+        host stores only key hashes. Used by artifact_fetch together with the
+        attempt capability.
+  parameters:
+    AttemptId:
+      name: attempt_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_-]{8,64}$'
+  responses:
+    Unauthorized:
+      description: Missing or incorrect bearer token
+      content:
+        application/json:
+          schema:
+            $ref: schemas/error.json
+          example:
+            code: unauthorized
+            error: unauthorized
+            message: missing or incorrect bearer token
+    ArtifactError:
+      description: Artifact fetch error (`code` is one of the v1 artifact error codes)
+      content:
+        application/json:
+          schema:
+            $ref: schemas/error.json

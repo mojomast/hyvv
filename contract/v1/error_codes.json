@@ -1,0 +1,82 @@
+{
+  "http": {
+    "400": [
+      "invalid_attempt_id"
+    ],
+    "401": [
+      "unauthorized",
+      "capability_required"
+    ],
+    "403": [
+      "not_owner",
+      "capability_invalid",
+      "capability_expired",
+      "capability_revoked"
+    ],
+    "404": [
+      "unknown_attempt",
+      "result_missing"
+    ],
+    "409": [
+      "result_pending",
+      "no_result_for_state",
+      "artifact_mismatch",
+      "artifact_changed",
+      "artifact_unsafe"
+    ],
+    "413": [
+      "artifact_oversized"
+    ],
+    "502": [
+      "artifact_malformed"
+    ],
+    "503": [
+      "worker_disconnected"
+    ]
+  },
+  "retryable": [
+    "worker_disconnected"
+  ],
+  "default_artifact_max_bytes": 8388608,
+  "planned": {
+    "leases": {
+      "status": "specified; not implemented in launcher 0.1.15 or the reference (x-hyvv-status: specified)",
+      "http": {
+        "429": [
+          "capacity_exhausted"
+        ]
+      },
+      "retryable": [
+        "capacity_exhausted"
+      ],
+      "defaults": {
+        "global_cap": 12,
+        "ci_cap": 2
+      }
+    }
+  },
+  "project_state": {
+    "status": "reference (x-hyvv-status: reference); not in launcher 0.1.15",
+    "spec": "workflow docs/18-parking-projects.md at mojomast/workflow 2bcf0c5 (feat/park-project)",
+    "http": {
+      "400": [
+        "invalid_project_state",
+        "override_reason_required"
+      ],
+      "403": [
+        "project_not_authorized"
+      ],
+      "409": [
+        "project_parked",
+        "project_archived",
+        "project_state_changed"
+      ]
+    },
+    "invalid_project_state_details": [
+      "snapshot_path_invalid",
+      "snapshot_path_symlink",
+      "snapshot_path_escape",
+      "snapshot_missing"
+    ]
+  }
+}

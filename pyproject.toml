@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hyvv"
+version = "0.1.15"
+description = "Worker-host runtime for local agent sandboxes. hyvv speaks a versioned /v1 contract."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [{ name = "mojomast" }]
+keywords = ["hyvv", "worker-host", "agents"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+# The Cua sandbox SDK is optional; hosts that run real bees install the cua extra.
+dependencies = []
+
+[project.optional-dependencies]
+cua = ["cua==0.5.0"]
+dev = []
+
+[project.scripts]
+hyvv = "hyvv.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/mojomast/hyvv"
+Repository = "https://github.com/mojomast/hyvv"
+Issues = "https://github.com/mojomast/hyvv/issues"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "hyvv/**",
+  "launcher.py",
+  "agy_cua_mcp.py",
+  "brief.schema.json",
+  "result.schema.json",
+  "config.example.json",
+  "contract/**",
+  "scripts/**",
+  "tests/**",
+  "README.md",
+  "LICENSE",
+  "ROADMAP.md",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["hyvv"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"launcher.py" = "launcher.py"
+"agy_cua_mcp.py" = "agy_cua_mcp.py"
+"brief.schema.json" = "brief.schema.json"
+"result.schema.json" = "result.schema.json"
+"config.example.json" = "hyvv/config.example.json"
+
+[tool.uv]
+# Install and lock with uv. Signed releases are produced by .github/workflows/release.yml.

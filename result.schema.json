@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "orbit.local-worker.result/v1",
+  "type": "object",
+  "required": ["schema", "attempt_id", "source", "observed", "worker_claims"],
+  "properties": {
+    "source": {"type": "object", "description": "project, repo_rev, input_manifest_sha256, image digest, harness, model, launcher version"},
+    "observed": {"type": "object", "description": "measured by the launcher: run_id, status, stop_reason, tool_calls, usage, files[{path,size,sha256,change:changed|deleted,in_assigned_scope}], error"},
+    "worker_claims": {"type": "object", "description": "the model's self-reported JSON block; never trusted as evidence"},
+    "checks": {"type": "array", "items": {"type": "object", "properties": {"name": {}, "command": {}, "passed": {}}}}
+  }
+}
