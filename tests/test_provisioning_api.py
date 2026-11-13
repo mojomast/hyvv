@@ -80,6 +80,16 @@ class ApiTests(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             return exc.code, json.loads(exc.read() or b"{}")
 
+
+    def get(self, path, token=TOKEN):
+        request = urllib.request.Request(self.url + path,
+                                         headers={"Authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read() or b"{}")
+
     def request(self, **overrides):
         body = {"repo": "mojomast/rizzstack-smoke", "source_rev": SHA, "profile": "smoke",
                 "job_id": "job_smoke", "idempotency_key": "prov_1", "project": "rizzstack-smoke"}
@@ -142,6 +152,59 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(result["state"], "cleaned")
         self.assertNotIn("rizzstack-smoke", self.cfg["projects"])
         self.assertFalse(workspace.exists())
+
+    def test_capabilities_advertise_the_enrolled_profile(self):
+        status, body = self.get("/v1/provision/capabilities")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["schema"], P.SCHEMA)
+        self.assertTrue(body["enabled"])
+        self.assertEqual(body["profiles"], ["smoke"])
+        self.assertTrue(body["supports_receipt_lookup"])
+        self.assertIn("ready", body["states"])
+
+    def test_a_disabled_host_advertises_no_capability(self):
+        cfg = dict(self.cfg, provisioning={"enabled": False})
+        stub = SimpleNamespace(cfg=cfg, attempts={}, provisioner=launcher.build_provisioner(cfg))
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), launcher.make_handler(stub, TOKEN))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        base = f"http://127.0.0.1:{httpd.server_port}"
+
+        request = urllib.request.Request(base + "/v1/provision/capabilities",
+                                         headers={"Authorization": f"Bearer {TOKEN}"})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = json.loads(response.read())
+        self.assertFalse(body["enabled"])
+        self.assertEqual(body["profiles"], [])
+
+    def test_receipt_lookup_returns_the_verified_receipt(self):
+        self.post("/v1/provision/project", self.request())
+
+        status, body = self.get("/v1/provision/receipts/prov_1")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["project"], "rizzstack-smoke")
+        self.assertEqual(body["resolved_revision"], SHA)
+        self.assertEqual(body["repo"], "mojomast/rizzstack-smoke")
+
+    def test_receipt_lookup_of_an_unknown_key_is_404(self):
+        status, body = self.get("/v1/provision/receipts/nope")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"], "receipt_unknown")
+
+    def test_receipt_lookup_refuses_a_receipt_the_world_moved_past(self):
+        self.post("/v1/provision/project", self.request())
+        workspace = Path(self.cfg["projects"]["rizzstack-smoke"]["path"])
+        import shutil
+
+        shutil.rmtree(workspace)
+
+        status, body = self.get("/v1/provision/receipts/prov_1")
+
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "receipt_stale")
 
 
 if __name__ == "__main__":

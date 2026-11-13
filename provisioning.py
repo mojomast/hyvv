@@ -622,7 +622,9 @@ class Provisioner:
             reasons.append("the project is not in the live registry")
         elif not self._registration_matches(registered, record, Path(workspace or ".")):
             reasons.append("the registry entry no longer matches the record")
-        if workspace and Path(workspace).exists() and profile is not None:
+        if workspace and not Path(workspace).exists():
+            reasons.append("the workspace is missing")
+        elif workspace and profile is not None:
             try:
                 self._verify_checkout(Path(workspace), repo, source_rev)
             except ProvisionError as exc:
@@ -724,6 +726,45 @@ class Provisioner:
             "verified": {"head": source_rev, "detached": True, "clean": True},
             "adopted": adopted,
         }
+
+
+    # -- capability advertisement and receipt lookup ------------------------
+
+    def capabilities(self) -> dict[str, Any]:
+        """Advertise only what this host actually implements and has enabled.
+
+        The launcher calls this with the live policy; a disabled host advertises
+        ``enabled: false`` and an empty profile list rather than pretending.
+        """
+        return {
+            "schema": SCHEMA,
+            "backend": "hyvv",
+            "enabled": True,
+            "profiles": sorted(self.policy),
+            "states": list(STATES),
+            "supports_cleanup": any(profile.allow_cleanup for profile in self.policy.values()),
+            "supports_receipt_lookup": True,
+            "idempotency": "idempotency_key binds repo, source_rev, profile, project, job_id",
+        }
+
+    def lookup_receipt(self, key: str) -> dict[str, Any]:
+        """Read-only receipt lookup that revalidates against reality.
+
+        A stored receipt is not authority by itself: the live registry, the full
+        workspace path and the checkout must still agree, or the record is marked
+        uncertain and refused.
+        """
+        record = self.journal.read(key)
+        if record is None:
+            raise ProvisionError("receipt_unknown", f"no provisioning record for {key}", "Provision first; do not guess.")
+        if record.get("state") in ("retiring", "cleaned"):
+            raise ProvisionError("receipt_retired", f"{key} was cleaned", "Use a new idempotency key.")
+        if record.get("state") != "ready":
+            raise ProvisionError("receipt_not_ready", f"{key} is {record.get('state')!r}", "Reconcile the provisioning state.")
+        try:
+            return self._replay_ready(record)
+        except ProvisionError as exc:
+            raise ProvisionError("receipt_stale", exc.message, "Re-provision with a new key after inspecting the host.") from exc
 
     # -- cleanup ------------------------------------------------------------
 

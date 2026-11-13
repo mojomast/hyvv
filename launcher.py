@@ -1284,6 +1284,21 @@ def make_handler(L, token):
                 rows = sorted(L.attempts.values(), key=lambda x: x.get("created_at") or 0, reverse=True)
                 if q.get("active") in ("1", "true"): rows = [x for x in rows if x["state"] not in TERMINAL]
                 return self._send(200, {"attempts": [L.listing(x) for x in rows[:200]]})
+            if p == ["v1", "provision", "capabilities"]:
+                svc = getattr(L, "provisioner", None)
+                if svc is None:
+                    cfg_block = L.cfg.get("provisioning") or {}
+                    return self._send(200, {"schema": "rizzstack.provisioning/1", "backend": "hyvv",
+                                            "enabled": False, "profiles": [], "states": [],
+                                            "supports_cleanup": False, "supports_receipt_lookup": False,
+                                            "reason": "provisioning is not enabled on this host" if not cfg_block.get("enabled") else "provisioning failed to initialise"})
+                return self._send(200, svc.capabilities())
+            if len(p) == 4 and p[:3] == ["v1", "provision", "receipts"]:
+                svc = getattr(L, "provisioner", None)
+                if svc is None: return self._send(501, {"error": "provisioning is not enabled on this host"})
+                try: return self._send(200, svc.lookup_receipt(p[3]))
+                except _provisioning.ProvisionError as ex:
+                    return self._send(404 if ex.code == "receipt_unknown" else 409, ex.to_dict())
             if p == ["v1", "provision", "receipts"]:
                 svc = getattr(L, "provisioner", None)
                 if svc is None: return self._send(501, {"error": "provisioning is not enabled on this host"})
