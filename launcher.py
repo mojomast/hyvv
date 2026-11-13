@@ -1213,19 +1213,19 @@ class Launcher:
 
 # ---------------------------------------------------------------- HTTP API
 
-def save_projects(path, projects):
-    """Atomically persist the project registry, preserving every other key.
+def active_attempts_for(attempts, project):
+    """Nonterminal attempts for a project, by the field the launcher actually stores.
 
-    The launcher never rewrote config.json before; provisioning needs durability
-    across restarts without one. Everything else in the file is copied verbatim.
+    Attempts keep their project inside the brief (``attempt["brief"]["project"]``),
+    so checking ``attempt["project"]`` would silently allow cleanup under a
+    running bee.
     """
-    import os as _os
-    target = Path(path)
-    raw = json.loads(target.read_text(encoding="utf-8-sig")) if target.exists() else {}
-    raw["projects"] = projects
-    tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(json.dumps(raw, indent=1), encoding="utf-8")
-    _os.replace(tmp, target)
+    count = 0
+    for attempt in attempts.values():
+        brief = attempt.get("brief") or {}
+        if brief.get("project") == project and attempt.get("state") not in TERMINAL:
+            count += 1
+    return count
 
 
 def build_provisioner(cfg):
@@ -1239,23 +1239,19 @@ def build_provisioner(cfg):
     policy_path = Path(block.get("policy") or config_path.with_name("provisioning-policy.json"))
     journal_dir = Path(block.get("journal") or (Path(cfg["data_dir"]) / "provisioning"))
     policy = _provisioning.load_policy(policy_path)
-    registry = cfg.setdefault("projects", {})
-
-    def persist(projects):
-        save_projects(config_path, projects)
+    registry = _provisioning.RegistryStore(config_path, cache=cfg.setdefault("projects", {}))
 
     def credential(repo):
-        # Authentication is delegated to the host's git credential helper. We only
-        # report whether the host claims to have one; the secret never enters here.
-        if block.get("credential_ready_repos") and repo in block["credential_ready_repos"]:
+        # Authentication is delegated to the host's git credential helper. Only the
+        # declared capability is consulted; no secret passes through the launcher.
+        if repo in (block.get("credential_ready_repos") or []):
             return "host-credential-helper"
         return None
 
     return _provisioning.Provisioner(
         policy=policy,
         journal=_provisioning.Journal(journal_dir),
-        projects=registry,
-        persist_registry=persist,
+        registry=registry,
         credential=credential,
     )
 
@@ -1334,13 +1330,13 @@ def make_handler(L, token):
                 svc = getattr(L, "provisioner", None)
                 if svc is None: return self._send(501, {"error": "provisioning is not enabled on this host"})
                 try: receipt = svc.provision(b)
-                except _provisioning.ProvisionError as ex: return self._send(409 if ex.code in ("journal_conflict", "project_conflict", "provision_in_progress") else 400, ex.to_dict())
+                except _provisioning.ProvisionError as ex: return self._send(409 if ex.code in ("journal_conflict", "project_conflict", "provision_in_progress", "project_retired", "stale_receipt", "quota_exhausted", "provision_lock_contention", "registry_busy") else 400, ex.to_dict())
                 return self._send(200, receipt)
             if p == ["v1", "provision", "cleanup"]:
                 svc = getattr(L, "provisioner", None)
                 if svc is None: return self._send(501, {"error": "provisioning is not enabled on this host"})
                 project = str(b.get("project") or "")
-                try: result = svc.cleanup(project, active_attempts=lambda name: sum(1 for a in L.attempts.values() if a.get("project") == name and a.get("state") not in TERMINAL))
+                try: result = svc.cleanup(project, active_attempts=lambda name: active_attempts_for(L.attempts, name))
                 except _provisioning.ProvisionError as ex: return self._send(409, ex.to_dict())
                 return self._send(200, result)
             if p == ["v1", "config"]:

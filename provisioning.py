@@ -2,43 +2,46 @@
 
 The coordinator submits a *declarative* request (repository identity, pinned
 commit, profile, job id, idempotency key). This module owns everything that
-touches the host filesystem and the launcher's project registry:
+touches the host filesystem and the launcher's project registry.
 
-  requested -> authorized -> preparing -> ready -> in_use -> retiring -> cleaned
+Lifecycle: requested -> authorized -> preparing -> ready -> in_use -> retiring
+-> cleaned, plus blocked / failed / uncertain for outcomes a human must inspect.
 
-Guarantees that matter operationally:
+Design rules enforced here:
 
-* authorisation comes from a host-enrolled policy file, not from the request;
-* the workspace path is derived from the root plus a validated name, never from
-  the request, and reparse points are refused;
-* the checkout is verified (remote identity, detached HEAD, exact SHA) before a
-  project is registered;
-* registration is atomic in memory and durable on disk, so it survives a
-  launcher restart without one;
-* every step is journalled, so a crash after clone/before registration, or a
-  lost registration acknowledgement, reconciles instead of duplicating.
+* authorisation comes from a host-enrolled policy file, never the request;
+* paths are derived from the root plus a validated name, and reparse points are
+  refused before any Git or filesystem operation;
+* a checkout is verified (remote, detached HEAD, exact SHA, clean) before any
+  project is registered — for fresh clones and recovered workspaces alike;
+* the idempotency key binds the whole immutable request;
+* registration goes through a file-locked read-modify-write store, so concurrent
+  provisioning cannot lose entries;
+* cleanup is journalled and recoverable, and a cleaned project is never
+  rediscovered as ready.
 
-Nothing here executes arbitrary shell: the only child process is ``git`` with a
-fixed argument vector built from policy-validated values.
+The only child process is ``git`` with a fixed argument vector built from
+policy-validated values. No shell, no arbitrary command execution.
 """
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import json
 import os
-import posixpath
 import re
+import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 SCHEMA = "rizzstack.provisioning/1"
 STATES = ("requested", "authorized", "preparing", "ready", "in_use", "retiring", "cleaned")
-FAILED = "failed"
-BLOCKED = "blocked"
-UNCERTAIN = "uncertain"
+ACTIVE_STATES = {"authorized", "preparing", "ready", "in_use"}
+FAILED, BLOCKED, UNCERTAIN = "failed", "blocked", "uncertain"
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -58,79 +61,73 @@ class ProvisionError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Windows-safe path handling
+# Path handling (Windows-aware; tested on POSIX through pure-path helpers)
 # ---------------------------------------------------------------------------
 
 
 def is_safe_name(name: Any) -> bool:
     if not isinstance(name, str) or not _NAME_RE.match(name) or name in {".", ".."}:
         return False
-    stem = name.split(".", 1)[0].lower()
-    return stem not in _RESERVED
-
-
-def child_path(root: str | os.PathLike[str], name: str) -> Path:
-    """Derive a child path from a validated name; reject anything else.
-
-    The name regex forbids separators, so ``name`` cannot introduce a new path
-    segment on either POSIX or Windows. Containment is checked with
-    ``commonpath`` on the native path, which is what the host actually resolves.
-    """
-
-    if not is_safe_name(name):
-        raise ProvisionError("invalid_project_name", f"project name {name!r} is not a safe path component", "Use lowercase letters, digits, dot, dash or underscore.")
-    base = Path(root)
-    if os.name == "nt" and not _windows_contained(str(base), str(Path(root) / name)):
-        raise ProvisionError("path_escape", "the workspace path escapes the configured root", "Fix the enrolled policy.")
-    if not base.is_absolute():
-        raise ProvisionError("invalid_workspace_root", "the workspace root must be an absolute path", "Fix the enrolled policy.")
-    candidate = base / name
-    try:
-        if os.path.commonpath([str(base), str(candidate)]) != str(base):
-            raise ProvisionError("path_escape", "the workspace path escapes the configured root", "Fix the enrolled policy.")
-    except ValueError as exc:
-        raise ProvisionError("path_escape", "the workspace path is on another drive", "Fix the enrolled policy.") from exc
-    return candidate
+    return name.split(".", 1)[0].lower() not in _RESERVED
 
 
 def _windows_contained(root: str, child: str) -> bool:
-    """Windows containment, tested directly even when the suite runs on POSIX."""
-
-    base = PureWindowsPath(root)
-    candidate = PureWindowsPath(child)
+    base, candidate = PureWindowsPath(root), PureWindowsPath(child)
     if not base.is_absolute() or not candidate.is_absolute():
         return False
     if base.drive.lower() != candidate.drive.lower():
         return False
-    prefix = str(base).lower().rstrip("\\") + "\\"
-    return str(candidate).lower().startswith(prefix)
+    return str(candidate).lower().startswith(str(base).lower().rstrip("\\") + "\\")
+
+
+def child_path(root: str | os.PathLike[str], name: str) -> Path:
+    if not is_safe_name(name):
+        raise ProvisionError("invalid_project_name", f"project name {name!r} is not a safe path component", "Use lowercase letters, digits, dot, dash or underscore.")
+    base = Path(root)
+    if not base.is_absolute():
+        raise ProvisionError("invalid_workspace_root", "the workspace root must be an absolute path", "Fix the enrolled policy.")
+    if os.name == "nt" and not _windows_contained(str(base), str(base / name)):
+        raise ProvisionError("path_escape", "the workspace path escapes the configured root", "Fix the enrolled policy.")
+    try:
+        if os.path.commonpath([str(base), str(base / name)]) != str(base):
+            raise ProvisionError("path_escape", "the workspace path escapes the configured root", "Fix the enrolled policy.")
+    except ValueError as exc:
+        raise ProvisionError("path_escape", "the workspace path is on another drive", "Fix the enrolled policy.") from exc
+    return base / name
 
 
 def is_reparse_point(path: Path) -> bool:
-    """True for symlinks and Windows reparse points (junctions)."""
-
     try:
         if path.is_symlink():
             return True
-        if os.name == "nt":  # pragma: no cover - exercised on the Windows host
+        if os.name == "nt":  # pragma: no cover - executed on the Windows host
             import stat
 
-            attrs = path.lstat().st_file_attributes  # type: ignore[attr-defined]
-            return bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+            return bool(path.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
         return False
     except OSError:
         return False
 
 
 def ensure_contained(root: Path, target: Path) -> None:
-    """Refuse a target that is not strictly below root, or that is a reparse point."""
-
     if is_reparse_point(target):
         raise ProvisionError("reparse_point", f"{target} is a symlink or reparse point", "Refusing to follow links out of the disposable root.")
-    root_resolved = root.resolve()
-    target_resolved = target.resolve()
+    root_resolved, target_resolved = root.resolve(), target.resolve()
     if root_resolved == target_resolved or root_resolved not in target_resolved.parents:
         raise ProvisionError("path_escape", f"{target} is not inside {root}", "Refusing to touch a path outside the disposable root.")
+
+
+def same_path(a: str | os.PathLike[str], b: str | os.PathLike[str]) -> bool:
+    """Full canonical comparison, not a basename comparison."""
+
+    def canon(value: str | os.PathLike[str]) -> str:
+        text = os.path.normcase(os.path.abspath(os.path.expanduser(str(value))))
+        return os.path.normpath(text.rstrip("\\/"))
+
+    try:
+        return canon(a) == canon(b)
+    except (OSError, ValueError):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +150,7 @@ class Profile:
         for pattern in self.repo_patterns:
             if pattern == repo:
                 return True
-            if pattern.endswith("/*") and repo.startswith(pattern[:-1]):
+            if pattern.endswith("*") and repo.startswith(pattern[:-1]):
                 return True
         return False
 
@@ -190,7 +187,7 @@ def load_policy(path: Path) -> dict[str, Profile]:
 
 
 class Journal:
-    """One JSON record per idempotency key, fsynced on every transition."""
+    """One JSON record per idempotency key, fsynced and atomically replaced."""
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
@@ -216,19 +213,13 @@ class Journal:
         body["updated_at"] = _now()
         payload = json.dumps(body, indent=2, sort_keys=True).encode("utf-8")
         tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-            raise
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
         return body
 
     def all(self) -> list[dict[str, Any]]:
@@ -239,6 +230,227 @@ class Journal:
             except (OSError, ValueError):
                 continue
         return records
+
+
+def _fsync_dir(path: Path) -> None:
+    if os.name == "nt":  # pragma: no cover - directories are not fsync-able on Windows
+        return
+    with contextlib.suppress(OSError):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# Cross-process key lock with crash recovery
+# ---------------------------------------------------------------------------
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":  # pragma: no cover - executed on Windows
+        import ctypes
+
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class KeyLock:
+    """A per-key lock that survives a killed owner.
+
+    The lock file records pid + host + timestamp. A lock whose owner is dead (or
+    whose host is this one and whose pid is gone) is stolen with an atomic
+    rename, so exactly one of several concurrent recovery processes wins and no
+    operation is performed twice.
+    """
+
+    def __init__(self, root: Path, key: str, *, stale_after: float = 300.0) -> None:
+        self.path = Path(root) / f"{key}.lock"
+        self.stale_after = stale_after
+        self.key = key
+        self.acquired = False
+
+    def _read(self) -> dict[str, Any]:
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _owner_dead(self, record: Mapping[str, Any]) -> bool:
+        if not record:
+            return True
+        if record.get("host") == socket.gethostname() and not pid_alive(int(record.get("pid") or 0)):
+            return True
+        age = time.time() - float(record.get("at") or 0)
+        return age > self.stale_after
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "at": time.time()}).encode()
+        for _ in range(50):
+            try:
+                fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            except FileExistsError:
+                record = self._read()
+                if not self._owner_dead(record):
+                    raise ProvisionError("provision_in_progress", f"another provisioning request holds {self.key}", "Wait for it to finish; do not clone twice.")
+                stale = self.path.with_name(f"{self.path.name}.stale.{os.getpid()}")
+                try:
+                    os.replace(self.path, stale)   # exactly one stealer wins
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    continue
+                with contextlib.suppress(OSError):
+                    stale.unlink()
+                continue
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self.acquired = True
+            return
+        raise ProvisionError("provision_lock_contention", f"could not acquire the lock for {self.key}", "Retry after the current owner finishes.")
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+        record = self._read()
+        if record.get("pid") == os.getpid() and record.get("host") == socket.gethostname():
+            with contextlib.suppress(OSError):
+                self.path.unlink()
+        self.acquired = False
+
+    def __enter__(self) -> "KeyLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+
+# ---------------------------------------------------------------------------
+# Registry store: file-locked read-modify-write
+# ---------------------------------------------------------------------------
+
+
+class RegistryStore:
+    """The launcher's project registry, persisted atomically and without lost updates.
+
+    Every mutation re-reads the file under an exclusive ``.lock`` file, applies
+    one change, writes a tmp file, fsyncs it, then replaces the target. Concurrent
+    provisioning of *different* keys therefore cannot drop each other's entries,
+    and a crash leaves either the old or the new file — never a partial one.
+    """
+
+    def __init__(self, config_path: Path, cache: dict[str, dict[str, Any]] | None = None) -> None:
+        self.config_path = Path(config_path)
+        self.cache = cache if cache is not None else self._load()
+
+    def _load(self) -> dict[str, dict[str, Any]]:
+        try:
+            raw = json.loads(self.config_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return {}
+        projects = raw.get("projects")
+        return dict(projects) if isinstance(projects, dict) else {}
+
+    @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        lock = self.config_path.with_name(self.config_path.name + ".lock")
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fd = None
+        for _ in range(400):
+            try:
+                fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                break
+            except FileExistsError:
+                with contextlib.suppress(OSError):
+                    if time.time() - lock.stat().st_mtime > 30:
+                        lock.unlink()  # abandoned by a crashed writer
+                        continue
+                time.sleep(0.01)
+        if fd is None:
+            raise ProvisionError("registry_busy", "the project registry is locked by another writer", "Retry shortly.")
+        try:
+            yield
+        finally:
+            os.close(fd)
+            with contextlib.suppress(OSError):
+                lock.unlink()
+
+    def _write(self, projects: dict[str, dict[str, Any]]) -> None:
+        raw = {}
+        if self.config_path.exists():
+            try:
+                raw = json.loads(self.config_path.read_text(encoding="utf-8-sig"))
+            except ValueError as exc:
+                raise ProvisionError("config_invalid", f"{self.config_path} is not valid JSON: {exc}", "Repair the config before provisioning.") from exc
+        raw["projects"] = projects
+        tmp = self.config_path.with_name(self.config_path.name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(raw, handle, indent=1)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, self.config_path)
+        _fsync_dir(self.config_path.parent)
+
+    def all(self) -> dict[str, dict[str, Any]]:
+        return dict(self.cache)
+
+    def get(self, name: str) -> dict[str, Any] | None:
+        return self.cache.get(name)
+
+    def set(self, name: str, entry: dict[str, Any]) -> None:
+        with self._locked():
+            current = self._load()
+            current[name] = entry
+            self._write(current)
+            self.cache.clear()
+            self.cache.update(current)
+
+    def delete(self, name: str) -> None:
+        with self._locked():
+            current = self._load()
+            if name in current:
+                del current[name]
+                self._write(current)
+            self.cache.clear()
+            self.cache.update(current)
+
+
+class MemoryRegistry(RegistryStore):
+    """Tests and simulations: same interface, no file."""
+
+    def __init__(self, seed: dict[str, dict[str, Any]] | None = None) -> None:
+        self.cache = dict(seed or {})
+        self.config_path = None  # type: ignore[assignment]
+
+    def _load(self) -> dict[str, dict[str, Any]]:
+        return dict(self.cache)
+
+    def _write(self, projects: dict[str, dict[str, Any]]) -> None:
+        self.cache = dict(projects)
+
+    def set(self, name: str, entry: dict[str, Any]) -> None:
+        self.cache[name] = dict(entry)
+
+    def delete(self, name: str) -> None:
+        self.cache.pop(name, None)
 
 
 # ---------------------------------------------------------------------------
@@ -253,14 +465,15 @@ def default_git(args: list[str], cwd: Path | None, *, timeout: float = 300.0) ->
         "GIT_CONFIG_NOSYSTEM": "1",
         "HOME": str(Path.home()),
     }
-    return subprocess.run(
-        ["git", *args],
-        cwd=str(cwd) if cwd else None,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=env,
-    )
+    return subprocess.run(["git", *args], cwd=str(cwd) if cwd else None, capture_output=True,
+                          text=True, timeout=timeout, env=env)
+
+
+_SECRETISH = re.compile(r"(x-access-token|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})[^\s]*")
+
+
+def _tail(done: subprocess.CompletedProcess) -> str:
+    return _SECRETISH.sub("<redacted>", (done.stderr or done.stdout or "git failed").strip()[:300])
 
 
 # ---------------------------------------------------------------------------
@@ -272,20 +485,19 @@ def default_git(args: list[str], cwd: Path | None, *, timeout: float = 300.0) ->
 class Provisioner:
     policy: Mapping[str, Profile]
     journal: Journal
-    projects: dict[str, dict[str, Any]]
-    persist_registry: Callable[[dict[str, dict[str, Any]]], None]
+    registry: RegistryStore
     git: Callable[..., subprocess.CompletedProcess] = default_git
     credential: Callable[[str], str | None] = lambda repo: None
+    url_for: Callable[[str], str] = lambda repo: f"https://github.com/{repo}.git"
     now: Callable[[], float] = time.time
+    lock_stale_after: float = 300.0
 
     # -- request validation -------------------------------------------------
 
-    def _validate(self, request: Mapping[str, Any]) -> tuple[Profile, str, str, str]:
-        repo = request.get("repo")
-        source_rev = request.get("source_rev")
-        profile_name = request.get("profile")
-        job_id = request.get("job_id")
-        key = request.get("idempotency_key")
+    def _validate(self, request: Mapping[str, Any]) -> tuple[Profile, str, str, str, str]:
+        repo, source_rev = request.get("repo"), request.get("source_rev")
+        profile_name, job_id = request.get("profile"), request.get("job_id")
+        key, project = request.get("idempotency_key"), request.get("project")
 
         if not isinstance(repo, str) or not _REPO_RE.match(repo):
             raise ProvisionError("invalid_repo", "repo must be 'owner/name'", "Submit a canonical repository identity.")
@@ -297,143 +509,198 @@ class Provisioner:
             raise ProvisionError("invalid_job_id", "job_id is required", "Pass the coordinator's job id.")
         if not is_safe_name(key):
             raise ProvisionError("invalid_idempotency_key", "idempotency_key must be a safe identifier", "Use a generated key.")
+        if project is not None and not is_safe_name(project):
+            raise ProvisionError("invalid_project_name", "project must be a safe path component", "Use a generated name.")
 
         profile = self.policy[profile_name]
         if not profile.allows_repo(repo):
             raise ProvisionError("repo_not_allowed", f"profile {profile_name} does not permit {repo}", "Expand the enrolled policy deliberately.")
         if "clone" not in profile.git_actions:
             raise ProvisionError("git_action_not_allowed", "profile does not permit clone", "Fix the policy.")
-        return profile, repo, source_rev, str(job_id)
+        return profile, repo, source_rev, str(job_id), str(project or repo.split("/")[-1])
+
+    def _request_identity(self, request: Mapping[str, Any], repo: str, source_rev: str, job_id: str, project: str) -> dict[str, Any]:
+        return {"repo": repo, "source_rev": source_rev, "profile": str(request["profile"]), "job_id": job_id, "project": project}
 
     # -- main entry ---------------------------------------------------------
 
     def provision(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        profile, repo, source_rev, job_id = self._validate(request)
+        profile, repo, source_rev, job_id, project = self._validate(request)
         key = str(request["idempotency_key"])
-        lock = self.journal.root / f"{key}.lock"
-        try:
-            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError as exc:
-            raise ProvisionError("provision_in_progress", f"another provisioning request holds {key}", "Wait for it to finish; do not clone twice.") from exc
-        os.close(fd)
-        try:
-            return self._provision_locked(request, profile, repo, source_rev, job_id, key)
-        finally:
-            try:
-                lock.unlink()
-            except OSError:
-                pass
+        identity = self._request_identity(request, repo, source_rev, job_id, project)
 
-    def _provision_locked(self, request, profile, repo, source_rev, job_id, key) -> dict[str, Any]:
-        project = str(request.get("project") or repo.split("/")[-1])
+        with KeyLock(self.journal.root, key, stale_after=self.lock_stale_after):
+            existing = self.journal.read(key)
+            if existing:
+                self._check_idempotency(key, existing, identity)
+                if existing.get("state") in ("retiring", "cleaned"):
+                    raise ProvisionError("project_retired", f"{key} was cleaned; use a new key to provision again", "Request a new key.")
+                if existing.get("state") == "ready":
+                    return self._replay_ready(existing)
+
+            self._enforce_quota(profile, key)
+            trail = self._provision_steps(existing, identity, profile, key)
+            return trail
+
+    def _check_idempotency(self, key: str, existing: Mapping[str, Any], identity: Mapping[str, Any]) -> None:
+        for field_name, value in identity.items():
+            if existing.get(field_name) not in (None, value):
+                raise ProvisionError("journal_conflict", f"this idempotency key was used with a different {field_name}", f"Use a new key for a different request.")
+
+    def _enforce_quota(self, profile: Profile, key: str) -> None:
+        active = [r for r in self.journal.all()
+                  if r.get("profile") == profile.name and r.get("state") in ACTIVE_STATES and r.get("idempotency_key") != key]
+        if len(active) >= profile.max_provisioned:
+            raise ProvisionError("quota_exhausted", f"profile {profile.name} already holds {len(active)} provisioned projects (max {profile.max_provisioned})", "Clean up an unused workspace or raise the enrolled limit deliberately.")
+
+    def _provision_steps(self, existing: Mapping[str, Any] | None, identity: Mapping[str, Any], profile: Profile, key: str) -> dict[str, Any]:
+        project = identity["project"]
         target = child_path(profile.workspace_root, project)
-
-        existing = self.journal.read(key)
-        if existing and existing.get("repo") not in (None, repo):
-            raise ProvisionError("journal_conflict", "this idempotency key was used for another repository", "Use a new key per request.")
-        if existing and existing.get("source_rev") not in (None, source_rev):
-            raise ProvisionError("journal_conflict", "this idempotency key was used for another revision", "Use a new key per request.")
-        if existing and existing.get("state") == "ready":
-            return self._receipt(existing, adopted=existing.get("project") in self.projects)
-
-        record = existing or {
-            "schema": SCHEMA,
-            "idempotency_key": key,
-            "job_id": job_id,
-            "repo": repo,
-            "source_rev": source_rev,
-            "profile": profile.name,
-            "project": project,
-            "workspace": str(target),
-            "state": "requested",
-            "created_at": _now(),
-        }
-        record["state"] = "authorized"
+        record = dict(existing or {})
+        record.update(identity)
+        record.update({
+            "schema": SCHEMA, "idempotency_key": key, "workspace": str(target),
+            "state": "authorized" if not existing else record.get("state", "authorized"),
+        })
+        record.setdefault("created_at", _now())
         self.journal.write(key, record)
 
-        # Crash recovery: an existing checkout is reconciled, never re-cloned.
-        state = record.get("state")
+        # Reparse points and escapes are refused before any filesystem action.
+        ensure_contained(Path(profile.workspace_root), target) if target.exists() else None
         if target.exists():
             record["state"] = "preparing"
             self.journal.write(key, record)
-            ok, detail = self._verify_checkout(target, repo, source_rev)
-            if not ok:
-                record.update(state=FAILED, failure="checkout_mismatch", detail=detail)
-                self.journal.write(key, record)
-                raise ProvisionError("checkout_mismatch", detail, "Inspect the workspace; do not retry blindly.")
+            self._verify_checkout(target, identity["repo"], identity["source_rev"])
         else:
             record["state"] = "preparing"
             self.journal.write(key, record)
-            self._clone(target, repo, source_rev)
+            self._clone(target, identity["repo"], identity["source_rev"])
 
-        # Registration: adopt if already present and identical.
-        registered = self.projects.get(project)
+        registered = self.registry.get(project)
         adopted = False
         if registered:
-            if not self._registration_matches(registered, repo, target):
-                record.update(state=BLOCKED, failure="project_conflict", detail="an existing project disagrees")
+            if not self._registration_matches(registered, identity, target):
+                record.update(state=BLOCKED, failure="project_conflict", detail="an existing project disagrees with this request")
                 self.journal.write(key, record)
-                raise ProvisionError("project_conflict", f"project {project} is already registered for a different repository or path", "Choose another project name or clean the stale registration.")
+                raise ProvisionError("project_conflict", f"project {project} is already registered for a different repository, revision, profile or path", "Choose another project name or clean the stale registration.")
             adopted = True
         else:
-            registry = dict(self.projects)
-            registry[project] = {"repo": repo, "path": str(target), "source_rev": source_rev, "profile": profile.name}
-            self.persist_registry(registry)          # durable first
-            self.projects[project] = registry[project]  # then live
+            self.registry.set(project, {
+                "repo": identity["repo"], "path": str(target), "source_rev": identity["source_rev"],
+                "profile": profile.name, "job_id": identity["job_id"],
+            })
 
-        receipt = self._receipt_fields(project, repo, source_rev, str(target), profile.name)
-        receipt["adopted"] = adopted
-        record.update(state="ready", ready_at=_now(), receipt=receipt)
+        ready_at = self.now()
+        receipt = self._receipt_fields(project, identity["repo"], identity["source_rev"], str(target), profile, adopted, ready_at)
+        record.update(state="ready", ready_at=_iso(ready_at), receipt=receipt)
         self.journal.write(key, record)
         return receipt
+
+    # -- replay -------------------------------------------------------------
+
+    def _replay_ready(self, record: Mapping[str, Any]) -> dict[str, Any]:
+        """A ready record is only usable while it still matches reality."""
+
+        key = str(record["idempotency_key"])
+        project, repo, source_rev = str(record["project"]), str(record["repo"]), str(record["source_rev"])
+        workspace = str(record.get("workspace") or "")
+        profile = self.policy.get(str(record.get("profile") or ""))
+
+        registered = self.registry.get(project)
+        reasons = []
+        if profile is None:
+            reasons.append("the profile is no longer enrolled")
+        if not workspace:
+            reasons.append("the record has no workspace")
+        if not registered:
+            reasons.append("the project is not in the live registry")
+        elif not self._registration_matches(registered, record, Path(workspace or ".")):
+            reasons.append("the registry entry no longer matches the record")
+        if workspace and Path(workspace).exists() and profile is not None:
+            try:
+                self._verify_checkout(Path(workspace), repo, source_rev)
+            except ProvisionError as exc:
+                reasons.append(exc.message)
+
+        if reasons:
+            record = dict(record, state=UNCERTAIN, failure="stale_receipt", detail="; ".join(reasons))
+            self.journal.write(key, record)
+            raise ProvisionError("stale_receipt", f"ready record {key} is stale: {'; '.join(reasons)}", "Re-provision with a new key after inspecting the workspace.")
+        return dict(record["receipt"])
 
     # -- steps --------------------------------------------------------------
 
     def _clone(self, target: Path, repo: str, source_rev: str) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
-        # Authentication is the host's: a short-lived credential helper (or a
-        # scoped token file) configured outside the launcher. The secret is never
-        # placed on the command line, in the remote URL, or in a receipt — this
-        # module only checks that the host says it can authenticate.
+        if is_reparse_point(target.parent):
+            raise ProvisionError("reparse_point", f"{target.parent} is a reparse point", "Refusing to clone through a link.")
         if self.credential(repo) is None:
-            raise ProvisionError(
-                "credential_unavailable",
-                f"the host has no credential for {repo}",
-                "Configure a repository-scoped read-only credential on the worker host.",
-            )
-        url = f"https://github.com/{repo}.git"
-        args = ["clone", "--no-checkout", "--filter=blob:none", url, str(target)]
-        done = self.git(args, None)
+            raise ProvisionError("credential_unavailable", f"the host has no credential for {repo}", "Configure a repository-scoped read-only credential on the worker host.")
+        url = self.url_for(repo)
+        done = self.git(["clone", "--no-checkout", "--filter=blob:none", url, str(target)], None)
         if done.returncode != 0:
             raise ProvisionError("clone_failed", _tail(done), "Check the repository and host credentials.")
+
+        # The pinned commit may not be reachable from the branch tips the clone
+        # fetched, so fetch that exact object before checking it out.
+        fetched = self.git(["-C", str(target), "fetch", "--depth=1", "origin", source_rev], None)
+        if fetched.returncode != 0:
+            fetched = self.git(["-C", str(target), "fetch", "origin", source_rev], None)
+        if fetched.returncode != 0:
+            raise ProvisionError("fetch_failed", _tail(fetched), "Verify the pinned revision exists in the repository.")
         checkout = self.git(["-C", str(target), "checkout", "--detach", source_rev], None)
         if checkout.returncode != 0:
             raise ProvisionError("checkout_failed", _tail(checkout), "Verify the pinned revision exists in the repository.")
-        fetch = self.git(["-C", str(target), "fetch", "--quiet", "origin", source_rev], None)
-        if fetch.returncode == 0:
-            again = self.git(["-C", str(target), "checkout", "--detach", source_rev], None)
-            if again.returncode != 0:
-                raise ProvisionError("checkout_failed", _tail(again), "Verify the pinned revision exists in the repository.")
+        self._verify_checkout(target, repo, source_rev)
 
-    def _verify_checkout(self, target: Path, repo: str, source_rev: str) -> tuple[bool, str]:
+    def _verify_checkout(self, target: Path, repo: str, source_rev: str) -> None:
+        ensure_contained(Path(self._root_for(target)), target)
         head = self.git(["-C", str(target), "rev-parse", "HEAD"], None)
         if head.returncode != 0 or head.stdout.strip() != source_rev:
-            return False, f"HEAD is {head.stdout.strip()[:12]!r}, expected {source_rev[:12]!r}"
+            raise ProvisionError("checkout_mismatch", f"HEAD is {head.stdout.strip()[:12]!r}, expected {source_rev[:12]!r}", "Inspect the workspace; do not retry blindly.")
+        symbolic = self.git(["-C", str(target), "symbolic-ref", "-q", "HEAD"], None)
+        if symbolic.returncode == 0:
+            raise ProvisionError("checkout_mismatch", "the checkout is on a branch, not a detached HEAD", "Re-checkout the pinned revision.")
         remote = self.git(["-C", str(target), "config", "--get", "remote.origin.url"], None)
-        if remote.returncode != 0 or repo not in remote.stdout:
-            return False, f"remote origin is {remote.stdout.strip()!r}, expected to contain {repo!r}"
+        if remote.returncode != 0 or not self._remote_matches(remote.stdout.strip(), repo):
+            raise ProvisionError("remote_mismatch", f"remote origin is {remote.stdout.strip()!r}, expected {repo!r}", "Re-provision from the correct repository.")
         state = self.git(["-C", str(target), "status", "--porcelain"], None)
         if state.returncode != 0 or state.stdout.strip():
-            return False, "the checkout is dirty"
-        return True, "ok"
+            raise ProvisionError("checkout_dirty", "the checkout has local modifications", "Inspect the workspace; do not retry blindly.")
 
-    def _registration_matches(self, entry: Mapping[str, Any], repo: str, target: Path) -> bool:
-        recorded_repo = str(entry.get("repo") or "")
-        same_repo = recorded_repo in {repo, f"https://github.com/{repo}.git"}
-        same_path = PureWindowsPath(str(entry.get("path") or "")).name == target.name
-        return same_repo and same_path
+    def _root_for(self, target: Path) -> Path:
+        for profile in self.policy.values():
+            root = Path(profile.workspace_root)
+            try:
+                if os.path.commonpath([str(root), str(target)]) == str(root):
+                    return root
+            except ValueError:
+                continue
+        raise ProvisionError("path_escape", f"{target} is not inside any enrolled workspace root", "Refusing to touch it.")
 
-    def _receipt_fields(self, project: str, repo: str, source_rev: str, workspace: str, profile: str) -> dict[str, Any]:
+    def _remote_matches(self, remote: str, repo: str) -> bool:
+        """The remote must be the repository we were told to fetch, by either
+        its canonical identity or the exact URL this host uses for it."""
+
+        def canon(value: str) -> str:
+            text = value.strip().rstrip("/")
+            if text.endswith(".git"):
+                text = text[:-4]
+            return text.lower()
+
+        if not remote:
+            return False
+        return canon(remote) in {canon(repo), canon(self.url_for(repo))}
+
+    def _registration_matches(self, entry: Mapping[str, Any], identity: Mapping[str, Any], target: Path) -> bool:
+        return (
+            str(entry.get("repo") or "") == identity["repo"]
+            and str(entry.get("source_rev") or "") == identity["source_rev"]
+            and str(entry.get("profile") or "") == str(identity.get("profile") or "")
+            and same_path(str(entry.get("path") or ""), target)
+        )
+
+    def _receipt_fields(self, project: str, repo: str, source_rev: str, workspace: str, profile: Profile, adopted: bool, ready_at: float) -> dict[str, Any]:
         return {
             "schema": SCHEMA,
             "status": "ready",
@@ -442,58 +709,62 @@ class Provisioner:
             "repo": repo,
             "resolved_revision": source_rev,
             "workspace": workspace,
-            "profile": profile,
-            "host": _hostname(),
+            "profile": profile.name,
+            "task_scopes": list(profile.task_scopes),
+            "host": socket.gethostname(),
             "fixture": PureWindowsPath(workspace).name,
-            "verified": {"head": source_rev, "detached": True},
+            "ttl_hours": profile.ttl_hours,
+            "expires_at": _iso(ready_at + profile.ttl_hours * 3600),
+            "verified": {"head": source_rev, "detached": True, "clean": True},
+            "adopted": adopted,
         }
-
-    def _receipt(self, record: Mapping[str, Any], *, adopted: bool) -> dict[str, Any]:
-        receipt = dict(record.get("receipt") or self._receipt_fields(str(record.get("project")), str(record.get("repo")), str(record.get("source_rev")), str(record.get("workspace")), str(record.get("profile"))))
-        receipt["adopted"] = adopted
-        return receipt
 
     # -- cleanup ------------------------------------------------------------
 
     def cleanup(self, project: str, *, active_attempts: Callable[[str], int] = lambda name: 0) -> dict[str, Any]:
-        entry = self.projects.get(project)
+        entry = self.registry.get(project)
         if not entry:
-            raise ProvisionError("unknown_project", f"{project} is not provisioned", "Nothing to clean.")
-        profile_name = str(entry.get("profile") or "")
-        profile = self.policy.get(profile_name)
+            # A crash between unregistering and deleting leaves a journal record.
+            for record in self.journal.all():
+                if record.get("project") == project and record.get("state") in ("retiring", "cleaned"):
+                    entry = {"repo": record.get("repo"), "path": record.get("workspace"), "profile": record.get("profile"), "source_rev": record.get("source_rev")}
+                    break
+            if not entry:
+                raise ProvisionError("unknown_project", f"{project} is not provisioned", "Nothing to clean.")
+
+        profile = self.policy.get(str(entry.get("profile") or ""))
         if profile is None or not profile.allow_cleanup:
-            raise ProvisionError("cleanup_not_allowed", f"profile {profile_name!r} does not permit cleanup", "Require explicit approval.")
+            raise ProvisionError("cleanup_not_allowed", f"profile {entry.get('profile')!r} does not permit cleanup", "Require explicit approval.")
         if active_attempts(project):
-            raise ProvisionError("project_in_use", f"{project} has running attempts", "Retry when idle.")
+            raise ProvisionError("project_in_use", f"{project} has nonterminal attempts", "Retry when idle.")
 
         workspace = Path(str(entry.get("path") or ""))
         root = Path(profile.workspace_root)
-        ensure_contained(root, workspace)  # refuses escapes and reparse points
+        ensure_contained(root, workspace)
 
-        registry = dict(self.projects)
-        registry.pop(project, None)
-        self.persist_registry(registry)
-        self.projects.pop(project, None)
+        record = next((r for r in self.journal.all() if r.get("project") == project and r.get("state") in ("ready", "in_use", "retiring")), None)
+        key = record["idempotency_key"] if record else f"cleanup-{project}"
+        if record is None:
+            record = {"schema": SCHEMA, "idempotency_key": key, "project": project, "repo": entry.get("repo"),
+                      "source_rev": entry.get("source_rev"), "profile": entry.get("profile"), "workspace": str(workspace), "created_at": _now()}
+
+        record.update(state="retiring", cleanup_started_at=_now())
+        self.journal.write(key, record)
+
+        self.registry.delete(project)                   # unregister first: no dispatch into a dying tree
 
         import shutil
 
-        shutil.rmtree(workspace, ignore_errors=False)
+        shutil.rmtree(workspace, ignore_errors=False)   # then delete the checkout
+
+        record.update(state="cleaned", cleaned_at=_now())
+        self.journal.write(key, record)
         return {"project": project, "state": "cleaned", "workspace": str(workspace), "evidence_preserved": True}
 
 
-_SECRETISH = re.compile(r"(x-access-token|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})[^\s]*")
+def _now() -> float:
+    return time.time()
 
 
-def _tail(done: subprocess.CompletedProcess) -> str:
-    text = (done.stderr or done.stdout or "git failed").strip()[:300]
-    return _SECRETISH.sub("<redacted>", text)
-
-
-def _hostname() -> str:
-    import socket
-
-    return socket.gethostname()
-
-
-def _now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+def _iso(stamp: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp))

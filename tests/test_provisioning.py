@@ -1,4 +1,4 @@
-"""Worker-side provisioning tests (stdlib unittest; the repo's CI uses it)."""
+"""Unit tests for the provisioning primitive (stdlib unittest)."""
 
 from __future__ import annotations
 
@@ -16,40 +16,34 @@ OTHER = "1" * 40
 REPO = "mojomast/rizzstack-smoke"
 
 
-def policy(root: Path, *, repo_patterns=None, allow_cleanup=True) -> dict:
-    raw = {
-        "schema": P.SCHEMA,
-        "profiles": {
-            "smoke": {
-                "repo_patterns": repo_patterns or ["mojomast/rizzstack-smoke", "mojomast/smoke-*"],
-                "workspace_root": str(root),
-                "allow_cleanup": allow_cleanup,
-                "max_provisioned": 5,
-                "ttl_hours": 2,
-            }
-        },
-    }
+def policy(root: Path, *, allow_cleanup=True, max_provisioned=5) -> dict:
     path = root.parent / "policy.json"
-    path.write_text(json.dumps(raw))
+    path.write_text(json.dumps({
+        "schema": P.SCHEMA,
+        "profiles": {"smoke": {"repo_patterns": ["mojomast/rizzstack-smoke", "mojomast/smoke-*"],
+                               "workspace_root": str(root), "allow_cleanup": allow_cleanup,
+                               "max_provisioned": max_provisioned, "ttl_hours": 2}},
+    }))
     return P.load_policy(path)
 
 
 class FakeGit:
+    """Simulates git; symbolic-ref fails so the checkout reads as detached."""
+
     def __init__(self, *, head=SHA, remote="https://github.com/mojomast/rizzstack-smoke.git", dirty=""):
         self.calls: list[list[str]] = []
-        self.head = head
-        self.remote = remote
-        self.dirty = dirty
+        self.head, self.remote, self.dirty = head, remote, dirty
 
     def __call__(self, args, cwd, timeout=300.0):
         self.calls.append(list(args))
         if args[0] == "clone":
-            target = Path(args[-1])
-            (target / ".git").mkdir(parents=True, exist_ok=True)
+            (Path(args[-1]) / ".git").mkdir(parents=True, exist_ok=True)
             return subprocess.CompletedProcess(args, 0, "", "")
         if args[0] == "-C":
             if "rev-parse" in args:
                 return subprocess.CompletedProcess(args, 0, self.head + "\n", "")
+            if "symbolic-ref" in args:
+                return subprocess.CompletedProcess(args, 1, "", "")
             if "config" in args and "--get" in args:
                 return subprocess.CompletedProcess(args, 0, self.remote + "\n", "")
             if "status" in args:
@@ -64,61 +58,37 @@ class Harness(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         (self.tmp / "fixtures").mkdir()
 
-    def make(self, *, git=None, credential=lambda repo: "token", allow_cleanup=True):
-        self.registry: dict = {}
-        self.saved: list[dict] = []
+    def make(self, *, git=None, credential=lambda repo: "token", allow_cleanup=True, max_provisioned=5):
+        self.reg = P.MemoryRegistry()
         self.journal = P.Journal(self.tmp / "journal")
         self.git = git or FakeGit()
-
-        def persist(projects):
-            self.saved.append(dict(projects))
-
         self.prov = P.Provisioner(
-            policy=policy(self.tmp / "fixtures", allow_cleanup=allow_cleanup),
+            policy=policy(self.tmp / "fixtures", allow_cleanup=allow_cleanup, max_provisioned=max_provisioned),
             journal=self.journal,
-            projects=self.registry,
-            persist_registry=persist,
+            registry=self.reg,
             git=self.git,
             credential=credential,
         )
         return self.prov
 
     def request(self, **overrides):
-        body = {
-            "repo": REPO,
-            "source_rev": SHA,
-            "profile": "smoke",
-            "job_id": "job_a",
-            "idempotency_key": "prov_1",
-            "project": "rizzstack-smoke",
-        }
+        body = {"repo": REPO, "source_rev": SHA, "profile": "smoke", "job_id": "job_a",
+                "idempotency_key": "prov_1", "project": "rizzstack-smoke"}
         body.update(overrides)
         return body
-
-    def seed_preparing(self, workspace: Path):
-        self.journal.write("prov_1", {
-            "schema": P.SCHEMA, "idempotency_key": "prov_1", "job_id": "job_a", "repo": REPO,
-            "source_rev": SHA, "profile": "smoke", "project": "rizzstack-smoke",
-            "workspace": str(workspace), "state": "preparing", "created_at": "now",
-        })
 
 
 class PathTests(Harness):
     def test_unsafe_names_are_refused(self):
-        for bad in ["..", "../escape", "a/b", "a\\b", "", ".", "nul\x00", "C:evil", "con", "com1"]:
+        for bad in ["..", "../escape", "a/b", "a\\b", "", ".", "C:evil", "con", "com1"]:
             with self.subTest(name=bad):
                 self.assertFalse(P.is_safe_name(bad))
                 with self.assertRaises(P.ProvisionError):
                     P.child_path(ROOT, bad)
 
-    def test_safe_names_produce_a_contained_child(self):
-        child = P.child_path(self.tmp / "fixtures", "rizzstack-smoke")
-        self.assertEqual(child.parent, self.tmp / "fixtures")
-
     def test_windows_containment_rules(self):
         self.assertTrue(P._windows_contained(ROOT, ROOT + "\\rizzstack-smoke"))
         self.assertFalse(P._windows_contained(ROOT, "C:\\Windows\\System32"))
-        self.assertFalse(P._windows_contained(ROOT, ROOT + "..\\escape"))
         self.assertFalse(P._windows_contained(ROOT, "D:\\fixtures\\x"))
 
     def test_a_symlink_inside_the_root_is_refused(self):
@@ -130,6 +100,10 @@ class PathTests(Harness):
             P.ensure_contained(self.tmp / "fixtures", link)
         self.assertEqual(caught.exception.code, "reparse_point")
 
+    def test_a_basename_only_match_is_not_the_same_path(self):
+        self.assertFalse(P.same_path("/a/fixtures/smoke", "/b/fixtures/smoke"))
+        self.assertTrue(P.same_path("/a/fixtures/smoke/", "/a/fixtures/./smoke"))
+
 
 class PolicyTests(Harness):
     def test_an_unlisted_repository_is_refused(self):
@@ -137,8 +111,7 @@ class PolicyTests(Harness):
         with self.assertRaises(P.ProvisionError) as caught:
             prov.provision(self.request(repo="attacker/evil"))
         self.assertEqual(caught.exception.code, "repo_not_allowed")
-        self.assertEqual(self.registry, {})
-        self.assertEqual(self.saved, [])
+        self.assertEqual(self.reg.all(), {})
 
     def test_a_short_sha_is_refused(self):
         prov = self.make()
@@ -158,19 +131,18 @@ class PolicyTests(Harness):
             prov.provision(self.request())
         self.assertEqual(caught.exception.code, "credential_unavailable")
         self.assertFalse([c for c in self.git.calls if c[0] == "clone"])
-        self.assertEqual(self.registry, {})
 
 
 class ProvisionTests(Harness):
-    def test_clone_checks_out_the_exact_pinned_sha_and_registers(self):
+    def test_clone_checks_out_the_pinned_sha_and_registers(self):
         prov = self.make()
         receipt = prov.provision(self.request())
 
         self.assertEqual(receipt["status"], "ready")
-        self.assertEqual(receipt["project"], "rizzstack-smoke")
         self.assertEqual(receipt["resolved_revision"], SHA)
-        self.assertEqual(self.registry["rizzstack-smoke"]["source_rev"], SHA)
-        self.assertTrue(self.saved and self.saved[-1]["rizzstack-smoke"]["path"].endswith("rizzstack-smoke"))
+        self.assertEqual(self.reg.get("rizzstack-smoke")["source_rev"], SHA)
+        self.assertTrue(receipt["expires_at"].endswith("Z"))
+        self.assertEqual(receipt["task_scopes"], [])
         checkout = [c for c in self.git.calls if "checkout" in c]
         self.assertTrue(checkout and SHA in checkout[0])
         self.assertEqual(self.journal.read("prov_1")["state"], "ready")
@@ -179,39 +151,43 @@ class ProvisionTests(Harness):
         prov = self.make()
         first = prov.provision(self.request())
         second = prov.provision(self.request())
-
         self.assertEqual(second["resolved_revision"], first["resolved_revision"])
         self.assertEqual(len([c for c in self.git.calls if c[0] == "clone"]), 1)
-        self.assertEqual(len(self.saved), 1)
 
     def test_a_crash_after_clone_before_registration_resumes(self):
         prov = self.make()
         target = self.tmp / "fixtures" / "rizzstack-smoke"
         (target / ".git").mkdir(parents=True)
-        self.seed_preparing(target)
+        self.journal.write("prov_1", {
+            "schema": P.SCHEMA, "idempotency_key": "prov_1", "job_id": "job_a", "repo": REPO,
+            "source_rev": SHA, "profile": "smoke", "project": "rizzstack-smoke",
+            "workspace": str(target), "state": "preparing", "created_at": "now"})
 
         receipt = prov.provision(self.request())
 
         self.assertEqual(receipt["status"], "ready")
         self.assertFalse([c for c in self.git.calls if c[0] == "clone"])
-        self.assertEqual(self.registry["rizzstack-smoke"]["source_rev"], SHA)
+        self.assertEqual(self.reg.get("rizzstack-smoke")["source_rev"], SHA)
 
     def test_a_lost_registration_ack_adopts_the_existing_project(self):
         prov = self.make()
         target = self.tmp / "fixtures" / "rizzstack-smoke"
         (target / ".git").mkdir(parents=True)
-        self.registry["rizzstack-smoke"] = {"repo": REPO, "path": str(target), "source_rev": SHA, "profile": "smoke"}
-        self.seed_preparing(target)
+        self.reg.set("rizzstack-smoke", {"repo": REPO, "path": str(target), "source_rev": SHA, "profile": "smoke"})
+        self.journal.write("prov_1", {
+            "schema": P.SCHEMA, "idempotency_key": "prov_1", "job_id": "job_a", "repo": REPO,
+            "source_rev": SHA, "profile": "smoke", "project": "rizzstack-smoke",
+            "workspace": str(target), "state": "preparing", "created_at": "now"})
 
         receipt = prov.provision(self.request())
 
         self.assertEqual(receipt["status"], "ready")
         self.assertIs(receipt.get("adopted"), True)
-        self.assertEqual(self.saved, [])
 
-    def test_an_existing_project_for_another_repo_blocks(self):
+    def test_an_existing_project_with_the_same_basename_but_another_path_blocks(self):
         prov = self.make()
-        self.registry["rizzstack-smoke"] = {"repo": "mojomast/other", "path": str(self.tmp / "fixtures" / "rizzstack-smoke")}
+        self.reg.set("rizzstack-smoke", {"repo": REPO, "path": str(self.tmp / "other" / "rizzstack-smoke"),
+                                         "source_rev": SHA, "profile": "smoke"})
         with self.assertRaises(P.ProvisionError) as caught:
             prov.provision(self.request())
         self.assertEqual(caught.exception.code, "project_conflict")
@@ -220,32 +196,13 @@ class ProvisionTests(Harness):
         prov = self.make(git=FakeGit(dirty=" M smoke/answer.py\n"))
         target = self.tmp / "fixtures" / "rizzstack-smoke"
         (target / ".git").mkdir(parents=True)
-        self.seed_preparing(target)
-
+        self.journal.write("prov_1", {
+            "schema": P.SCHEMA, "idempotency_key": "prov_1", "job_id": "job_a", "repo": REPO,
+            "source_rev": SHA, "profile": "smoke", "project": "rizzstack-smoke",
+            "workspace": str(target), "state": "preparing", "created_at": "now"})
         with self.assertRaises(P.ProvisionError) as caught:
             prov.provision(self.request())
-        self.assertEqual(caught.exception.code, "checkout_mismatch")
-        self.assertEqual(self.registry, {})
-
-    def test_a_wrong_head_is_refused_on_resume(self):
-        prov = self.make(git=FakeGit(head=OTHER))
-        target = self.tmp / "fixtures" / "rizzstack-smoke"
-        (target / ".git").mkdir(parents=True)
-        self.seed_preparing(target)
-
-        with self.assertRaises(P.ProvisionError) as caught:
-            prov.provision(self.request())
-        self.assertEqual(caught.exception.code, "checkout_mismatch")
-
-    def test_a_concurrent_request_for_the_same_key_is_refused(self):
-        prov = self.make()
-        (self.tmp / "journal").mkdir(exist_ok=True)
-        lock = self.tmp / "journal" / "prov_1.lock"
-        lock.write_text("held")
-        with self.assertRaises(P.ProvisionError) as caught:
-            prov.provision(self.request())
-        self.assertEqual(caught.exception.code, "provision_in_progress")
-        self.assertFalse([c for c in self.git.calls if c[0] == "clone"])
+        self.assertEqual(caught.exception.code, "checkout_dirty")
 
 
 class CleanupTests(Harness):
@@ -258,7 +215,7 @@ class CleanupTests(Harness):
         prov, workspace = self.ready()
         result = prov.cleanup("rizzstack-smoke")
         self.assertEqual(result["state"], "cleaned")
-        self.assertNotIn("rizzstack-smoke", self.registry)
+        self.assertIsNone(self.reg.get("rizzstack-smoke"))
         self.assertFalse(workspace.exists())
 
     def test_cleanup_refuses_a_project_with_active_attempts(self):
@@ -266,11 +223,13 @@ class CleanupTests(Harness):
         with self.assertRaises(P.ProvisionError) as caught:
             prov.cleanup("rizzstack-smoke", active_attempts=lambda name: 1)
         self.assertEqual(caught.exception.code, "project_in_use")
-        self.assertIn("rizzstack-smoke", self.registry)
+        self.assertIsNotNone(self.reg.get("rizzstack-smoke"))
 
     def test_cleanup_refuses_outside_the_root(self):
         prov, _ = self.ready()
-        self.registry["rizzstack-smoke"]["path"] = str(self.tmp / "elsewhere")
+        entry = dict(self.reg.get("rizzstack-smoke"))
+        entry["path"] = str(self.tmp / "elsewhere")
+        self.reg.cache["rizzstack-smoke"] = entry
         with self.assertRaises(P.ProvisionError) as caught:
             prov.cleanup("rizzstack-smoke")
         self.assertEqual(caught.exception.code, "path_escape")

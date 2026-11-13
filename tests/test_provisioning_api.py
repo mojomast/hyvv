@@ -35,6 +35,8 @@ class FakeGit:
         if args[0] == "-C":
             if "rev-parse" in args:
                 return subprocess.CompletedProcess(args, 0, SHA + "\n", "")
+            if "symbolic-ref" in args:
+                return subprocess.CompletedProcess(args, 1, "", "")
             if "config" in args:
                 return subprocess.CompletedProcess(args, 0, "https://github.com/mojomast/rizzstack-smoke.git\n", "")
         return subprocess.CompletedProcess(args, 0, "", "")
@@ -96,7 +98,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(on_disk["projects"]["existing"]["repo"], "mojomast/workflow")
         # A fresh process built from the same file sees the registration.
         fresh = launcher.build_provisioner(dict(self.cfg, projects=dict(on_disk["projects"])))
-        self.assertIn("rizzstack-smoke", fresh.projects)
+        self.assertIn("rizzstack-smoke", fresh.registry.all())
 
     def test_unauthenticated_requests_are_refused(self):
         status, _ = self.post("/v1/provision/project", self.request(), token="wrong")
