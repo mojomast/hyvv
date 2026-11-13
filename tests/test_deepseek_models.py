@@ -34,7 +34,7 @@ class DeepSeekModels(unittest.TestCase):
         return cfg
 
     def test_version(self):
-        self.assertEqual(L.VERSION, "0.1.15")
+        self.assertEqual(L.VERSION, "0.1.16")
 
     def test_deepseek_flash_is_official(self):
         # Unprefixed names go to Go in 0.1.15; official requires the deepseek: prefix (or priority: high).

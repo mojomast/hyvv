@@ -29,7 +29,7 @@ def _init_repo(path, text="v1\n"):
 
 class ExportProjectSourceRev(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(L.VERSION, "0.1.15")
+        self.assertEqual(L.VERSION, "0.1.16")
 
     def test_no_origin_local_source_rev_new_work_branch_succeeds(self):
         with tempfile.TemporaryDirectory(prefix="exp14-") as d:
