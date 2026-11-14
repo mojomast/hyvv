@@ -59,7 +59,22 @@ class Contract(unittest.TestCase):
         agents = spec(n.Agents); agents.run.return_value = run; agents.get.return_value = run
         sb = spec(n.Sandbox); sb.agents.return_value = agents
         sd = spec(n.SpacesdClient)
-        sd.sh.return_value = mock.Mock(spec=n.ProcessOutput, stdout=b"ab" * 32 + b"\n", stderr=b"", pty=b"", exit=mock.Mock(code=0))
+        def shell_output(line, timeout_ms):
+            if line == 'printf %s "$HOME"':
+                out = b"/home/cua"
+            elif "rev-parse" in line:
+                out = b"a" * 40 + b"\n"
+            elif "--name-status" in line:
+                out = b"M\0m.py\0"
+            elif "--binary" in line:
+                out = b"diff --git a/m.py b/m.py\n"
+            elif "sha256sum" in line:
+                out = b"ab" * 32 + b"\n"
+            else:
+                out = b""
+            return n.ProcessOutput(stdout=out, stderr=b"", pty=b"",
+                                   exit=n.ExitInfo(code=0, signal=None, timed_out=False, error=None, success=True))
+        sd.sh.side_effect = shell_output
         sb.spacesd.return_value = sd
         sb.guest_sh.side_effect = AssertionError("guest_sh is Lume/agentless only; containers use spacesd().sh")
         sb.id.return_value = "sbx-1"
@@ -77,7 +92,8 @@ class Contract(unittest.TestCase):
                 self.assertEqual((evs[0]["kind"], cur), ("turn_ended", 1))
                 r = await be.result(a); self.assertEqual(r["artifacts"][0]["path"], "a.txt")
                 self.assertEqual(await be.file_sha256(a, "a.txt"), "ab" * 32)
-                a["workdir"] = "/home/cua/work/demo"; await be.patch(a); await be.environment(a)
+                a.update(workdir="/home/cua/work/demo", seed_commit="a" * 40)
+                await be.patch(a); await be.environment(a)
                 import subprocess, tempfile
                 repo = tempfile.mkdtemp(); open(f"{repo}/m.py", "w").write("x=1\n")
                 for c in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "b"]): subprocess.run(["git", "-C", repo] + c, check=True)
@@ -100,6 +116,21 @@ class Contract(unittest.TestCase):
         self.assertIsInstance(sbs.create.call_args.args[0], n.SandboxCreateOptions)
         self.assertEqual(sbs.create.call_args.args[0].cpus, 2)
         self.assertEqual(sbs.create.call_args.args[0].memory_mb, 1024)
+
+    def test_workspace_shell_requires_explicit_sdk_exit_code(self):
+        be = launcher.CuaBackend.__new__(launcher.CuaBackend)
+        sd = spec(n.SpacesdClient)
+        be._sd = mock.AsyncMock(return_value=sd)
+        for code in (0, 1, None):
+            with self.subTest(code=code):
+                sd.sh.return_value = n.ProcessOutput(
+                    stdout=b"fixture", stderr=b"", pty=b"",
+                    exit=n.ExitInfo(code=code, signal=None, timed_out=False, error=None, success=code == 0))
+                if code == 0:
+                    self.assertEqual(asyncio.run(be._checked_sh(object(), "true", stage="seed")), "fixture")
+                else:
+                    with self.assertRaises(launcher.WorkspaceError):
+                        asyncio.run(be._checked_sh(object(), "true", stage="seed"))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

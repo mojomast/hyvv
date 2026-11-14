@@ -263,12 +263,12 @@ class PatchCollectorBase(unittest.TestCase):
         p = asyncio.run(self.be.patch(self._attempt(wd, seed)))
         self.assertIn("b.txt", p["diff"])
 
-    def test_bad_seed_value_falls_back_to_head_and_is_not_interpolated(self):
+    def test_bad_seed_value_is_refused_and_is_not_interpolated(self):
         wd, _, _ = self._seed()
         Path(wd, "b.txt").write_text("two\n")
-        p = asyncio.run(self.be.patch(self._attempt(wd, "HEAD; touch pwned")))
-        self.assertIn("b.txt", p["diff"])
-        self.assertEqual(p["base"], "HEAD")
+        with self.assertRaises(L.WorkspaceError) as caught:
+            asyncio.run(self.be.patch(self._attempt(wd, "HEAD; touch pwned")))
+        self.assertEqual(caught.exception.code, "patch_collection_failed")
         self.assertFalse(Path(wd, "pwned").exists())
 
 
