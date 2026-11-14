@@ -66,6 +66,19 @@ document to its own containing commit.
 | `merge_group` | kept, superseded candidates cancelled | Merge-queue candidates |
 | `push` to `feat/**` | eliminated | The same commit already runs through its PR |
 
-The preserved required contexts are the existing jobs: `provisioning (windows)`,
-`test`, `scan` and the `CI` gate that requires `test` and `scan`. Repository
-rules and required-context names are unchanged.
+The preserved substantive jobs are `provisioning (windows)`, `test`, `scan`
+and the `CI` gate that requires `test` and `scan`. The repository ruleset also
+requires five `bee-ci/*` contexts; the workflow now emits those as zero-execution
+gates that fail unless the corresponding substantive job succeeds:
+
+| Required context | Substantive dependency |
+| --- | --- |
+| `bee-ci/unit` | `test` matrix, including unit discovery |
+| `bee-ci/contract` | `test` matrix, including `python -m contract` |
+| `bee-ci/release-assets` | `test` matrix, including the build-only release-assets step |
+| `bee-ci/installer-dry-run` | `test` matrix, including the installer dry run |
+| `bee-ci/scan` | `scan` |
+
+This preserves required coverage without duplicating the test matrix. Changing
+the ruleset names would be a policy decision; this change keeps the existing
+policy and makes the required contexts substantive.

@@ -120,6 +120,56 @@ jobs:
       - name: Host and tailnet grep
         run: bash scripts/scan-secrets.sh
 
+  bee-ci-unit:
+    name: bee-ci/unit
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require unit test job
+        run: test "${{ needs.test.result }}" = "success"
+
+  bee-ci-contract:
+    name: bee-ci/contract
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require contract test job
+        run: test "${{ needs.test.result }}" = "success"
+
+  bee-ci-release-assets:
+    name: bee-ci/release-assets
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require release-assets build job
+        run: test "${{ needs.test.result }}" = "success"
+
+  bee-ci-installer-dry-run:
+    name: bee-ci/installer-dry-run
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require installer dry-run job
+        run: test "${{ needs.test.result }}" = "success"
+
+  bee-ci-scan:
+    name: bee-ci/scan
+    if: always()
+    needs: [scan]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require scan job
+        run: test "${{ needs.scan.result }}" = "success"
+
   ci:
     name: CI
     if: always()
