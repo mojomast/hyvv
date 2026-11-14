@@ -2,8 +2,17 @@ name: CI
 
 on:
   pull_request:
+  # Main keeps its push run. Feature branches are covered by their PR, so a
+  # feature-branch push must not start a second identical matrix.
   push:
-    branches: [main, "feat/**"]
+    branches: [main]
+  # Merge-queue candidates run the same required contexts.
+  merge_group:
+
+# A superseded PR/queue candidate is cancelled; the required main run is not.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Least privilege at the workflow level; jobs request only what they need.
 permissions: {}
