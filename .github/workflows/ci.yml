@@ -2,13 +2,45 @@ name: CI
 
 on:
   pull_request:
+  # Main keeps its push run. Feature branches are covered by their PR, so a
+  # feature-branch push must not start a second identical matrix.
   push:
-    branches: [main, "feat/**"]
+    branches: [main]
+  # Merge-queue candidates run the same required contexts.
+  merge_group:
+
+# A superseded PR/queue candidate is cancelled; the required main run is not.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Least privilege at the workflow level; jobs request only what they need.
 permissions: {}
 
 jobs:
+  windows-provisioning:
+    # The full Windows matrix stays deferred (Kyle, Nov 12). Provisioning needs
+    # real Windows path/reparse semantics, so this job runs only its tests.
+    name: provisioning (windows)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Provisioning tests
+        shell: bash
+        run: |
+          uv sync --frozen --no-dev || uv sync --no-dev
+          uv run python -m unittest tests.test_provisioning tests.test_provisioning_api tests.test_provisioning_convergence -v
+
   test:
     name: test
     runs-on: ${{ matrix.os }}
@@ -87,6 +119,56 @@ jobs:
 
       - name: Host and tailnet grep
         run: bash scripts/scan-secrets.sh
+
+  bee-ci-unit:
+    name: bee-ci/unit
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require unit test job
+        run: test "${{ needs.test.result }}" = "success"
+
+  bee-ci-contract:
+    name: bee-ci/contract
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require contract test job
+        run: test "${{ needs.test.result }}" = "success"
+
+  bee-ci-release-assets:
+    name: bee-ci/release-assets
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require release-assets build job
+        run: test "${{ needs.test.result }}" = "success"
+
+  bee-ci-installer-dry-run:
+    name: bee-ci/installer-dry-run
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require installer dry-run job
+        run: test "${{ needs.test.result }}" = "success"
+
+  bee-ci-scan:
+    name: bee-ci/scan
+    if: always()
+    needs: [scan]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require scan job
+        run: test "${{ needs.scan.result }}" = "success"
 
   ci:
     name: CI

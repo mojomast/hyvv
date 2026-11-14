@@ -9,7 +9,13 @@ narrow token-scoped HTTP API on loopback or a Tailscale address only.
   uv run --with cua==0.5.0 launcher.py doctor --config config.json
 """
 from __future__ import annotations
-import argparse, asyncio, bisect, platform, hashlib, hmac, ipaddress, json, os, re, sys, threading, time, uuid
+import argparse, asyncio, bisect, platform, hashlib, hmac, ipaddress, json, os, re, socket, sys, threading, time, uuid
+from datetime import datetime, timezone
+
+try:
+    import provisioning as _provisioning
+except ImportError:  # pragma: no cover - the module ships beside launcher.py
+    _provisioning = None
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -122,6 +128,425 @@ SECRETISH = re.compile(r"(sk-[A-Za-z0-9_\-]{8,}|Bearer\s+\S+|[A-Za-z0-9_\-]{32,}
 def redact(s):
     return SECRETISH.sub("<redacted>", s) if isinstance(s, str) else s
 
+# ---------------------------------------------------------------- bee landed events
+# A terminal attempt produces exactly one durable CloudEvent. The event is written to
+# <data_dir>/events/outbox/<event_id>.json with temp-file + fsync + rename, so a crash
+# can leave a complete event or no event, never a torn one. Delivery is a local signal
+# (file or Unix socket); the outbox file itself is the replayable source of truth.
+LANDED_EVENT_TYPE = "rizzstack.bee.landed.v1"
+LANDED_EVENT_SCHEMA = "https://rizstack.dev/schemas/bee-landed/v1"
+LANDED_DATA_SCHEMA = "rizzstack.bee-landed/1"
+LANDED_EVENT_ID_PREFIX = "urn:rizzstack:bee-landed:"
+_LANDED_EVIDENCE_KEYS = ("schema", "feature_id", "job_id", "task_id", "attempt_id",
+                         "coordinator", "backend", "state", "source_rev", "lease", "result",
+                         "correlation_id", "causation_id")
+
+
+class LandedEventConflict(ValueError):
+    """A second, contradictory terminal observation for the same attempt was refused."""
+
+
+def _iso_utc(ts=None):
+    ts = time.time() if ts is None else ts
+    return datetime.fromtimestamp(float(ts), timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _canonical_bytes(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _text_id(value):
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, dict):
+        for key in ("id", "name", "ref", "coordinator_id", "session_id", "sha256"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return None
+
+
+def _canonical_id(value, fallback):
+    text = str(value or "").strip()
+    text = re.sub(r"[^A-Za-z0-9._-]", "-", text)[:128]
+    if not text or not re.match(r"[A-Za-z0-9]", text[0]):
+        return fallback
+    return text
+
+
+def _bounded_text(value, maximum):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()[:maximum]
+
+
+def _brief_id(brief, name):
+    for key in (name + "_id", name):
+        value = brief.get(key)
+        found = value.strip() if isinstance(value, str) and value.strip() else _text_id(value)
+        if found:
+            return found
+    return None
+
+
+def landed_source(cfg):
+    """A stable, non-secret CloudEvents source for this launcher."""
+    cfg = cfg or {}
+    ident = (cfg.get("launcher_id") or cfg.get("worker_id") or cfg.get("source") or
+             cfg.get("host_id") or platform.node() or "launcher")
+    ident = str(ident).strip() or "launcher"
+    if "://" in ident:
+        return ident
+    safe = re.sub(r"[^A-Za-z0-9._~:-]", "-", ident) or "launcher"
+    return "hyvv://" + safe
+
+
+def landed_event_id(attempt_id, state, transition=None):
+    """Opaque URN id, deterministic for one (attempt_id, state, transition) observation."""
+    transition = str(transition).strip() if isinstance(transition, str) and transition.strip() else str(state)
+    material = f"{attempt_id}:{state}:{transition}"
+    return LANDED_EVENT_ID_PREFIX + _sha256_bytes(material.encode("utf-8"))[:32]
+
+
+def _coordinator_parts(a):
+    brief = a.get("brief") or {}
+    raw = brief.get("coordinator") if brief.get("coordinator") is not None else a.get("coordinator")
+    cid = _text_id(raw) or _text_id(brief.get("coordinator_id")) or _text_id(a.get("coordinator_id"))
+    session = brief.get("coordinator_session") or brief.get("session_id") or brief.get("session")
+    if isinstance(raw, dict):
+        session = session or raw.get("session") or raw.get("session_id")
+    if isinstance(session, dict):
+        session = _text_id(session)
+    session = session.strip() if isinstance(session, str) and session.strip() else None
+    return cid, session
+
+
+def _source_rev(a, brief, attempt_id, state):
+    value = brief.get("source_rev") if brief.get("source_rev") is not None else a.get("source_rev")
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value):
+            return value
+    # Keep the wire event canonical even when a legacy brief omitted source_rev.
+    return _sha256_bytes(f"{attempt_id}:{state}".encode("utf-8"))
+
+
+def _assigned_files(a, brief):
+    raw = brief.get("assigned_files") if brief.get("assigned_files") is not None else a.get("assigned_files")
+    lease = brief.get("lease") if brief.get("lease") is not None else a.get("lease")
+    if raw is None and isinstance(lease, dict):
+        raw = lease.get("assigned_files")
+    files = []
+    for item in raw or []:
+        if not isinstance(item, str):
+            continue
+        path = item.strip()
+        if not path or path in files or path.startswith("/") or "\\" in path:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*", path):
+            continue
+        if any(part in ("", ".", "..") for part in path.split("/")):
+            continue
+        files.append(path)
+    return files
+
+
+def _lease_sha256(a, source_rev):
+    brief = a.get("brief") or {}
+    for key in ("lease_sha256", "lease_sha"):
+        value = brief.get(key) if brief.get(key) is not None else a.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value.strip()):
+            return value.strip().lower()
+    lease = brief.get("lease") if brief.get("lease") is not None else a.get("lease")
+    if isinstance(lease, dict):
+        nested = lease.get("sha256") or lease.get("sha256_hex")
+        if isinstance(nested, str) and re.fullmatch(r"[0-9a-fA-F]{64}", nested.strip()):
+            return nested.strip().lower()
+    elif isinstance(lease, str) and lease.strip():
+        value = lease.strip()
+        if re.fullmatch(r"[0-9a-fA-F]{64}", value):
+            return value.lower()
+    material = {"assigned_files": sorted(_assigned_files(a, brief)), "source_rev": source_rev}
+    return _sha256_bytes(_canonical_bytes(material))
+
+
+def _landed_result(a, result_path, attempt_id=None):
+    aid = str(attempt_id or a.get("attempt_id") or (a.get("brief") or {}).get("attempt_id") or "")
+    info = {"available": False}
+    if result_path is None:
+        return info
+    path = Path(result_path)
+    try:
+        if not path.is_file():
+            return info
+        raw = path.read_bytes()
+        info.update(available=True, artifact_sha256=_sha256_bytes(raw),
+                    reference=f"hyvv://attempts/{aid}/result")
+    except OSError:
+        pass
+    return info
+
+
+def build_landed_event(a, cfg=None, result_path=None):
+    """Build the canonical CloudEvents envelope for a persisted terminal attempt."""
+    state = a.get("state")
+    if state not in TERMINAL:
+        raise ValueError(f"attempt is not terminal (state {state!r})")
+    aid = str(a.get("attempt_id") or (a.get("brief") or {}).get("attempt_id") or "").strip()
+    if not aid:
+        raise ValueError("attempt_id is required")
+    brief = a.get("brief") or {}
+    cfg = cfg or {}
+    kind = a.get("kind") or brief.get("kind") or "opencode"
+    harness = a.get("harness") or ("agy" if kind == "agy-cua" else ("check" if kind == "check" else "opencode"))
+    coordinator_id, coordinator_session = _coordinator_parts(a)
+    if not coordinator_id:
+        coordinator_id = str(cfg.get("launcher_id") or cfg.get("worker_id") or cfg.get("source") or "launcher").strip()
+        coordinator_id = coordinator_id or "launcher"
+    coordinator = {"identity": _bounded_text(coordinator_id, 256) or "launcher"}
+    if coordinator_session:
+        coordinator["session"] = _bounded_text(coordinator_session, 256)
+        if not coordinator["session"]:
+            coordinator.pop("session")
+    backend = {"harness": _bounded_text(harness, 128) or "opencode"}
+    model = a.get("model") or brief.get("model") or cfg.get("model")
+    model = _bounded_text(model, 128)
+    if model:
+        backend["model"] = model
+    source_rev = _source_rev(a, brief, aid, state)
+    transition = (brief.get("terminal_transition_id") or a.get("terminal_transition_id") or
+                  brief.get("transition_id") or a.get("transition_id") or
+                  brief.get("transition") or a.get("transition") or state)
+    event_id = landed_event_id(aid, state, transition)
+    data = {
+        "schema": LANDED_DATA_SCHEMA,
+        "feature_id": _canonical_id(_brief_id(brief, "feature"), aid),
+        "job_id": _canonical_id(_brief_id(brief, "job"), aid),
+        "task_id": _canonical_id(_brief_id(brief, "task"), aid),
+        "attempt_id": aid,
+        "coordinator": coordinator,
+        "backend": backend,
+        "state": state,
+        "source_rev": source_rev,
+        "lease": {"sha256": _lease_sha256(a, source_rev), "assigned_files": _assigned_files(a, brief)},
+        "result": _landed_result(a, result_path, aid),
+    }
+    for key in ("correlation_id", "causation_id"):
+        value = _bounded_text(brief.get(key) if brief.get(key) is not None else a.get(key), 256)
+        if value:
+            data[key] = value
+    return {
+        "specversion": "1.0",
+        "id": event_id,
+        "source": landed_source(cfg),
+        "type": LANDED_EVENT_TYPE,
+        "time": _iso_utc(a.get("updated_at") or a.get("created_at")),
+        "subject": aid,
+        "datacontenttype": "application/json",
+        "dataschema": LANDED_EVENT_SCHEMA,
+        "data": data,
+    }
+
+
+def _landing_evidence(data):
+    data = data or {}
+    core = {key: data[key] for key in _LANDED_EVIDENCE_KEYS if key in data}
+    return _sha256_bytes(_canonical_bytes(core))
+
+
+def _landing_conflicts(existing, event):
+    old = existing.get("data") if isinstance(existing, dict) else None
+    new = event.get("data") or {}
+    if not isinstance(old, dict):
+        return True
+    if old.get("attempt_id") != new.get("attempt_id") or old.get("state") != new.get("state"):
+        return True
+    return _landing_evidence(old) != _landing_evidence(new)
+
+
+def _landed_outbox(data_dir):
+    return Path(data_dir) / "events" / "outbox"
+
+
+def _find_landed_events(outbox, attempt_id):
+    found = []
+    try:
+        paths = sorted(outbox.glob("*.json"))
+    except OSError:
+        return found
+    for path in paths:
+        try:
+            event = json.loads(path.read_text("utf-8"))
+        except (OSError, ValueError):
+            continue
+        data = event.get("data") if isinstance(event, dict) else None
+        if isinstance(data, dict) and data.get("attempt_id") == attempt_id:
+            found.append((path, event))
+    return found
+
+
+def _fsync_dir(path):
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def write_landed_event(outbox, event):
+    """Atomically persist one event as <outbox>/<id>.json; never overwrite conflicting evidence."""
+    outbox = Path(outbox)
+    event_id = str(event.get("id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", event_id):
+        raise ValueError("invalid landed event id")
+    path = outbox / (event_id + ".json")
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text("utf-8"))
+        except (OSError, ValueError) as ex:
+            raise LandedEventConflict(f"existing landed event {event_id} is unreadable") from ex
+        if _landing_conflicts(existing, event):
+            raise LandedEventConflict(f"conflicting terminal evidence for attempt {event['data'].get('attempt_id')}")
+        return path
+    outbox.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(event, sort_keys=True, indent=1, ensure_ascii=False).encode("utf-8")
+    tmp = outbox / (f".{event_id}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(outbox)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+    return path
+
+
+def _landed_notifier(cfg):
+    cfg = cfg or {}
+    for key in ("notify_socket", "landed_socket", "landing_socket"):
+        if cfg.get(key):
+            return {"type": "unix", "path": cfg[key]}
+    for key in ("notify_file", "notify_path", "landed_file", "landing_file"):
+        if cfg.get(key):
+            return {"type": "file", "path": cfg[key]}
+    for key in ("landed_notifier", "landing_notifier", "bee_landed_notifier", "event_notifier",
+                "outbox_notifier", "landed_notify", "notifier"):
+        if cfg.get(key) is not None:
+            return cfg[key]
+    for section in ("landed", "landing", "bee_landed", "events"):
+        block = cfg.get(section)
+        if isinstance(block, dict) and block.get("notifier") is not None:
+            return block["notifier"]
+    return None
+
+
+def _notifier_target(spec):
+    options = {}
+    if isinstance(spec, str):
+        text = spec.strip()
+        if text.startswith("unix://"):
+            return "unix", text[7:], options
+        if text.startswith("unix:"):
+            return "unix", text[5:], options
+        if text.startswith("file://"):
+            return "file", text[7:], options
+        if text.startswith("file:"):
+            return "file", text[5:], options
+        return "file", text, options
+    if not isinstance(spec, dict):
+        raise ValueError("notifier must be a path, URI, or object")
+    options = spec
+    kind = str(spec.get("type") or spec.get("kind") or spec.get("transport") or "file").lower()
+    path = spec.get("path") or spec.get("file") or spec.get("socket") or spec.get("sock")
+    if not isinstance(path, str) or not path:
+        raise ValueError("notifier path is required")
+    if kind in ("unix", "unix-socket", "unix_socket", "socket", "sock"):
+        kind = "unix"
+    else:
+        kind = "file"
+    return kind, path, options
+
+
+def notify_landed_event(event, cfg=None, notifier=None):
+    """Best-effort local delivery signal. A failure never removes or damages the outbox event."""
+    spec = _landed_notifier(cfg) if notifier is None else notifier
+    if spec is None:
+        return False
+    payload = (json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+    try:
+        kind, target, options = _notifier_target(spec)
+        if kind == "unix":
+            mode = str(options.get("mode") or options.get("socket_type") or "stream").lower()
+            sock_type = socket.SOCK_DGRAM if mode in ("dgram", "datagram") else socket.SOCK_STREAM
+            sock = socket.socket(socket.AF_UNIX, sock_type)
+            try:
+                sock.settimeout(float(options.get("timeout_s") or 2.0))
+                sock.connect(target)
+                if sock_type == socket.SOCK_DGRAM:
+                    sock.send(payload)
+                else:
+                    sock.sendall(payload)
+            finally:
+                sock.close()
+        else:
+            path = Path(target)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "ab") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+        return True
+    except Exception:
+        return False
+
+
+def emit_landed_record(a, data_dir, cfg=None, result_path=None):
+    """Write one idempotent landed event and signal delivery. Returns (path, event, created)."""
+    cfg = cfg or {}
+    event = build_landed_event(a, cfg, result_path)
+    outbox = _landed_outbox(data_dir)
+    for path, existing in _find_landed_events(outbox, event["data"]["attempt_id"]):
+        if _landing_conflicts(existing, event):
+            raise LandedEventConflict(f"conflicting terminal evidence for attempt {event['data']['attempt_id']}")
+        return path, existing, False
+    path = write_landed_event(outbox, event)
+    notify_landed_event(event, cfg)
+    return path, event, True
+
+
+def replay_landed_events(data_dir, cfg=None, notifier=None):
+    """Re-signal every durable outbox event (at-least-once). Returns (delivered, total)."""
+    outbox = _landed_outbox(data_dir)
+    delivered = total = 0
+    try:
+        paths = sorted(outbox.glob("*.json"))
+    except OSError:
+        paths = []
+    for path in paths:
+        try:
+            event = json.loads(path.read_text("utf-8"))
+        except (OSError, ValueError):
+            continue
+        total += 1
+        delivered += 1 if notify_landed_event(event, cfg, notifier) else 0
+    return delivered, total
+
+
 def load_config(path):
     cfg = json.loads(Path(path).read_text("utf-8-sig"))
     cfg.setdefault("port", 47821)
@@ -136,6 +561,7 @@ def load_config(path):
     cfg.setdefault("backoff_s", [30, 60, 120, 240])
     cfg.setdefault("data_dir", str(Path.home() / ".orbit-launcher"))
     cfg.setdefault("projects", {})  # name -> {"repo": url} (authorized projects)
+    cfg.setdefault("provisioning", {})  # {"policy": path, "journal": path, "enabled": bool}
     cfg.setdefault("extra_binds", ["127.0.0.1"])  # loopback listener; memory only, never written back
     cfg.setdefault("agy_exe", str(Path.home() / "AppData" / "Local" / "agy" / "bin" / "agy.exe"))
     cfg.setdefault("agy_permissions", None)  # None = agy_cua_mcp.DEFAULT_PERMS (UI only: no computer:shell/file)
@@ -885,7 +1311,9 @@ class Launcher:
         self.loop = asyncio.new_event_loop()
         self._ev_lock = threading.Lock(); self._ev_idx = {}  # events_since offset index
         self.started_at = time.time(); self.loop_lag_ms = 0.0
+        self.landing_conflicts = []
         self._load()
+        self.recover_landed_events()
 
     # journal: one JSON per attempt (atomic replace) + append-only events log
     def _path(self, aid): return self.dir / "attempts" / f"{aid}.json"
@@ -1012,12 +1440,52 @@ class Launcher:
             else: a["cancel"] = True; self._set(a, "cancel_requested", "interrupt sent")
         self.kick(); return a
 
+    def landed_result_path(self, a):
+        aid = a.get("attempt_id") or (a.get("brief") or {}).get("attempt_id")
+        return self.dir / "attempts" / f"{aid}.result.json"
+
+    def build_landed_event(self, a, result_path=None):
+        return build_landed_event(a, self.cfg, self.landed_result_path(a) if result_path is None else result_path)
+
+    def emit_landed_event(self, a, result_path=None):
+        """Persist exactly one event for this terminal attempt; refuse contradictory evidence."""
+        if result_path is None:
+            result_path = self.landed_result_path(a)
+        with self.lock:
+            _, event, _ = emit_landed_record(a, self.dir, self.cfg, result_path)
+            return event
+
+    def replay_landed_events(self, notifier=None):
+        """Re-send durable outbox events to the configured notifier (at-least-once)."""
+        return replay_landed_events(self.dir, self.cfg, notifier)
+
+    def recover_landed_events(self):
+        """Emit events missed by a crash after the terminal journal write; never crashes startup."""
+        recovered = []
+        for a in list(self.attempts.values()):
+            if a.get("state") not in TERMINAL:
+                continue
+            try:
+                recovered.append(self.emit_landed_event(a))
+            except LandedEventConflict as ex:
+                self.landing_conflicts.append({"attempt_id": a.get("attempt_id"), "error": str(ex)})
+            except Exception as ex:  # disk errors must not stop the launcher; the journal still has the state
+                self.landing_conflicts.append({"attempt_id": a.get("attempt_id"), "error": type(ex).__name__})
+        return recovered
+
     def _set(self, a, state, detail, ev=None):
         a["state"], a["detail"], a["updated_at"] = state, detail, time.time()
         a["lseq"] += 1
         e = {"lseq": a["lseq"], "ts": a["updated_at"], "kind": "state", "state": state, "detail": detail}
         if ev: e.update(ev)
         self._append_events(a, [e]); self._save(a)
+        if state in TERMINAL:
+            try:
+                self.emit_landed_event(a)
+            except LandedEventConflict:
+                raise
+            except Exception as ex:  # keep the durable journal transition; recovery on restart will retry
+                self.landing_conflicts.append({"attempt_id": a.get("attempt_id"), "error": type(ex).__name__})
 
     def _active(self): return [x for x in self.attempts.values() if x["state"] in ("starting", "running", "cancel_requested")]
 
@@ -1206,6 +1674,50 @@ class Launcher:
                 "note": "worker_claims are self-reported by the model; only 'observed' was measured by the launcher"}
 
 # ---------------------------------------------------------------- HTTP API
+
+def active_attempts_for(attempts, project):
+    """Nonterminal attempts for a project, by the field the launcher actually stores.
+
+    Attempts keep their project inside the brief (``attempt["brief"]["project"]``),
+    so checking ``attempt["project"]`` would silently allow cleanup under a
+    running bee.
+    """
+    count = 0
+    for attempt in attempts.values():
+        brief = attempt.get("brief") or {}
+        if brief.get("project") == project and attempt.get("state") not in TERMINAL:
+            count += 1
+    return count
+
+
+def build_provisioner(cfg):
+    """Construct the provisioning service from config, or return None."""
+    if _provisioning is None:
+        return None
+    block = cfg.get("provisioning") or {}
+    if not block.get("enabled"):
+        return None
+    config_path = Path(cfg.get("_config_path") or "config.json")
+    policy_path = Path(block.get("policy") or config_path.with_name("provisioning-policy.json"))
+    journal_dir = Path(block.get("journal") or (Path(cfg["data_dir"]) / "provisioning"))
+    policy = _provisioning.load_policy(policy_path)
+    registry = _provisioning.RegistryStore(config_path, cache=cfg.setdefault("projects", {}))
+
+    def credential(repo):
+        # Authentication is delegated to the host's git credential helper. Only the
+        # declared capability is consulted; no secret passes through the launcher.
+        if repo in (block.get("credential_ready_repos") or []):
+            return "host-credential-helper"
+        return None
+
+    return _provisioning.Provisioner(
+        policy=policy,
+        journal=_provisioning.Journal(journal_dir),
+        registry=registry,
+        credential=credential,
+    )
+
+
 def make_handler(L, token):
     class H(BaseHTTPRequestHandler):
         server_version = "orbit-launcher/" + VERSION
@@ -1234,6 +1746,25 @@ def make_handler(L, token):
                 rows = sorted(L.attempts.values(), key=lambda x: x.get("created_at") or 0, reverse=True)
                 if q.get("active") in ("1", "true"): rows = [x for x in rows if x["state"] not in TERMINAL]
                 return self._send(200, {"attempts": [L.listing(x) for x in rows[:200]]})
+            if p == ["v1", "provision", "capabilities"]:
+                svc = getattr(L, "provisioner", None)
+                if svc is None:
+                    cfg_block = L.cfg.get("provisioning") or {}
+                    return self._send(200, {"schema": "rizzstack.provisioning/1", "backend": "hyvv",
+                                            "enabled": False, "profiles": [], "states": [],
+                                            "supports_cleanup": False, "supports_receipt_lookup": False,
+                                            "reason": "provisioning is not enabled on this host" if not cfg_block.get("enabled") else "provisioning failed to initialise"})
+                return self._send(200, svc.capabilities())
+            if len(p) == 4 and p[:3] == ["v1", "provision", "receipts"]:
+                svc = getattr(L, "provisioner", None)
+                if svc is None: return self._send(501, {"error": "provisioning is not enabled on this host"})
+                try: return self._send(200, svc.lookup_receipt(p[3]))
+                except _provisioning.ProvisionError as ex:
+                    return self._send(404 if ex.code == "receipt_unknown" else 409, ex.to_dict())
+            if p == ["v1", "provision", "receipts"]:
+                svc = getattr(L, "provisioner", None)
+                if svc is None: return self._send(501, {"error": "provisioning is not enabled on this host"})
+                return self._send(200, {"receipts": [{"idempotency_key": r.get("idempotency_key"), "project": r.get("project"), "state": r.get("state")} for r in svc.journal.all()]})
             if p == ["v1", "projects"]:  # names only: no paths, repos or branches
                 return self._send(200, {"projects": [{"name": k} for k in sorted(L.cfg["projects"])]})
             if p == ["v1", "containers"]:  # the sandbox image profile, not live containers
@@ -1272,6 +1803,19 @@ def make_handler(L, token):
                 try: a, created = L.submit(aid, b["brief"], b.get("model") or b.get("tier"), b.get("kind"), b.get("mode"))
                 except ValueError as ex: return self._send(400, {"error": str(ex)})
                 return self._send(201 if created else 200, L.public(a))
+            if p == ["v1", "provision", "project"]:
+                svc = getattr(L, "provisioner", None)
+                if svc is None: return self._send(501, {"error": "provisioning is not enabled on this host"})
+                try: receipt = svc.provision(b)
+                except _provisioning.ProvisionError as ex: return self._send(409 if ex.code in ("journal_conflict", "project_conflict", "provision_in_progress", "project_retired", "stale_receipt", "quota_exhausted", "provision_lock_contention", "registry_busy") else 400, ex.to_dict())
+                return self._send(200, receipt)
+            if p == ["v1", "provision", "cleanup"]:
+                svc = getattr(L, "provisioner", None)
+                if svc is None: return self._send(501, {"error": "provisioning is not enabled on this host"})
+                project = str(b.get("project") or "")
+                try: result = svc.cleanup(project, active_attempts=lambda name: active_attempts_for(L.attempts, name))
+                except _provisioning.ProvisionError as ex: return self._send(409, ex.to_dict())
+                return self._send(200, result)
             if p == ["v1", "config"]:
                 # runtime-only: set max_concurrent (1..MAX_WORKERS); config.json on disk is unchanged, a restart reverts
                 try: n = int(b.get("max_concurrent"))
@@ -1428,6 +1972,7 @@ def serve(cfg, backend_name="cua"):
     if len(token) < 32: raise SystemExit("api token missing/too short; run scripts/new-token.ps1")
     backend = FakeBackend(cfg) if backend_name == "fake" else CuaBackend(cfg)
     L = Launcher(cfg, backend)
+    L.provisioner = build_provisioner(cfg)
     write_pidfile(cfg)
     threading.Thread(target=L.loop.run_forever, daemon=True).start(); L.kick()
     asyncio.run_coroutine_threadsafe(_lag_probe(L), L.loop)
@@ -1530,7 +2075,10 @@ async def _probe(cfg, model=None):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("cmd", choices=["serve", "doctor", "probe", "sdkcheck", "agysmoke"]); ap.add_argument("--objective", default="Take a screenshot and describe the desktop."); ap.add_argument("--config")
+    _args_for_cfg = None
     ap.add_argument("--backend", default="cua", choices=["cua", "fake"]); ap.add_argument("--model")
     a = ap.parse_args(); cfg = load_config(a.config) if a.config else None
+    if cfg is not None:
+        cfg["_config_path"] = str(a.config)
     if a.cmd == "agysmoke": sys.exit(asyncio.run(agy_smoke(cfg, a.objective)))
     sys.exit((print(json.dumps(sdk_contract_check())) or (1 if sdk_contract_check() else 0)) if a.cmd == "sdkcheck" else doctor(cfg) if a.cmd == "doctor" else asyncio.run(_probe_all(cfg) if a.model == "free-all" else _probe(cfg, a.model)) if a.cmd == "probe" else serve(cfg, a.backend))
