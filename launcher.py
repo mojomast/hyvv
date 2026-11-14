@@ -417,6 +417,17 @@ def _fsync_dir(path):
         os.close(fd)
 
 
+def _register_landed_file(outbox):
+    """Best-effort index registration after the immutable outbox file is durable."""
+    if _landing_export is None:
+        return
+    try:
+        _landing_export.register_landed_file(outbox)
+    except Exception:
+        # The next export scans the outbox and registers an unindexed file.
+        pass
+
+
 def write_landed_event(outbox, event):
     """Atomically persist one event as <outbox>/<id>.json; never overwrite conflicting evidence."""
     outbox = Path(outbox)
@@ -431,6 +442,7 @@ def write_landed_event(outbox, event):
             raise LandedEventConflict(f"existing landed event {event_id} is unreadable") from ex
         if _landing_conflicts(existing, event):
             raise LandedEventConflict(f"conflicting terminal evidence for attempt {event['data'].get('attempt_id')}")
+        _register_landed_file(outbox)
         return path
     outbox.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(event, sort_keys=True, indent=1, ensure_ascii=False).encode("utf-8")
@@ -448,6 +460,7 @@ def write_landed_event(outbox, event):
                 tmp.unlink()
         except OSError:
             pass
+    _register_landed_file(outbox)
     return path
 
 
@@ -1801,7 +1814,11 @@ def make_handler(L, token):
                         limit=q.get("limit"),
                     )
                 except _landing_export.LandingExportError as ex:
-                    return self._send(400, {"error": str(ex)})
+                    body = {"error": str(ex)}
+                    code = getattr(ex, "code", None)
+                    if code:
+                        body["code"] = code
+                    return self._send(400, body)
                 return self._send(200, page)
             if len(p) >= 3 and p[:2] == ["v1", "attempts"]:
                 a = L.attempts.get(p[2])

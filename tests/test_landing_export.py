@@ -85,8 +85,7 @@ class ExportModule(unittest.TestCase):
         self.assertIsNone(body["retention"]["max_events"])
         self.assertIsNone(body["retention"]["max_age_seconds"])
 
-        self.assertEqual([row["cursor"] for row in body["events"]],
-                         sorted(path.stem for path in paths))
+        self.assertEqual([row["cursor"] for row in body["events"]], [1, 2, 3])
         for row in body["events"]:
             raw = (outbox / f"{row['event_id']}.json").read_bytes()
             canonical = (
@@ -97,7 +96,7 @@ class ExportModule(unittest.TestCase):
             self.assertEqual(row["file_sha256"], hashlib.sha256(raw).hexdigest())
             self.assertEqual(row["event"], json.loads(raw.decode("utf-8")))
             self.assertEqual(row["event_id"], row["event"]["id"])
-            self.assertEqual(row["cursor"], row["event_id"])
+            self.assertIsInstance(row["cursor"], int)
             self.assertEqual(row["event"]["type"], "rizzstack.bee.landed.v1")
             self.assertEqual(row["event"]["data"]["schema"], "rizzstack.bee-landed/1")
 
@@ -153,12 +152,10 @@ class ExportModule(unittest.TestCase):
         self.assertEqual(len(E.export_events(self.data_dir, limit=1)["events"]), 1)
         self.assertEqual(len(E.export_events(self.data_dir, limit=500)["events"]), 1)
 
-    def test_unknown_cursor_is_an_explicit_empty_page(self):
+    def test_unknown_cursor_is_an_explicit_error(self):
         self.add("att_cursor001")
-        body = E.export_events(self.data_dir, after="zzzz-not-a-stored-cursor")
-        self.assertEqual(body["events"], [])
-        self.assertFalse(body["has_more"])
-        self.assertEqual(body["next_cursor"], "zzzz-not-a-stored-cursor")
+        with self.assertRaises(E.MalformedCursorError):
+            E.export_events(self.data_dir, after="zzzz-not-a-stored-cursor")
 
     def test_attempt_logs_and_journals_are_never_reconstructed(self):
         attempts = self.data_dir / "attempts"
@@ -209,7 +206,9 @@ class ExportHttp(unittest.TestCase):
         return response.status, body
 
     def test_authenticated_export_and_pagination(self):
-        expected = sorted(save_event(self.data_dir, f"att_http0000{i}")[0].stem for i in range(3))
+        save_event(self.data_dir, "att_http00001")
+        save_event(self.data_dir, "att_http00002")
+        save_event(self.data_dir, "att_http00003")
 
         status, body = self.get("/v1/landing/events?limit=2")
         self.assertEqual(status, 200)
@@ -217,16 +216,16 @@ class ExportHttp(unittest.TestCase):
         self.assertEqual(len(body["events"]), 2)
         self.assertTrue(body["has_more"])
         self.assertEqual(body["retention"], E.RETENTION)
-        self.assertEqual([row["cursor"] for row in body["events"]], expected[:2])
+        self.assertEqual([row["cursor"] for row in body["events"]], [1, 2])
 
-        cursor = urllib.parse.quote(body["next_cursor"], safe="")
+        cursor = urllib.parse.quote(str(body["next_cursor"]), safe="")
         status, body2 = self.get(f"/v1/landing/events?after={cursor}&limit=2")
         self.assertEqual(status, 200)
-        self.assertEqual([row["cursor"] for row in body2["events"]], expected[2:])
+        self.assertEqual([row["cursor"] for row in body2["events"]], [3])
         self.assertFalse(body2["has_more"])
-        self.assertEqual(body2["next_cursor"], expected[-1])
+        self.assertEqual(body2["next_cursor"], 3)
 
-        status, empty = self.get(f"/v1/landing/events?after={urllib.parse.quote(expected[-1], safe='')}")
+        status, empty = self.get(f"/v1/landing/events?after={urllib.parse.quote(str(body2['next_cursor']), safe='')}")
         self.assertEqual(status, 200)
         self.assertEqual(empty["events"], [])
         self.assertFalse(empty["has_more"])
