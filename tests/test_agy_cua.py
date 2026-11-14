@@ -207,7 +207,7 @@ class CodeMode(unittest.TestCase):
             be, sbs, fake = Runner._be(Runner(), d)
             be.cfg["projects"] = {"web": {"path": d}}
             seeded = mock.AsyncMock(return_value=("/home/cua/work/web", "a" * 40, "b" * 40)); be._seed_project = seeded
-            be._sh = mock.AsyncMock(side_effect=lambda sb, line, *x: ("M\tsrc/style.css\n" if "name-status" in line else "diff --git a/src/style.css b/src/style.css\n" if "diff --cached --binary" in line else "ab" * 32, "", 0))
+            be._sh = mock.AsyncMock(side_effect=lambda sb, line, *x: ("M\0src/style.css\0" if "name-status" in line else "diff --git a/src/style.css b/src/style.css\n" if "diff --cached --binary" in line else "b" * 40 if "rev-parse --verify" in line else "ab" * 32, "", 0))
             seen = {}
             real = launcher.agy_argv
             def argv(cfg, p, m, t): seen["prompt"] = p; return [sys.executable, str(fake)] + real(cfg, p, m, t)[1:]

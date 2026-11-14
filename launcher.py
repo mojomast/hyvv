@@ -9,7 +9,7 @@ narrow token-scoped HTTP API on loopback or a Tailscale address only.
   uv run --with cua==0.5.0 launcher.py doctor --config config.json
 """
 from __future__ import annotations
-import argparse, asyncio, bisect, platform, hashlib, hmac, ipaddress, json, os, re, socket, sys, threading, time, uuid
+import argparse, asyncio, bisect, platform, hashlib, hmac, ipaddress, json, os, re, shlex, socket, sys, threading, time, uuid
 from datetime import datetime, timezone
 
 try:
@@ -819,6 +819,17 @@ def sdk_contract_check():
             if x not in got: problems.append(f"{typ} lacks field {x}")
     return problems
 
+class WorkspaceError(RuntimeError):
+    """Measured workspace/collection failure; never an ordinary empty patch."""
+    def __init__(self, code, stage, detail, exit_code=None):
+        self.code, self.stage, self.exit_code = code, stage, exit_code
+        self.detail = redact(str(detail))[-300:]
+        super().__init__(f"{code} ({stage}): {self.detail}")
+
+    def to_dict(self):
+        return {"code": self.code, "stage": self.stage, "exit_code": self.exit_code, "detail": self.detail}
+
+
 class CuaBackend:
     """Real backend: cua 0.5.0 SDK, local Docker Desktop sandboxes (runc).
     Handles: client.sandboxes() (sync) -> Sandboxes; await .create(opts)/.connect(name) -> Sandbox;
@@ -853,6 +864,31 @@ class CuaBackend:
         code = getattr(out.exit, "code", None)
         return dec(out.stdout) + dec(out.pty), dec(out.stderr), code
 
+    async def _checked_sh(self, sb, line, *, stage, code="workspace_invalid"):
+        try:
+            out, err, status = await self._sh(sb, line)
+        except Exception as ex:
+            raise WorkspaceError(code, stage, f"shell transport failed: {type(ex).__name__}") from ex
+        # Missing status is not evidence that the sandbox command succeeded.
+        if type(status) is not int or status != 0:
+            raise WorkspaceError(code, stage, err or "command did not report exit code 0",
+                                 status if type(status) is int else None)
+        return out
+
+    async def _verify_workspace(self, sb, wd, seed, *, code="workspace_invalid"):
+        if not isinstance(wd, str) or not wd.startswith("/"):
+            raise WorkspaceError(code, "workspace", "a seeded absolute sandbox workdir is required")
+        if not isinstance(seed, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", seed):
+            raise WorkspaceError(code, "seed", "a recorded seed commit is required; refusing a HEAD fallback")
+        # A nested directory in some other checkout is not this attempt's root.
+        # Git itself resolves .git files, so linked worktrees are supported.
+        out = await self._checked_sh(sb,
+            f"cd {shlex.quote(wd)} && root=$(git rev-parse --show-toplevel) && "
+            'test "$root" = "$(pwd -P)" && '
+            f"git rev-parse --verify {shlex.quote(seed + '^{commit}')}", stage="workspace", code=code)
+        if out.strip() != seed:
+            raise WorkspaceError(code, "seed", "the sandbox did not verify the recorded seed commit")
+
     async def _seed_project(self, sb, proj, name, source_rev=None, branch=None):
         """Copy an authorized local git repo into the sandbox; returns (workdir, base_rev, seed_commit).
 
@@ -861,19 +897,23 @@ class CuaBackend:
 
         Prefer brief source_rev (optionally after fetching branch); otherwise sync_branch / HEAD.
         """
-        import base64, subprocess
         src = proj["path"]
         rev, tar = export_project(src, sync_branch=proj.get("sync_branch"), source_rev=source_rev, branch=branch)
-        home = (await self._sh(sb, "printf %s \"$HOME\""))[0].strip() or "/root"
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or name in (".", ".."):
+            raise WorkspaceError("workspace_invalid", "seed", "invalid project directory name")
+        home = (await self._checked_sh(sb, 'printf %s "$HOME"', stage="home")).strip()
+        if not home.startswith("/"):
+            raise WorkspaceError("workspace_invalid", "home", "sandbox HOME must be an absolute directory")
         wd = f"{home}/work/{name}"
-        await self._sh(sb, f"rm -rf '{wd}' /tmp/orbit-src.tar && mkdir -p '{wd}'")
+        await self._checked_sh(sb, f"rm -rf {shlex.quote(wd)} /tmp/orbit-src.tar && mkdir -p {shlex.quote(wd)}", stage="prepare")
         await (await self._sd(sb)).upload("/tmp/orbit-src.tar", tar, None)
-        o, e, c = await self._sh(sb, f"cd '{wd}' && tar -xf /tmp/orbit-src.tar && git init -q && "
+        o = await self._checked_sh(sb, f"cd {shlex.quote(wd)} && tar -xf /tmp/orbit-src.tar && git init -q && "
                                      f"printf '__pycache__/\\n*.pyc\\n.pytest_cache/\\nnode_modules/\\n' >> .git/info/exclude && git add -A && "
-                                     f"git -c user.name=orbit -c user.email=orbit@local commit -qm 'base {rev}' && git update-ref refs/hyvv/seed HEAD && git rev-parse HEAD")
-        if c not in (0, None): raise RuntimeError(f"seeding project failed: {e[-300:]}")
-        seed = (o.strip().splitlines() or [""])[-1].strip()
-        return wd, rev, (seed if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", seed) else None)
+                                     f"git -c user.name=orbit -c user.email=orbit@local commit --allow-empty -qm 'base {rev}' && git update-ref refs/hyvv/seed HEAD && git rev-parse HEAD",
+                                     stage="seed")
+        seed = o.strip()
+        await self._verify_workspace(sb, wd, seed)
+        return wd, rev, seed
 
     async def environment(self, a):
         if a.get("kind") == "agy-cua": return await self.agy.environment(a)
@@ -886,23 +926,40 @@ class CuaBackend:
         return env
 
     async def patch(self, a):
-        if not a.get("workdir"): return None
+        if not a.get("workdir"):
+            if a["brief"].get("assigned_files") or (a.get("kind") == "agy-cua" and a.get("mode") == "code"):
+                raise WorkspaceError("patch_collection_failed", "workspace", "scoped code attempt has no seeded workdir")
+            return None
         sb = await self.agy.sandbox(a) if a.get("kind") == "agy-cua" else await self._sandbox(a["sandbox"])
         wd = a["workdir"]
         # Diff against the seed commit recorded at start, not HEAD: a bee that commits (or `git checkout -B`)
-        # moves HEAD, and a HEAD diff would then come back empty. Older attempts without a seed use HEAD.
-        seed = a.get("seed_commit")
-        base = seed if isinstance(seed, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", seed) else "HEAD"
-        await self._sh(sb, f"cd '{wd}' && git add -A")
-        diff = (await self._sh(sb, f"cd '{wd}' && git diff --cached --binary {base}"))[0]
-        names = (await self._sh(sb, f"cd '{wd}' && git diff --cached --name-status --no-renames {base}"))[0]
+        # moves HEAD, and a HEAD diff would then come back empty. Missing baselines must fail explicitly.
+        base = a.get("seed_commit")
+        await self._verify_workspace(sb, wd, base, code="patch_collection_failed")
+        prefix = f"cd {shlex.quote(wd)} && "
+        async def collect(command, stage):
+            return await self._checked_sh(sb, prefix + command, stage=stage, code="patch_collection_failed")
+        await collect("git add -A", "stage")
+        diff = await collect(f"git diff --cached --binary {base}", "diff")
+        names = await collect(f"git diff --cached --name-status --no-renames -z {base}", "names")
+        parts = names.split("\0") if names else [""]
+        if parts[-1] != "" or (len(parts) - 1) % 2:
+            raise WorkspaceError("patch_collection_failed", "names", "invalid Git name-status output")
         files = []
-        for l in names.splitlines():
-            st, _, path = l.partition("\t")
-            if not path: continue
-            sha = None if st.startswith("D") else ((await self._sh(sb, f"cd '{wd}' && sha256sum -- '{path}' | cut -d' ' -f1"))[0].strip()[:64] or None)
+        for st, path in zip(parts[:-1:2], parts[1:-1:2]):
+            if st not in ("A", "M", "D", "T") or not path:
+                raise WorkspaceError("patch_collection_failed", "names", "invalid Git change entry")
+            sha = None
+            if st != "D":
+                # No pipeline: a missing/unreadable file must not look like a successful cut(1).
+                out = await collect(f"sha256sum < {shlex.quote(path)}", "hash")
+                sha = (out.split() or [""])[0]
+                if not re.fullmatch(r"[0-9a-f]{64}", sha):
+                    raise WorkspaceError("patch_collection_failed", "hash", "invalid file digest")
             files.append({"path": path, "status": st, "sha256": sha, "change": "deleted" if st.startswith("D") else ("added" if st.startswith("A") else "changed"),
                           "in_assigned_scope": in_assigned_scope(path, a["brief"].get("assigned_files"))})
+        if bool(diff) != bool(files):
+            raise WorkspaceError("patch_collection_failed", "diff", "patch and changed-file evidence disagree")
         return {"diff": diff, "files": files, "base": base}
 
     async def _inject_bbs_token(self, sb, attempt):
@@ -931,16 +988,19 @@ class CuaBackend:
     async def start(self, attempt, key):
         if attempt.get("kind") == "agy-cua": return await self.agy.start(attempt)
         cua, cfg, b = self.cua, self.cfg, attempt["brief"]
+        proj = cfg["projects"].get(b.get("project", ""), {})
+        if b.get("assigned_files") and not proj.get("path"):
+            raise WorkspaceError("workspace_invalid", "project", "scoped code work requires a registered local-path project")
         name = attempt.get("sandbox") or sandbox_name(attempt)
         attempt["sandbox"] = name  # recorded before create so a failed start still cleans up the right sandbox
         sb = await self.client.sandboxes().create(cua.SandboxCreateOptions(
             on="local", kind="container", runtime=cfg["runtime"], image=cfg["image"], name=name,
             memory_mb=cfg["memory_mb"], cpus=cfg.get("cpus", 2), wait_for=[cua.ReadinessProbe(service="env")]))
         self._sb[name] = sb
-        proj = cfg["projects"].get(b.get("project", ""), {})
         wd, base, seed = (None, None, None)
         if proj.get("path"):
             wd, base, seed = await self._seed_project(sb, proj, b["project"], source_rev=b.get("source_rev"), branch=b.get("branch"))
+            attempt.update(workdir=wd, local_base_rev=base, seed_commit=seed)
         spec = model_spec(cfg, attempt.get("model"), attempt.get("brief"))
         env = {"OPENCODE_CONFIG_CONTENT": json.dumps(dict(WORKER_OPENCODE_CONFIG, **({"model": spec["model"]} if spec["key"] == "none" else {})))}
         if spec["key"] in ("go", "deepseek"): env["OPENAI_API_KEY"] = key  # OpenAI-compatible: DeepSeek official or OpenCode Go
@@ -1135,6 +1195,7 @@ class AgyCuaRunner:
             proj = cfg["projects"].get(b.get("project", ""), {})
             if not proj.get("path"): raise ValueError("agy-cua code mode needs a project with a local path on this PC")
             wd, base, seed = await self.be._seed_project(sb, proj, b["project"], source_rev=b.get("source_rev"), branch=b.get("branch"))
+            a.update(workdir=wd, local_base_rev=base, seed_commit=seed)
         timeout = agy_timeout(b, mode)
         prompt = render_agy_code_prompt(b, wd) if mode == "code" else render_agy_prompt(b)
         argv = agy_argv(cfg, prompt, a.get("model") or AGY_DEFAULT_MODEL, timeout)
@@ -1389,6 +1450,8 @@ class Launcher:
     def public(self, a):
         keys = ("attempt_id", "kind", "mode", "tier", "state", "detail", "run_id", "sandbox", "created_at", "updated_at", "lseq", "queue_position", "retry_at", "rate_limited", "model", "fallback", "pool", "model_history")
         d = {k: a.get(k) for k in keys}
+        if a.get("workspace_error"):
+            d["workspace_error"] = a["workspace_error"]
         if d["state"] == "queued": d["queue_position"] = self._queue().index(a["attempt_id"]) + 1 if a["attempt_id"] in self._queue() else None
         return d
 
@@ -1581,6 +1644,8 @@ class Launcher:
                         return await self._finish(a, e)
                 await asyncio.sleep(1.0)
         except Exception as ex:  # noqa
+            if isinstance(ex, WorkspaceError):
+                a["workspace_error"] = ex.to_dict()
             self._set(a, "failed", f"controller error: {type(ex).__name__}: {redact(str(ex))[:300]}")
             if not a.get("sandbox") and a.get("model"): a["sandbox"] = sandbox_name(a)  # created but not recorded yet
             try: await self.backend.cleanup(a)
@@ -1694,7 +1759,7 @@ class Launcher:
         return {"schema": "orbit.local-worker.result/v1", "attempt_id": a["attempt_id"],
                 "source": {"project": b.get("project"), "repo_rev": b.get("source_rev"), "input_manifest_sha256": b.get("input_manifest_sha256"),
                            "image": self.cfg["image"], "kind": a.get("kind") or "opencode", "mode": a.get("mode"), "tier": a.get("tier"), "harness": "agy" if a.get("kind") == "agy-cua" else "opencode", "model": a.get("model") or self.cfg["model"], "fallback": a.get("fallback"), "tier_pool": a.get("pool"), "model_history": a.get("model_history"), "launcher": VERSION},
-                "observed": {"node": platform.node(), "run_id": a.get("run_id"), "sandbox_id": a.get("sandbox_id"), "workdir": a.get("workdir"), "local_base_rev": a.get("local_base_rev"),
+                "observed": {"node": platform.node(), "run_id": a.get("run_id"), "sandbox_id": a.get("sandbox_id"), "workdir": a.get("workdir"), "local_base_rev": a.get("local_base_rev"), "seed_commit": a.get("seed_commit"),
                              "result_file": str(self.dir / "attempts" / f"{a['attempt_id']}.result.json"), "status": res.get("status"), "stop_reason": res.get("stop_reason"),
                              "tool_calls": res.get("tool_calls"), "usage": res.get("usage"), "files": (patch or {}).get("files") or files, "artifacts": files, "error": res.get("error")},
                 "environment": env, "patch": patch,

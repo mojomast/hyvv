@@ -112,7 +112,9 @@ class PatchScope(unittest.TestCase):
 
         async def sh(sb, line, timeout_ms=120000):
             if "name-status" in line:
-                return name_status, "", 0
+                return name_status.replace("\t", "\0").replace("\n", "\0"), "", 0
+            if "rev-parse --verify" in line:
+                return "a" * 40, "", 0
             if "diff --cached --binary" in line:
                 return "diff --git a/x b/x\n", "", 0
             if "sha256sum" in line:
@@ -128,7 +130,7 @@ class PatchScope(unittest.TestCase):
         if assigned is not None:
             brief["assigned_files"] = assigned
         a = {"attempt_id": "att_scope00000002", "kind": "opencode", "sandbox": "s",
-             "workdir": "/tmp/w", "brief": brief}
+             "workdir": "/tmp/w", "seed_commit": "a" * 40, "brief": brief}
         return asyncio.run(be.patch(a))["files"]
 
     def test_empty_scope_marks_patch_files_out_of_scope(self):

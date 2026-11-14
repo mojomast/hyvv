@@ -43,6 +43,11 @@ The generated table covers the attempt, artifact and lease contract. The provisi
 
 ## Worker provisioning and landing export (merged on main; not released)
 
+Scoped coding attempts also require a verified per-attempt Git workspace and
+recorded seed. Setup or patch-collection errors produce failed attempts instead
+of successful empty patches. See [workspace readiness and patch evidence](docs/worker-workspace-evidence.md)
+for the failure contract and commissioning checks.
+
 The merged `main` branch adds the launcher-owned operation a coordinator needs before it can dispatch a bee into a repository the host has never seen: create the workspace, check out the exact commit, verify it, and register it as an authorized project without a restart and without the coordinator touching the host filesystem. PR #5 (merged at `fe606b237bb9d447223ca943aeedb899ef527d29`) contains the provisioning work from PR #4 plus canonical landing-event export; PR #4 was closed as superseded. It is governed by a host-enrolled policy, not by the request. The design is recorded in [`docs/adr/0001-worker-provisioning.md`](docs/adr/0001-worker-provisioning.md).
 
 **What works** (171 unit tests and 93 contract tests on 2026-11-14; deterministic, no live host):
