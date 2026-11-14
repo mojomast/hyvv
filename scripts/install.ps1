@@ -25,6 +25,8 @@ if ($WhatIf) {
 
 $payload = @(
   "launcher.py",
+  "provisioning.py",
+  "landing_export.py",
   "agy_cua_mcp.py",
   "brief.schema.json",
   "result.schema.json",
@@ -33,6 +35,11 @@ $payload = @(
 
 if (-not (Test-Path (Join-Path $Source "launcher.py"))) {
   throw "Source $Source does not contain launcher.py"
+}
+foreach ($required in @("provisioning.py", "landing_export.py")) {
+  if (-not (Test-Path (Join-Path $Source $required))) {
+    throw "Source $Source does not contain $required"
+  }
 }
 
 New-Item -ItemType Directory -Force $Prefix | Out-Null

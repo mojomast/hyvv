@@ -16,8 +16,23 @@ try:
     import provisioning as _provisioning
 except ImportError:  # pragma: no cover - the module ships beside launcher.py
     _provisioning = None
+try:
+    import landing_export as _landing_export
+except ImportError:  # pragma: no cover - the module ships beside launcher.py
+    _landing_export = None
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote
+
+if _landing_export is None:  # pragma: no cover - loaded from a sibling copy
+    try:
+        import importlib.util as _importlib_util
+        _export_spec = _importlib_util.spec_from_file_location("landing_export", Path(__file__).with_name("landing_export.py"))
+        _landing_export = _importlib_util.module_from_spec(_export_spec)
+        sys.modules.setdefault("landing_export", _landing_export)
+        _export_spec.loader.exec_module(_landing_export)
+    except Exception:
+        _landing_export = None
 
 VERSION = "0.1.16"
 HEARTBEAT_S = 60  # controller emits a heartbeat event after this many quiet seconds
@@ -1776,6 +1791,18 @@ def make_handler(L, token):
             if p == ["v1", "health"]:
                 return self._send(200, {"ok": True, "version": VERSION, "max_concurrent": L.cfg["max_concurrent"], "active": len(L._active()), "queued": len(L._queue()), "model": L.cfg["model"],
                                        "uptime_s": round(time.time() - L.started_at), "loop_lag_ms": round(L.loop_lag_ms, 1)})
+            if p == ["v1", "landing", "events"]:  # authenticated export of the durable canonical outbox
+                if _landing_export is None:
+                    return self._send(501, {"error": "landing export is unavailable"})
+                try:
+                    page = _landing_export.export_events(
+                        L.dir,
+                        after=unquote(q["after"]) if "after" in q else None,
+                        limit=q.get("limit"),
+                    )
+                except _landing_export.LandingExportError as ex:
+                    return self._send(400, {"error": str(ex)})
+                return self._send(200, page)
             if len(p) >= 3 and p[:2] == ["v1", "attempts"]:
                 a = L.attempts.get(p[2])
                 if not a: return self._send(404, {"error": "unknown attempt"})
