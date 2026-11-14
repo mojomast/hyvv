@@ -67,7 +67,7 @@ class ExportModule(unittest.TestCase):
     def add(self, aid, **kwargs):
         return save_event(self.data_dir, aid, **kwargs)
 
-    def test_exports_persisted_canonical_events_with_raw_byte_sha256(self):
+    def test_exports_persisted_canonical_events_with_content_and_file_identity(self):
         paths = [self.add(f"att_export000{i}")[0] for i in range(3)]
         outbox = self.data_dir / "events" / "outbox"
 
@@ -89,7 +89,12 @@ class ExportModule(unittest.TestCase):
                          sorted(path.stem for path in paths))
         for row in body["events"]:
             raw = (outbox / f"{row['event_id']}.json").read_bytes()
-            self.assertEqual(row["sha256"], hashlib.sha256(raw).hexdigest())
+            canonical = (
+                json.dumps(row["event"], sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+                .encode("utf-8") + b"\n"
+            )
+            self.assertEqual(row["sha256"], hashlib.sha256(canonical).hexdigest())
+            self.assertEqual(row["file_sha256"], hashlib.sha256(raw).hexdigest())
             self.assertEqual(row["event"], json.loads(raw.decode("utf-8")))
             self.assertEqual(row["event_id"], row["event"]["id"])
             self.assertEqual(row["cursor"], row["event_id"])

@@ -17,8 +17,9 @@ Wire shape for ``GET /v1/landing/events``::
       "retention": {...}
     }
 
-``sha256`` is the SHA-256 of the exact bytes stored on disk.  A client can use
-it to prove the exported ``event`` is byte-identical to the producer outbox.
+``sha256`` is the SHA-256 of the canonical CloudEvent content (sorted keys,
+compact separators, trailing newline). ``file_sha256`` is the SHA-256 of the
+exact stored outbox file, retained as an auditable file identity.
 """
 from __future__ import annotations
 
@@ -161,10 +162,16 @@ def _read_entries(source):
         if cursor in by_cursor:
             # Canonical outbox filenames are unique; keep the first stable path.
             continue
+        canonical = (
+            json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            .encode("utf-8")
+            + b"\n"
+        )
         row = {
             "cursor": cursor,
             "event_id": event_id,
-            "sha256": hashlib.sha256(raw).hexdigest(),
+            "sha256": hashlib.sha256(canonical).hexdigest(),
+            "file_sha256": hashlib.sha256(raw).hexdigest(),
             "event": event,
         }
         by_cursor[cursor] = row
