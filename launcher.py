@@ -9,7 +9,8 @@ narrow token-scoped HTTP API on loopback or a Tailscale address only.
   uv run --with cua==0.5.0 launcher.py doctor --config config.json
 """
 from __future__ import annotations
-import argparse, asyncio, bisect, platform, hashlib, hmac, ipaddress, json, os, re, sys, threading, time, uuid
+import argparse, asyncio, bisect, platform, hashlib, hmac, ipaddress, json, os, re, socket, sys, threading, time, uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -121,6 +122,362 @@ SECRETISH = re.compile(r"(sk-[A-Za-z0-9_\-]{8,}|Bearer\s+\S+|[A-Za-z0-9_\-]{32,}
 
 def redact(s):
     return SECRETISH.sub("<redacted>", s) if isinstance(s, str) else s
+
+# ---------------------------------------------------------------- bee landed events
+# A terminal attempt produces exactly one durable CloudEvent. The event is written to
+# <data_dir>/events/outbox/<event_id>.json with temp-file + fsync + rename, so a crash
+# can leave a complete event or no event, never a torn one. Delivery is a local signal
+# (file or Unix socket); the outbox file itself is the replayable source of truth.
+LANDED_EVENT_TYPE = "rizzstack.bee.landed.v1"
+LANDED_EVENT_SCHEMA = "https://rizstack.dev/schemas/bee-landed/v1"
+_LANDED_EVIDENCE_KEYS = ("attempt_id", "state", "feature_id", "job_id", "task_id",
+                         "coordinator", "harness", "model", "source_rev", "lease_sha256", "result")
+
+
+class LandedEventConflict(ValueError):
+    """A second, contradictory terminal observation for the same attempt was refused."""
+
+
+def _iso_utc(ts=None):
+    ts = time.time() if ts is None else ts
+    return datetime.fromtimestamp(float(ts), timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _canonical_bytes(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _text_id(value):
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, dict):
+        for key in ("id", "name", "ref", "coordinator_id", "session_id", "sha256"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return None
+
+
+def _brief_id(brief, name):
+    for key in (name + "_id", name):
+        value = brief.get(key)
+        found = value.strip() if isinstance(value, str) and value.strip() else _text_id(value)
+        if found:
+            return found
+    return None
+
+
+def landed_source(cfg):
+    """A stable, non-secret CloudEvents source for this launcher."""
+    cfg = cfg or {}
+    ident = (cfg.get("launcher_id") or cfg.get("worker_id") or cfg.get("source") or
+             cfg.get("host_id") or platform.node() or "launcher")
+    ident = str(ident).strip() or "launcher"
+    if "://" in ident:
+        return ident
+    safe = re.sub(r"[^A-Za-z0-9._~:-]", "-", ident) or "launcher"
+    return "hyvv://" + safe
+
+
+def landed_event_id(attempt_id, state):
+    """Opaque id, deterministic for one (attempt_id, terminal state) observation."""
+    digest = _sha256_bytes((str(attempt_id) + "\x00" + str(state)).encode("utf-8"))
+    return "bee-" + digest[:32]
+
+
+def _coordinator_parts(a):
+    brief = a.get("brief") or {}
+    raw = brief.get("coordinator") if brief.get("coordinator") is not None else a.get("coordinator")
+    cid = _text_id(raw) or _text_id(brief.get("coordinator_id")) or _text_id(a.get("coordinator_id"))
+    session = brief.get("coordinator_session") or brief.get("session_id") or brief.get("session")
+    if isinstance(raw, dict):
+        session = session or raw.get("session") or raw.get("session_id")
+    if isinstance(session, dict):
+        session = _text_id(session)
+    session = session.strip() if isinstance(session, str) and session.strip() else None
+    return cid, session
+
+
+def _lease_sha256(a):
+    brief = a.get("brief") or {}
+    for key in ("lease_sha256", "lease_sha"):
+        value = brief.get(key) if brief.get(key) is not None else a.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    lease = brief.get("lease") if brief.get("lease") is not None else a.get("lease")
+    if isinstance(lease, dict):
+        nested = lease.get("sha256") or lease.get("sha256_hex")
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip().lower()
+        return _sha256_bytes(_canonical_bytes(lease))
+    if isinstance(lease, str) and lease.strip():
+        value = lease.strip()
+        return value.lower() if re.fullmatch(r"[0-9a-fA-F]{64}", value) else _sha256_bytes(value.encode("utf-8"))
+    return None
+
+
+def _landed_result(a, result_path, attempt_id=None):
+    aid = str(attempt_id or a.get("attempt_id") or (a.get("brief") or {}).get("attempt_id") or "")
+    info = {"available": False, "artifact_sha256": None, "reference": None}
+    if result_path is None:
+        return info
+    path = Path(result_path)
+    try:
+        if not path.is_file():
+            return info
+        raw = path.read_bytes()
+        info.update(available=True, artifact_sha256=_sha256_bytes(raw),
+                    reference=f"hyvv://attempts/{aid}/result")
+        try:
+            schema = json.loads(raw.decode("utf-8")).get("schema")
+            if isinstance(schema, str) and schema:
+                info["schema"] = schema
+        except Exception:
+            pass
+    except OSError:
+        pass
+    return info
+
+
+def build_landed_event(a, cfg=None, result_path=None):
+    """Build the CloudEvents envelope for a persisted terminal attempt."""
+    state = a.get("state")
+    if state not in TERMINAL:
+        raise ValueError(f"attempt is not terminal (state {state!r})")
+    aid = str(a.get("attempt_id") or (a.get("brief") or {}).get("attempt_id") or "").strip()
+    if not aid:
+        raise ValueError("attempt_id is required")
+    brief = a.get("brief") or {}
+    cfg = cfg or {}
+    kind = a.get("kind") or brief.get("kind") or "opencode"
+    harness = a.get("harness") or ("agy" if kind == "agy-cua" else ("check" if kind == "check" else "opencode"))
+    coordinator_id, coordinator_session = _coordinator_parts(a)
+    event_id = landed_event_id(aid, state)
+    data = {
+        "event_id": event_id,
+        "feature_id": _brief_id(brief, "feature"),
+        "job_id": _brief_id(brief, "job"),
+        "task_id": _brief_id(brief, "task"),
+        "attempt_id": aid,
+        "coordinator": {"id": coordinator_id, "session": coordinator_session},
+        "harness": harness,
+        "model": a.get("model") or brief.get("model") or cfg.get("model"),
+        "state": state,
+        "source_rev": brief.get("source_rev") or a.get("source_rev"),
+        "lease_sha256": _lease_sha256(a),
+        "result": _landed_result(a, result_path, aid),
+    }
+    data["evidence_sha256"] = _landing_evidence(data)
+    return {
+        "specversion": "1.0",
+        "id": event_id,
+        "source": landed_source(cfg),
+        "type": LANDED_EVENT_TYPE,
+        "time": _iso_utc(a.get("updated_at") or a.get("created_at")),
+        "subject": aid,
+        "datacontenttype": "application/json",
+        "dataschema": LANDED_EVENT_SCHEMA,
+        "data": data,
+    }
+
+
+def _landing_evidence(data):
+    core = {key: (data or {}).get(key) for key in _LANDED_EVIDENCE_KEYS}
+    return _sha256_bytes(_canonical_bytes(core))
+
+
+def _landing_conflicts(existing, event):
+    old = existing.get("data") if isinstance(existing, dict) else None
+    new = event.get("data") or {}
+    if not isinstance(old, dict):
+        return True
+    if old.get("attempt_id") != new.get("attempt_id") or old.get("state") != new.get("state"):
+        return True
+    return _landing_evidence(old) != _landing_evidence(new)
+
+
+def _landed_outbox(data_dir):
+    return Path(data_dir) / "events" / "outbox"
+
+
+def _find_landed_events(outbox, attempt_id):
+    found = []
+    try:
+        paths = sorted(outbox.glob("*.json"))
+    except OSError:
+        return found
+    for path in paths:
+        try:
+            event = json.loads(path.read_text("utf-8"))
+        except (OSError, ValueError):
+            continue
+        data = event.get("data") if isinstance(event, dict) else None
+        if isinstance(data, dict) and data.get("attempt_id") == attempt_id:
+            found.append((path, event))
+    return found
+
+
+def _fsync_dir(path):
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def write_landed_event(outbox, event):
+    """Atomically persist one event as <outbox>/<id>.json; never overwrite conflicting evidence."""
+    outbox = Path(outbox)
+    event_id = str(event.get("id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", event_id):
+        raise ValueError("invalid landed event id")
+    path = outbox / (event_id + ".json")
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text("utf-8"))
+        except (OSError, ValueError) as ex:
+            raise LandedEventConflict(f"existing landed event {event_id} is unreadable") from ex
+        if _landing_conflicts(existing, event):
+            raise LandedEventConflict(f"conflicting terminal evidence for attempt {event['data'].get('attempt_id')}")
+        return path
+    outbox.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(event, sort_keys=True, indent=1, ensure_ascii=False).encode("utf-8")
+    tmp = outbox / (f".{event_id}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(outbox)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+    return path
+
+
+def _landed_notifier(cfg):
+    cfg = cfg or {}
+    for key in ("notify_socket", "landed_socket", "landing_socket"):
+        if cfg.get(key):
+            return {"type": "unix", "path": cfg[key]}
+    for key in ("notify_file", "notify_path", "landed_file", "landing_file"):
+        if cfg.get(key):
+            return {"type": "file", "path": cfg[key]}
+    for key in ("landed_notifier", "landing_notifier", "bee_landed_notifier", "event_notifier",
+                "outbox_notifier", "landed_notify", "notifier"):
+        if cfg.get(key) is not None:
+            return cfg[key]
+    for section in ("landed", "landing", "bee_landed", "events"):
+        block = cfg.get(section)
+        if isinstance(block, dict) and block.get("notifier") is not None:
+            return block["notifier"]
+    return None
+
+
+def _notifier_target(spec):
+    options = {}
+    if isinstance(spec, str):
+        text = spec.strip()
+        if text.startswith("unix://"):
+            return "unix", text[7:], options
+        if text.startswith("unix:"):
+            return "unix", text[5:], options
+        if text.startswith("file://"):
+            return "file", text[7:], options
+        if text.startswith("file:"):
+            return "file", text[5:], options
+        return "file", text, options
+    if not isinstance(spec, dict):
+        raise ValueError("notifier must be a path, URI, or object")
+    options = spec
+    kind = str(spec.get("type") or spec.get("kind") or spec.get("transport") or "file").lower()
+    path = spec.get("path") or spec.get("file") or spec.get("socket") or spec.get("sock")
+    if not isinstance(path, str) or not path:
+        raise ValueError("notifier path is required")
+    if kind in ("unix", "unix-socket", "unix_socket", "socket", "sock"):
+        kind = "unix"
+    else:
+        kind = "file"
+    return kind, path, options
+
+
+def notify_landed_event(event, cfg=None, notifier=None):
+    """Best-effort local delivery signal. A failure never removes or damages the outbox event."""
+    spec = _landed_notifier(cfg) if notifier is None else notifier
+    if spec is None:
+        return False
+    payload = (json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+    try:
+        kind, target, options = _notifier_target(spec)
+        if kind == "unix":
+            mode = str(options.get("mode") or options.get("socket_type") or "stream").lower()
+            sock_type = socket.SOCK_DGRAM if mode in ("dgram", "datagram") else socket.SOCK_STREAM
+            sock = socket.socket(socket.AF_UNIX, sock_type)
+            try:
+                sock.settimeout(float(options.get("timeout_s") or 2.0))
+                sock.connect(target)
+                if sock_type == socket.SOCK_DGRAM:
+                    sock.send(payload)
+                else:
+                    sock.sendall(payload)
+            finally:
+                sock.close()
+        else:
+            path = Path(target)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "ab") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+        return True
+    except Exception:
+        return False
+
+
+def emit_landed_record(a, data_dir, cfg=None, result_path=None):
+    """Write one idempotent landed event and signal delivery. Returns (path, event, created)."""
+    cfg = cfg or {}
+    event = build_landed_event(a, cfg, result_path)
+    outbox = _landed_outbox(data_dir)
+    for path, existing in _find_landed_events(outbox, event["data"]["attempt_id"]):
+        if _landing_conflicts(existing, event):
+            raise LandedEventConflict(f"conflicting terminal evidence for attempt {event['data']['attempt_id']}")
+        return path, existing, False
+    path = write_landed_event(outbox, event)
+    notify_landed_event(event, cfg)
+    return path, event, True
+
+
+def replay_landed_events(data_dir, cfg=None, notifier=None):
+    """Re-signal every durable outbox event (at-least-once). Returns (delivered, total)."""
+    outbox = _landed_outbox(data_dir)
+    delivered = total = 0
+    try:
+        paths = sorted(outbox.glob("*.json"))
+    except OSError:
+        paths = []
+    for path in paths:
+        try:
+            event = json.loads(path.read_text("utf-8"))
+        except (OSError, ValueError):
+            continue
+        total += 1
+        delivered += 1 if notify_landed_event(event, cfg, notifier) else 0
+    return delivered, total
+
 
 def load_config(path):
     cfg = json.loads(Path(path).read_text("utf-8-sig"))
@@ -885,7 +1242,9 @@ class Launcher:
         self.loop = asyncio.new_event_loop()
         self._ev_lock = threading.Lock(); self._ev_idx = {}  # events_since offset index
         self.started_at = time.time(); self.loop_lag_ms = 0.0
+        self.landing_conflicts = []
         self._load()
+        self.recover_landed_events()
 
     # journal: one JSON per attempt (atomic replace) + append-only events log
     def _path(self, aid): return self.dir / "attempts" / f"{aid}.json"
@@ -1012,12 +1371,52 @@ class Launcher:
             else: a["cancel"] = True; self._set(a, "cancel_requested", "interrupt sent")
         self.kick(); return a
 
+    def landed_result_path(self, a):
+        aid = a.get("attempt_id") or (a.get("brief") or {}).get("attempt_id")
+        return self.dir / "attempts" / f"{aid}.result.json"
+
+    def build_landed_event(self, a, result_path=None):
+        return build_landed_event(a, self.cfg, self.landed_result_path(a) if result_path is None else result_path)
+
+    def emit_landed_event(self, a, result_path=None):
+        """Persist exactly one event for this terminal attempt; refuse contradictory evidence."""
+        if result_path is None:
+            result_path = self.landed_result_path(a)
+        with self.lock:
+            _, event, _ = emit_landed_record(a, self.dir, self.cfg, result_path)
+            return event
+
+    def replay_landed_events(self, notifier=None):
+        """Re-send durable outbox events to the configured notifier (at-least-once)."""
+        return replay_landed_events(self.dir, self.cfg, notifier)
+
+    def recover_landed_events(self):
+        """Emit events missed by a crash after the terminal journal write; never crashes startup."""
+        recovered = []
+        for a in list(self.attempts.values()):
+            if a.get("state") not in TERMINAL:
+                continue
+            try:
+                recovered.append(self.emit_landed_event(a))
+            except LandedEventConflict as ex:
+                self.landing_conflicts.append({"attempt_id": a.get("attempt_id"), "error": str(ex)})
+            except Exception as ex:  # disk errors must not stop the launcher; the journal still has the state
+                self.landing_conflicts.append({"attempt_id": a.get("attempt_id"), "error": type(ex).__name__})
+        return recovered
+
     def _set(self, a, state, detail, ev=None):
         a["state"], a["detail"], a["updated_at"] = state, detail, time.time()
         a["lseq"] += 1
         e = {"lseq": a["lseq"], "ts": a["updated_at"], "kind": "state", "state": state, "detail": detail}
         if ev: e.update(ev)
         self._append_events(a, [e]); self._save(a)
+        if state in TERMINAL:
+            try:
+                self.emit_landed_event(a)
+            except LandedEventConflict:
+                raise
+            except Exception as ex:  # keep the durable journal transition; recovery on restart will retry
+                self.landing_conflicts.append({"attempt_id": a.get("attempt_id"), "error": type(ex).__name__})
 
     def _active(self): return [x for x in self.attempts.values() if x["state"] in ("starting", "running", "cancel_requested")]
 
