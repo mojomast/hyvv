@@ -39,11 +39,11 @@ Nothing below the first row ships in the launcher yet. `GET /v1/attempts/{attemp
 | **Proposed** (`proposed`) | — | coordinator-signed briefs (HMAC over the canonical brief with the per-coordinator key, verified at settle) |
 <!-- status:end -->
 
-The generated table covers the attempt, artifact and lease contract. The provisioning routes are additive, are documented below, and are not yet listed in `contract/v1/STATUS.json` because they ship on `feat/worker-provisioning` only.
+The generated table covers the attempt, artifact and lease contract. The provisioning and landing-export routes are additive, are documented below, and are not yet listed in `contract/v1/STATUS.json` because they are merged on `main` but not in a released build.
 
-## Worker provisioning (feature branch, not released)
+## Worker provisioning and landing export (merged on main; not released)
 
-`feat/worker-provisioning` (PR #4) adds the launcher-owned operation a coordinator needs before it can dispatch a bee into a repository the host has never seen: create the workspace, check out the exact commit, verify it, and register it as an authorized project without a restart and without the coordinator touching the host filesystem. It is governed by a host-enrolled policy, not by the request. The design is recorded in [`docs/adr/0001-worker-provisioning.md`](docs/adr/0001-worker-provisioning.md).
+The merged `main` branch adds the launcher-owned operation a coordinator needs before it can dispatch a bee into a repository the host has never seen: create the workspace, check out the exact commit, verify it, and register it as an authorized project without a restart and without the coordinator touching the host filesystem. PR #5 (merged at `fe606b237bb9d447223ca943aeedb899ef527d29`) contains the provisioning work from PR #4 plus canonical landing-event export; PR #4 was closed as superseded. It is governed by a host-enrolled policy, not by the request. The design is recorded in [`docs/adr/0001-worker-provisioning.md`](docs/adr/0001-worker-provisioning.md).
 
 **What works** (171 unit tests and 93 contract tests on 2026-11-14; deterministic, no live host):
 
@@ -69,7 +69,9 @@ A profile may also map a canonical repository to an enrolled mirror (`mirrors`),
 
 **What is experimental:** the live Windows host has not run this branch; the mirror and cross-machine transport are exercised against local fixtures, not a second machine. Provisioning is a one-time privileged host step: install this build and enroll a policy deliberately.
 
-**What is blocked:** PR #4 is open and blocked because branch protection requires `bee-ci/*` required contexts that no job produces. The endpoints therefore do not exist on any released launcher. Bundlebees pins this branch by commit (`5bee1a870ffe32ee91c6a70b7be807eaa8400801`) and sets `REQUIRE_HYVV=1`, so its CI runs the real contract while the PR is blocked.
+**Deployment status:** the endpoints are merged on `main` but do not exist on the running released launcher. Bundlebees pins the merged revision `fe606b237bb9d447223ca943aeedb899ef527d29` and sets `REQUIRE_HYVV=1` in CI. Deploying the merged build, enrolling `provisioning-policy.json`, and performing the real-TTY authorization remain separate operator actions; the real-bee canary is **NOT RUN**.
+
+**Canonical landing export.** `GET /v1/landing/events?after=<position>&limit=<n>` is an authenticated, read-only view of the durable outbox. It exports the stored canonical CloudEvents, never a reconstruction from attempt summaries. The cursor is a durable monotonic integer export position independent of the canonical event ID, so an event appended later is returned even when its ID sorts lower. Each row carries `cursor`, `event_id`, the canonical-content `sha256`, `file_sha256` for the exact stored bytes, and `event`; the page carries `next_cursor`, `has_more`, `retention` and the `rizzstack.bee-landed-export/1` schema. Invalid, expired and incompatible cursors return HTTP 400 with an explicit error code; unknown cursors are never a successful empty page. The bundlebees client recovers a legacy hash cursor once from the durable beginning under idempotent local ingestion and then persists the integer position. Cursor persistence occurs only after durable local ingestion, and exporter restart/crash recovery scans the outbox for unindexed files.
 
 **Protocol pinning.** A backend must advertise `rizzstack.provisioning/1`; a `404`, or a different schema, is incompatible and dispatch stops. There is no legacy fallback. The receipt carries `status: ready`, `repo`, `resolved_revision`, `project`, `profile`, `host`, `verified` (`head`, `detached`, `clean`) and `transport`; the coordinator checks each field against the authorization and binds the job to the receipt digest. `5xx` means `ProvisionUncertain` — reconcile, never re-POST; `409` is a conflict.
 
