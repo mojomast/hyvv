@@ -17,12 +17,12 @@ This repository is the fourth layer: the runtime on each machine where work happ
 
 ## Status
 
-The imported runtime is **v0.1.15**. It already routes unprefixed and `go:` models to OpenCode Go, and `deepseek:` or `priority: high` to the official DeepSeek API, with automatic DeepSeek fallback.
+The imported runtime is **v0.1.15**. This branch bumps the package to **v0.1.16** so a deployed build can be told apart; the release is still 0.1.15. It already routes unprefixed and `go:` models to OpenCode Go, and `deepseek:` or `priority: high` to the official DeepSeek API, with automatic DeepSeek fallback.
 
 The `/v1` contract in `contract/v1` is the source of truth going forward:
 
 - OpenAPI plus JSON Schemas for attempts, artifacts (`hyvv.worker-artifact/1`), errors, and usage records (`bee.usage/v1`)
-- `GET /v1/version` returns `api_version` (`v1`, the contract version) and `version` (the hyvv / launcher release, currently `0.1.15`), plus the capabilities this host supports (`priority_routing`, `go_fallback`). `artifact_fetch` and `leases` are advertised only once those routes ship
+- `GET /v1/version` returns `api_version` (`v1`, the contract version) and `version` (the hyvv / launcher release, `0.1.16` on this branch, `0.1.15` released), plus the capabilities this host supports (`priority_routing`, `go_fallback`). `artifact_fetch` and `leases` are advertised only once those routes ship
 - Semver: `/v1` only ever gets additive changes. A breaking change is `/v2`, served alongside `/v1` for one release
 - Conformance tests, including artifact acceptance criteria `AC-001`–`AC-010`
 
@@ -38,6 +38,48 @@ Nothing below the first row ships in the launcher yet. `GET /v1/attempts/{attemp
 | **Specified, not implemented** (`specified`) | `GET /v1/leases`, `POST /v1/leases`, `DELETE /v1/leases/{lease_id}`, `POST /v1/leases/{lease_id}/renew` | bee-slot leases (capability leases, 429 capacity_exhausted) |
 | **Proposed** (`proposed`) | — | coordinator-signed briefs (HMAC over the canonical brief with the per-coordinator key, verified at settle) |
 <!-- status:end -->
+
+The generated table covers the attempt, artifact and lease contract. The provisioning routes are additive, are documented below, and are not yet listed in `contract/v1/STATUS.json` because they ship on `feat/worker-provisioning` only.
+
+## Worker provisioning (feature branch, not released)
+
+`feat/worker-provisioning` (PR #4) adds the launcher-owned operation a coordinator needs before it can dispatch a bee into a repository the host has never seen: create the workspace, check out the exact commit, verify it, and register it as an authorized project without a restart and without the coordinator touching the host filesystem. It is governed by a host-enrolled policy, not by the request. The design is recorded in [`docs/adr/0001-worker-provisioning.md`](docs/adr/0001-worker-provisioning.md).
+
+**What works** (171 unit tests and 93 contract tests on 2026-11-14; deterministic, no live host):
+
+- `GET /v1/provision/capabilities` — advertises `rizzstack.provisioning/1`, `enabled`, profiles, whether cleanup and receipt lookup are supported, mirrored repositories, and the idempotency rule. A disabled host advertises `enabled: false`; it never pretends.
+- `POST /v1/provision/project` — declarative request: `repo` (`owner/name`), full 40-hex `source_rev`, `profile`, `job_id`, `project`, `idempotency_key`. The host derives the path from the profile's `workspace_root` plus a validated name.
+- `GET /v1/provision/receipts/<idempotency_key>` — read-only receipt lookup that revalidates the live registry, the workspace path and the checkout; a stale receipt is refused (`receipt_stale`), not returned as truth.
+- `POST /v1/provision/cleanup` — bounded deletion, only inside the profile root, only when the profile allows it and no attempt is running.
+
+**Policy, not request, is authority.** The host enrolls `provisioning-policy.json` next to `config.json`:
+
+```json
+{"schema": "rizzstack.provisioning/1",
+ "profiles": {"smoke": {"repo_patterns": ["mojomast/rizzstack-smoke"],
+   "workspace_root": "/srv/orbit-worker-fixtures",
+   "max_provisioned": 5, "ttl_hours": 24, "allow_cleanup": true,
+   "git_actions": ["clone", "fetch", "checkout"],
+   "task_scopes": ["smoke/answer.py"]}}}
+```
+
+A profile may also map a canonical repository to an enrolled mirror (`mirrors`), so an accepted ref is fetched from the governed mirror rather than GitHub; a request can never name a URL. The trusted-remote check compares the resolved transport URL while the repository identity stays canonical.
+
+**Invariants enforced by the implementation:** no request-selected paths or reparse points; the only child process is `git` with a fixed argument vector; credentials stay in the host's git credential helper and are scrubbed from errors; `HEAD == source_rev`, the remote matches the repository identity and the worktree is clean before registration; `config.json` is rewritten atomically and the running registry updated; one journal record per idempotency key with an `O_EXCL` per-key lock; a `preparing` record with an existing workspace is re-verified and adopted, never re-cloned; cleanup leaves the journal record as evidence.
+
+**What is experimental:** the live Windows host has not run this branch; the mirror and cross-machine transport are exercised against local fixtures, not a second machine. Provisioning is a one-time privileged host step: install this build and enroll a policy deliberately.
+
+**What is blocked:** PR #4 is open and blocked because branch protection requires `bee-ci/*` required contexts that no job produces. The endpoints therefore do not exist on any released launcher. Bundlebees pins this branch by commit (`5bee1a870ffe32ee91c6a70b7be807eaa8400801`) and sets `REQUIRE_HYVV=1`, so its CI runs the real contract while the PR is blocked.
+
+**Protocol pinning.** A backend must advertise `rizzstack.provisioning/1`; a `404`, or a different schema, is incompatible and dispatch stops. There is no legacy fallback. The receipt carries `status: ready`, `repo`, `resolved_revision`, `project`, `profile`, `host`, `verified` (`head`, `detached`, `clean`) and `transport`; the coordinator checks each field against the authorization and binds the job to the receipt digest. `5xx` means `ProvisionUncertain` — reconcile, never re-POST; `409` is a conflict.
+
+**Enabling it.** `provisioning.enabled` defaults to `false`. Add the block to `config.json` and restart the launcher once:
+
+```json
+{"provisioning": {"enabled": true,
+                  "policy": "provisioning-policy.json",
+                  "journal": "provisioning"}}
+```
 
 ## Install
 
@@ -103,9 +145,11 @@ Orbit and bundlebees should pin this tree at a tag and run the same command in t
 ## Development
 
 ```bash
-uv run python -m unittest discover -s tests -v   # 82 unit tests
-uv run python -m contract -v                     # 46 contract tests
+uv run python -m unittest discover -s tests -v   # 171 tests, 2 skipped (2026-11-14)
+uv run python -m contract -v                     # 93 tests, 3 skipped
 ```
+
+The provisioning tests are part of the unit suite: `tests/test_provisioning.py`, `tests/test_provisioning_api.py` and `tests/test_provisioning_convergence.py` cover policy denial, path containment, checkout mismatch, idempotency, quota, crash adoption, cleanup and mirror transport. They need no network and no live host.
 
 The Cua SDK contract test (`tests/test_sdk_contract.py`) is skipped when `cua` is not installed. Run it with `uv run --python 3.12 --with cua==0.5.0 python -m unittest tests.test_sdk_contract -v`.
 
