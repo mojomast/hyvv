@@ -1,6 +1,6 @@
 # ADR 0001 — Worker-host project provisioning
 
-Status: proposed (draft PR, not deployed)
+Status: accepted; merged to `main` in PR #5 (not yet deployed)
 Scope: `hyvv` launcher; consumed by `bundlebees` M3.5
 
 ## Context
@@ -114,7 +114,7 @@ until a human inspects them.
 
 * A launcher upgrade and a policy enrollment are **one-time privileged steps**;
   they are approval gates, not routine operations. Until the worker runs this
-  code, the endpoints do not exist and the smoke stays blocked.
+  code, the endpoints do not exist on the deployed build and the smoke stays blocked.
 * `config.json` becomes launcher-written, so its formatting changes on first
   registration; every unknown key is preserved.
 * `max_provisioned` and TTL accounting are enforced per profile; exceeding them
