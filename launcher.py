@@ -130,8 +130,11 @@ def redact(s):
 # (file or Unix socket); the outbox file itself is the replayable source of truth.
 LANDED_EVENT_TYPE = "rizzstack.bee.landed.v1"
 LANDED_EVENT_SCHEMA = "https://rizstack.dev/schemas/bee-landed/v1"
-_LANDED_EVIDENCE_KEYS = ("attempt_id", "state", "feature_id", "job_id", "task_id",
-                         "coordinator", "harness", "model", "source_rev", "lease_sha256", "result")
+LANDED_DATA_SCHEMA = "rizzstack.bee-landed/1"
+LANDED_EVENT_ID_PREFIX = "urn:rizzstack:bee-landed:"
+_LANDED_EVIDENCE_KEYS = ("schema", "feature_id", "job_id", "task_id", "attempt_id",
+                         "coordinator", "backend", "state", "source_rev", "lease", "result",
+                         "correlation_id", "causation_id")
 
 
 class LandedEventConflict(ValueError):
@@ -162,6 +165,20 @@ def _text_id(value):
     return None
 
 
+def _canonical_id(value, fallback):
+    text = str(value or "").strip()
+    text = re.sub(r"[^A-Za-z0-9._-]", "-", text)[:128]
+    if not text or not re.match(r"[A-Za-z0-9]", text[0]):
+        return fallback
+    return text
+
+
+def _bounded_text(value, maximum):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()[:maximum]
+
+
 def _brief_id(brief, name):
     for key in (name + "_id", name):
         value = brief.get(key)
@@ -183,10 +200,11 @@ def landed_source(cfg):
     return "hyvv://" + safe
 
 
-def landed_event_id(attempt_id, state):
-    """Opaque id, deterministic for one (attempt_id, terminal state) observation."""
-    digest = _sha256_bytes((str(attempt_id) + "\x00" + str(state)).encode("utf-8"))
-    return "bee-" + digest[:32]
+def landed_event_id(attempt_id, state, transition=None):
+    """Opaque URN id, deterministic for one (attempt_id, state, transition) observation."""
+    transition = str(transition).strip() if isinstance(transition, str) and transition.strip() else str(state)
+    material = f"{attempt_id}:{state}:{transition}"
+    return LANDED_EVENT_ID_PREFIX + _sha256_bytes(material.encode("utf-8"))[:32]
 
 
 def _coordinator_parts(a):
@@ -202,27 +220,58 @@ def _coordinator_parts(a):
     return cid, session
 
 
-def _lease_sha256(a):
+def _source_rev(a, brief, attempt_id, state):
+    value = brief.get("source_rev") if brief.get("source_rev") is not None else a.get("source_rev")
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value):
+            return value
+    # Keep the wire event canonical even when a legacy brief omitted source_rev.
+    return _sha256_bytes(f"{attempt_id}:{state}".encode("utf-8"))
+
+
+def _assigned_files(a, brief):
+    raw = brief.get("assigned_files") if brief.get("assigned_files") is not None else a.get("assigned_files")
+    lease = brief.get("lease") if brief.get("lease") is not None else a.get("lease")
+    if raw is None and isinstance(lease, dict):
+        raw = lease.get("assigned_files")
+    files = []
+    for item in raw or []:
+        if not isinstance(item, str):
+            continue
+        path = item.strip()
+        if not path or path in files or path.startswith("/") or "\\" in path:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*", path):
+            continue
+        if any(part in ("", ".", "..") for part in path.split("/")):
+            continue
+        files.append(path)
+    return files
+
+
+def _lease_sha256(a, source_rev):
     brief = a.get("brief") or {}
     for key in ("lease_sha256", "lease_sha"):
         value = brief.get(key) if brief.get(key) is not None else a.get(key)
-        if isinstance(value, str) and value.strip():
+        if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value.strip()):
             return value.strip().lower()
     lease = brief.get("lease") if brief.get("lease") is not None else a.get("lease")
     if isinstance(lease, dict):
         nested = lease.get("sha256") or lease.get("sha256_hex")
-        if isinstance(nested, str) and nested.strip():
+        if isinstance(nested, str) and re.fullmatch(r"[0-9a-fA-F]{64}", nested.strip()):
             return nested.strip().lower()
-        return _sha256_bytes(_canonical_bytes(lease))
-    if isinstance(lease, str) and lease.strip():
+    elif isinstance(lease, str) and lease.strip():
         value = lease.strip()
-        return value.lower() if re.fullmatch(r"[0-9a-fA-F]{64}", value) else _sha256_bytes(value.encode("utf-8"))
-    return None
+        if re.fullmatch(r"[0-9a-fA-F]{64}", value):
+            return value.lower()
+    material = {"assigned_files": sorted(_assigned_files(a, brief)), "source_rev": source_rev}
+    return _sha256_bytes(_canonical_bytes(material))
 
 
 def _landed_result(a, result_path, attempt_id=None):
     aid = str(attempt_id or a.get("attempt_id") or (a.get("brief") or {}).get("attempt_id") or "")
-    info = {"available": False, "artifact_sha256": None, "reference": None}
+    info = {"available": False}
     if result_path is None:
         return info
     path = Path(result_path)
@@ -232,19 +281,13 @@ def _landed_result(a, result_path, attempt_id=None):
         raw = path.read_bytes()
         info.update(available=True, artifact_sha256=_sha256_bytes(raw),
                     reference=f"hyvv://attempts/{aid}/result")
-        try:
-            schema = json.loads(raw.decode("utf-8")).get("schema")
-            if isinstance(schema, str) and schema:
-                info["schema"] = schema
-        except Exception:
-            pass
     except OSError:
         pass
     return info
 
 
 def build_landed_event(a, cfg=None, result_path=None):
-    """Build the CloudEvents envelope for a persisted terminal attempt."""
+    """Build the canonical CloudEvents envelope for a persisted terminal attempt."""
     state = a.get("state")
     if state not in TERMINAL:
         raise ValueError(f"attempt is not terminal (state {state!r})")
@@ -256,22 +299,41 @@ def build_landed_event(a, cfg=None, result_path=None):
     kind = a.get("kind") or brief.get("kind") or "opencode"
     harness = a.get("harness") or ("agy" if kind == "agy-cua" else ("check" if kind == "check" else "opencode"))
     coordinator_id, coordinator_session = _coordinator_parts(a)
-    event_id = landed_event_id(aid, state)
+    if not coordinator_id:
+        coordinator_id = str(cfg.get("launcher_id") or cfg.get("worker_id") or cfg.get("source") or "launcher").strip()
+        coordinator_id = coordinator_id or "launcher"
+    coordinator = {"identity": _bounded_text(coordinator_id, 256) or "launcher"}
+    if coordinator_session:
+        coordinator["session"] = _bounded_text(coordinator_session, 256)
+        if not coordinator["session"]:
+            coordinator.pop("session")
+    backend = {"harness": _bounded_text(harness, 128) or "opencode"}
+    model = a.get("model") or brief.get("model") or cfg.get("model")
+    model = _bounded_text(model, 128)
+    if model:
+        backend["model"] = model
+    source_rev = _source_rev(a, brief, aid, state)
+    transition = (brief.get("terminal_transition_id") or a.get("terminal_transition_id") or
+                  brief.get("transition_id") or a.get("transition_id") or
+                  brief.get("transition") or a.get("transition") or state)
+    event_id = landed_event_id(aid, state, transition)
     data = {
-        "event_id": event_id,
-        "feature_id": _brief_id(brief, "feature"),
-        "job_id": _brief_id(brief, "job"),
-        "task_id": _brief_id(brief, "task"),
+        "schema": LANDED_DATA_SCHEMA,
+        "feature_id": _canonical_id(_brief_id(brief, "feature"), aid),
+        "job_id": _canonical_id(_brief_id(brief, "job"), aid),
+        "task_id": _canonical_id(_brief_id(brief, "task"), aid),
         "attempt_id": aid,
-        "coordinator": {"id": coordinator_id, "session": coordinator_session},
-        "harness": harness,
-        "model": a.get("model") or brief.get("model") or cfg.get("model"),
+        "coordinator": coordinator,
+        "backend": backend,
         "state": state,
-        "source_rev": brief.get("source_rev") or a.get("source_rev"),
-        "lease_sha256": _lease_sha256(a),
+        "source_rev": source_rev,
+        "lease": {"sha256": _lease_sha256(a, source_rev), "assigned_files": _assigned_files(a, brief)},
         "result": _landed_result(a, result_path, aid),
     }
-    data["evidence_sha256"] = _landing_evidence(data)
+    for key in ("correlation_id", "causation_id"):
+        value = _bounded_text(brief.get(key) if brief.get(key) is not None else a.get(key), 256)
+        if value:
+            data[key] = value
     return {
         "specversion": "1.0",
         "id": event_id,
@@ -286,7 +348,8 @@ def build_landed_event(a, cfg=None, result_path=None):
 
 
 def _landing_evidence(data):
-    core = {key: (data or {}).get(key) for key in _LANDED_EVIDENCE_KEYS}
+    data = data or {}
+    core = {key: data[key] for key in _LANDED_EVIDENCE_KEYS if key in data}
     return _sha256_bytes(_canonical_bytes(core))
 
 
@@ -338,7 +401,7 @@ def write_landed_event(outbox, event):
     """Atomically persist one event as <outbox>/<id>.json; never overwrite conflicting evidence."""
     outbox = Path(outbox)
     event_id = str(event.get("id") or "")
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", event_id):
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", event_id):
         raise ValueError("invalid landed event id")
     path = outbox / (event_id + ".json")
     if path.exists():
