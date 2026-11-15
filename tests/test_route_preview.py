@@ -278,13 +278,21 @@ class RoutePreview(unittest.TestCase):
     def test_a_non_opencode_kind_is_refused_because_dispatch_resolves_it_differently(self):
         # Found by review: submit() only routes kind=opencode through model_spec; agy-cua resolves
         # through AGY_TIERS/AGY_MODELS and check uses no model at all. A preview that answered 200 for
-        # those kinds would report a route the dispatch never takes.
+        # those kinds would report a route the dispatch never takes. Dispatch reads the kind from the
+        # request's top-level field FIRST (submit: kind or brief.kind or "opencode"), so both channels
+        # must be refused, and non-string kinds must be a 400 rather than a dropped connection.
         la, srv = serve(self.tmp)
         try:
             for kind in ("agy-cua", "check", "bogus"):
+                st, body = post(srv, "/v1/route", {"kind": kind, "brief": {"objective": "x"}})
+                self.assertEqual(st, 400, kind)
+                self.assertIn("kind", body["error"], kind)
                 st, body = post(srv, "/v1/route", {"brief": {"objective": "x", "kind": kind}})
                 self.assertEqual(st, 400, kind)
                 self.assertIn("kind", body["error"], kind)
+            for bad in (["x"], {"a": 1}, 5):
+                st, body = post(srv, "/v1/route", {"kind": bad, "brief": {"objective": "x"}})
+                self.assertEqual(st, 400, bad)
         finally:
             srv.shutdown()
 

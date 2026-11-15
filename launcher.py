@@ -1954,7 +1954,7 @@ def make_handler(L, token):
                 return self._send(201 if created else 200, L.public(a))
             if p == ["v1", "route"]:  # preview: what this request would resolve to; no run is started
                 brief = b.get("brief") if isinstance(b.get("brief"), dict) else {}
-                try: return self._send(200, route_preview(L.cfg, b.get("model") or b.get("tier"), brief))
+                try: return self._send(200, route_preview(L.cfg, b.get("model") or b.get("tier"), brief, b.get("kind")))
                 except ValueError as ex: return self._send(400, {"error": str(ex)})
             if p == ["v1", "provision", "project"]:
                 svc = getattr(L, "provisioner", None)
@@ -2090,7 +2090,7 @@ def model_spec(cfg, name, brief=None):
             spec.update(base_url=cfg["base_url"], wire=cfg.get("wire") or "openai-chat")
     return spec
 
-def route_preview(cfg, model=None, brief=None):
+def route_preview(cfg, model=None, brief=None, kind=None):
     """What a dispatch of this request would resolve to, without starting one.
 
     Mirrors submit(): the request model field, then the brief's own model, then its tier, then
@@ -2101,9 +2101,13 @@ def route_preview(cfg, model=None, brief=None):
     Only kind=opencode is previewable: submit() resolves agy-cua through AGY_TIERS/AGY_MODELS and
     runs check briefs without a model, so any answer for those kinds would describe a route the
     dispatch never takes (found by the independent review of the first version of this endpoint).
+    The kind is read the way dispatch reads it: the request's top-level field first, then the
+    brief's own, then the opencode default. The preview covers model resolution only - it does not
+    run the brief validation dispatch applies (security profile, check commands), so a 200 means
+    "this is the model a dispatch would pick", not "dispatch would accept this brief".
     """
     brief = brief if isinstance(brief, dict) else {}
-    kind = brief.get("kind") or "opencode"
+    kind = kind or brief.get("kind") or "opencode"
     if kind != "opencode":
         raise ValueError(
             "route preview supports only kind=opencode; dispatch would resolve kind="
