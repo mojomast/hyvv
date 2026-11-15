@@ -1899,8 +1899,12 @@ def make_handler(L, token):
                 return self._send(200, {"api_version": "v1", "version": VERSION,
                                         "capabilities": ["priority_routing", "go_fallback"]})
             if p == ["v1", "health"]:
+                # `models` is the dispatchable allow-list (built-ins plus this host's config entries),
+                # so a coordinator can validate a brief's model before it dispatches; `model` stays
+                # the host default and is always a member.
+                allow = sorted({L.cfg["model"], *MODELS, *((L.cfg.get("models") or {}).keys())})
                 return self._send(200, {"ok": True, "version": VERSION, "max_concurrent": L.cfg["max_concurrent"], "active": len(L._active()), "queued": len(L._queue()), "model": L.cfg["model"],
-                                       "uptime_s": round(time.time() - L.started_at), "loop_lag_ms": round(L.loop_lag_ms, 1)})
+                                       "models": allow, "uptime_s": round(time.time() - L.started_at), "loop_lag_ms": round(L.loop_lag_ms, 1)})
             if p == ["v1", "landing", "events"]:  # authenticated export of the durable canonical outbox
                 if _landing_export is None:
                     return self._send(501, {"error": "landing export is unavailable"})
