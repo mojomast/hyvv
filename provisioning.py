@@ -472,15 +472,38 @@ class MemoryRegistry(RegistryStore):
 # ---------------------------------------------------------------------------
 
 
-def default_git(args: list[str], cwd: Path | None, *, timeout: float = 300.0) -> subprocess.CompletedProcess:
+_GIT_WINDOWS_ENV = ("SYSTEMROOT", "WINDIR", "TEMP", "TMP")
+
+
+def _git_env(environ: Mapping[str, str] | None = None, *, windows: bool | None = None) -> dict[str, str]:
+    """Build the deliberately small environment used for provisioning Git.
+
+    Windows networking (including name resolution in Git for Windows) requires
+    SYSTEMROOT; passing only PATH/HOME makes the networking stack unavailable
+    and produces ``getaddrinfo() thread failed to start``. Pass the Windows
+    runtime variables through when they exist, without widening the child
+    environment to the coordinator's credentials.
+    """
+    source = os.environ if environ is None else environ
     env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PATH": source.get("PATH", "/usr/bin:/bin"),
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_CONFIG_NOSYSTEM": "1",
         "HOME": str(Path.home()),
     }
+    if windows is None:
+        windows = os.name == "nt"
+    if windows:
+        for key in _GIT_WINDOWS_ENV:
+            value = source.get(key)
+            if value:
+                env[key] = value
+    return env
+
+
+def default_git(args: list[str], cwd: Path | None, *, timeout: float = 300.0) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=str(cwd) if cwd else None, capture_output=True,
-                          text=True, timeout=timeout, env=env)
+                          text=True, timeout=timeout, env=_git_env())
 
 
 _SECRETISH = re.compile(r"(x-access-token|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})[^\s]*")
