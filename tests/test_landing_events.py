@@ -290,7 +290,14 @@ class LandingEvents(unittest.TestCase):
             while time.time() < deadline and la.attempts[aid]["state"] not in L.TERMINAL:
                 time.sleep(0.01)
             self.assertEqual(la.attempts[aid]["state"], "succeeded", la.attempts[aid].get("detail"))
+            # The landing event is written after the attempt reaches its terminal state, so reaching
+            # "succeeded" does not imply the event is readable yet: on slower CI runners (observed on
+            # ubuntu-24.04-arm) the event was still missing here. Poll for it instead of asserting
+            # immediately; the assertion still requires it within the same deadline.
             evs = events(la)
+            while len(evs) != 1 and time.time() < deadline:
+                time.sleep(0.02)
+                evs = events(la)
             self.assertEqual(len(evs), 1)
             self.assertEqual(evs[0]["data"]["state"], "succeeded")
             self.assertTrue(evs[0]["data"]["result"]["available"])
