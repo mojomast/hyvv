@@ -168,14 +168,17 @@ class RoutePreview(unittest.TestCase):
         finally:
             srv.shutdown()
 
-    def test_high_priority_beats_an_explicit_zoo_model(self):
+    def test_an_explicit_model_beats_priority_high(self):
+        # Owner decision (2026-11-15): "whatever I say goes" - an explicitly named model is
+        # authoritative, so priority: high routes only unnamed briefs to DeepSeek.
         la, srv = serve(self.tmp)
         try:
             self._add_zoo()
             st, body = post(srv, "/v1/route", {"model": ZOO, "brief": {"objective": "x", "priority": "high"}})
             self.assertEqual(st, 200)
             self.assertEqual(body["requested"], ZOO)
-            self.assertEqual(body["effective"]["name"], DS_FLASH)
+            self.assertEqual(body["effective"]["name"], ZOO)
+            self.assertEqual(body["effective"]["key"], "zoo")
         finally:
             srv.shutdown()
 

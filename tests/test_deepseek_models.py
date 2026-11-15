@@ -220,7 +220,9 @@ class DeepSeekDispatch(unittest.TestCase):
         finally:
             srv.shutdown()
 
-    def test_priority_high_routes_to_deepseek(self):
+    def test_a_named_request_model_beats_brief_priority_high(self):
+        # Owner decision (2026-11-15): the request's named model is authoritative; priority: high
+        # only reroutes UNNAMED briefs. An unnamed + high dispatch still goes to DeepSeek official.
         la, srv = self._serve()
         try:
             st, body = self._post(srv, "/v1/attempts", {
@@ -233,9 +235,21 @@ class DeepSeekDispatch(unittest.TestCase):
                 time.sleep(0.05)
             a = la.attempts["att_ds00000005"]
             self.assertEqual(a["state"], "succeeded")
+            self.assertEqual(a["model"], "deepseek-v4.1-flash")  # the name the request made, not a rewrite
             spec = L.model_spec(la.cfg, a["model"], a["brief"])
-            self.assertEqual(spec["key"], "deepseek")
-            self.assertEqual(spec["base_url"], L.DEEPSEEK_BASE_URL)
+            self.assertEqual(spec["key"], "go")
+
+            st, body = self._post(srv, "/v1/attempts", {
+                "attempt_id": "att_ds00000007",
+                "brief": {"objective": "x", "deliverables": ["a"], "acceptance": ["b"], "priority": "high"},
+            })
+            self.assertIn(st, (200, 201), body)
+            t0 = time.time()
+            while time.time() - t0 < 8 and la.attempts["att_ds00000007"]["state"] not in L.TERMINAL:
+                time.sleep(0.05)
+            a = la.attempts["att_ds00000007"]
+            self.assertEqual(a["state"], "succeeded")
+            self.assertEqual(a["model"], "deepseek:deepseek-flash")  # unnamed + high -> official
         finally:
             srv.shutdown()
 
@@ -299,11 +313,14 @@ class RoutingUnit(unittest.TestCase):
         self.assertEqual(spec["model"], "deepseek-flash")
         self.assertEqual(spec["base_url"], L.DEEPSEEK_BASE_URL)
 
-    def test_priority_high_overrides_bare_and_go_prefix(self):
-        for name in ("deepseek-v4.1-flash", "go:deepseek-v4.1-flash", "deepseek-flash"):
+    def test_a_named_model_beats_priority_high(self):
+        # Owner decision (2026-11-15): "whatever I say goes" - an explicitly named model is
+        # authoritative, so priority: high no longer rewrites a bare or go: name to official.
+        # The names still resolve to their own specs; unnamed + high keeps the official route.
+        for name, key in (("deepseek-v4.1-flash", "go"), ("go:deepseek-v4.1-flash", "go"),
+                          ("deepseek:deepseek-flash", "deepseek")):
             spec = L.model_spec(self._cfg(), name, {"priority": "high"})
-            self.assertEqual(spec["key"], "deepseek", name)
-            self.assertEqual(spec["base_url"], L.DEEPSEEK_BASE_URL, name)
+            self.assertEqual(spec["key"], key, name)
 
     def test_is_monthly_limit(self):
         self.assertTrue(L.is_monthly_limit("HTTP 429 GoUsageLimitError: usage limit reached monthly limitName=monthly"))

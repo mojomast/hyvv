@@ -105,10 +105,12 @@ class ZooRouting(unittest.TestCase):
         self.assertEqual(L.TIERS["standard"], ZOO)
         self.assertEqual(L.model_spec(self._cfg(), "standard")["key"], "zoo")
 
-    def test_high_priority_stays_deepseek_direct(self):
+    def test_an_explicit_zoo_name_beats_priority_high(self):
+        # Owner decision (2026-11-15): an explicitly named model is authoritative; priority: high
+        # routes only unnamed briefs to DeepSeek official.
         spec = L.model_spec(self._cfg(), ZOO, {"priority": "high"})
-        self.assertEqual(spec["key"], "deepseek")
-        self.assertEqual(spec["base_url"], L.DEEPSEEK_BASE_URL)
+        self.assertEqual(spec["key"], "zoo")
+        self.assertEqual(spec["name"], ZOO)
 
     def test_zoo_is_not_in_the_free_pool(self):
         self.assertNotIn(ZOO, L.FREE_POOL)

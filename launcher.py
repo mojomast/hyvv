@@ -2049,14 +2049,20 @@ def default_model(cfg):
 def model_spec(cfg, name, brief=None):
     """Resolve an allow-listed model name (or tier) to its run spec.
 
-    0.1.17 routing: a brief that names no model gets `default_model(cfg)` - Zoo's free GLM 5.3 Flash
-    pass while this host can authenticate to it, else the host default. 0.1.15 routing still holds
-    for named models: no prefix or `go:` -> OpenCode Go (including bare deepseek-v4.1-flash);
-    `deepseek:<model>` or brief priority: high -> DeepSeek official. Free-pool ids are unchanged.
+    0.1.17 routing, owner precedence (2026-11-15): an explicitly named model or tier is
+    authoritative - priority: high routes only UNNAMED briefs to DeepSeek official. A brief that
+    names no model gets `default_model(cfg)`: Zoo's free GLM 5.3 Flash pass while this host can
+    authenticate to it, else the host default. Named models: no prefix or `go:` -> OpenCode Go
+    (including bare deepseek-v4.1-flash); `deepseek:<model>` -> DeepSeek official. Free-pool ids
+    are unchanged.
     """
+    # Owner precedence (2026-11-15): an explicitly named model or tier is authoritative -
+    # priority: high routes only UNNAMED briefs to DeepSeek official. Whatever the brief names
+    # is what runs; high is a default-level signal, not an override of an explicit choice.
+    named = bool(name)
     name = TIERS.get(name, name) if name else default_model(cfg)
     if name == "pool:free": return {"name": "pool:free", "pool": "free"}
-    high = is_high_priority(brief)
+    high = is_high_priority(brief) and not named
     prefix, _, rest = name.partition(":")
     if prefix in ("deepseek", "go") and rest:
         inner = rest
@@ -2123,12 +2129,12 @@ def route_preview(cfg, model=None, brief=None, kind=None):
         except KeyError: creds[source] = False  # a partial cfg (unit tests) has no data_dir to read from
     if spec.get("pool"):
         why = "the free pool is used, so the launcher picks one free model per attempt"
-    elif is_high_priority(brief):
-        why = "brief priority is high, so DeepSeek official flash is used"
     elif requested and requested in TIERS:
         why = "tier " + requested + " maps to " + TIERS[requested]
     elif requested:
         why = "a model was named, so its allow-listed spec is used"
+    elif is_high_priority(brief):
+        why = "no model was named and brief priority is high, so DeepSeek official flash is used"
     elif creds["zoo"] and cfg.get("prefer_zoo", True):
         why = "no model was named and this host can authenticate to Zoo, so the preferred free pass is used"
     elif not cfg.get("prefer_zoo", True):
