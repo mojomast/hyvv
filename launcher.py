@@ -40,6 +40,7 @@ MAX_WORKERS = 10  # hard ceiling for max_concurrent
 TERMINAL = {"succeeded", "failed", "cancelled"}
 GO_BASE_URL = "https://opencode.ai/inference/go/openai/v1"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"  # official OpenAI-compatible endpoint
+ZOO_BASE_URL = "https://www.zoocode.dev/api/gateway/v1"  # Zoo gateway, OpenAI-compatible
 # Workers must not fan out: deny the OpenCode `task` (subagent) tool.
 WORKER_OPENCODE_CONFIG = {"$schema": "https://opencode.ai/config.json", "permission": {"task": "deny"}}
 # Allow-listed per-run models.
@@ -68,10 +69,20 @@ def _go_free(model_id, ctx_tokens):
 # Context sizes from models.dev (input limit where it is lower).
 _DEEPSEEK_FLASH = {"model": "deepseek-flash", "base_url": DEEPSEEK_BASE_URL, "wire": "openai-chat", "key": "deepseek"}
 _GO_FLASH = {"model": "deepseek-v4.1-flash", "base_url": GO_BASE_URL, "wire": "openai-chat", "key": "go"}
+# Zoo gateway, free GLM 5.3 Flash pass. `zoo/glm-5.3-flash` is the free model; `zai/glm-5.3-flash`
+# is the paid one, so the id matters. 16 concurrent runs are clean and 20 is the edge, which the
+# launcher's own MAX_WORKERS=10 ceiling sits well under. Thinking is always on and spends the
+# output budget FIRST, so callers must allow at least 4096 output tokens (8192 for coding); any
+# max_tokens below 1024 is silently raised to 1024 by the gateway. Streaming usage is always
+# zeros, so metrics must come from non-stream usage or an estimate. Go is the fallback once Zoo
+# rate limits persist (or after the free pass ends).
+_ZOO_GLM = {"model": "zoo/glm-5.3-flash", "base_url": ZOO_BASE_URL, "wire": "openai-chat", "key": "zoo",
+            "fallback": "go:deepseek-v4.1-flash", "backoff_s": [15, 30, 60]}
 MODELS = {
     "deepseek-flash": dict(_GO_FLASH),  # unprefixed -> Go (0.1.15)
     "deepseek-v4.1-flash": dict(_GO_FLASH),  # unprefixed / default briefs -> Go
     "go:deepseek-v4.1-flash": dict(_GO_FLASH),
+    "zoo:glm-5.3-flash": dict(_ZOO_GLM),  # free Zoo pass; Go fallback when the pass ends
     "deepseek:deepseek-flash": dict(_DEEPSEEK_FLASH),
     "deepseek:deepseek-v4.1-flash": dict(_DEEPSEEK_FLASH),
     "deepseek-v4.1-flash-free": _free("deepseek-v4.1-flash-free", 128_000),
@@ -85,9 +96,15 @@ MODELS = {
     "longcat-2.5-preview-free": _free("longcat-2.5-preview-free", 1_000_000),
 }
 FREE_POOL = [m for m, v in MODELS.items() if v.get("free")]  # deepseek first: preferred when all are equally fresh
-TIERS = {"simple": "pool:free", "standard": "deepseek-v4.1-flash"}
+TIERS = {"simple": "pool:free", "standard": "zoo:glm-5.3-flash"}
 FREE_TIER_DENIED = re.compile(r"FreeTierError|free tier can only be used", re.I)
 RATE_LIMIT = re.compile(r"\b429\b|rate.?limit|too many requests|quota", re.I)
+# Zoo answers 429 "Too many concurrent requests" with a Retry-After of 5-7s, and a 402
+# "Insufficient credits" that is really an admission/concurrency error rather than a permanent
+# failure. Both are retried; the 402 is matched only for a zoo-keyed model.
+RETRY_AFTER = re.compile(r"retry[\s_-]*after\W{0,3}(\d{1,4})", re.I)
+ZOO_ADMISSION = re.compile(r"\b402\b|insufficient credits", re.I)
+ZOO_RETRY_AFTER_MAX = 300
 MONTHLY_LIMIT = re.compile(r"GoUsageLimitError|usage limit reached|UsageLimit", re.I)
 MONTHLY_LIMIT_HINT = re.compile(r"monthly|limitName", re.I)
 # ---- task kinds. "opencode" (default) = Cua agents harness in a sandbox; "agy-cua" = Antigravity CLI
@@ -114,6 +131,7 @@ AGY_CODE_PERMS = "computer:shell,computer:file,computer:screenshot,computer:clic
 MODEL_ABBR = {
     "deepseek-flash": "dsflash", "deepseek-v4.1-flash": "ds41", "go:deepseek-v4.1-flash": "ds41go",
     "deepseek:deepseek-flash": "dsflash", "deepseek:deepseek-v4.1-flash": "dsflash",
+    "zoo:glm-5.3-flash": "zoo53",
     "deepseek-v4.1-flash-free": "ds41fr", "beam-free": "beamfr", "big-pickle": "bpkl",
     "minimax-m3.1-flash-free": "mm31fr", "nemotron-3.5-super-vl-free": "nm35svfr", "nemotron-3.5-lightning-free": "nm35lfr",
     "glm-5.3-flash-free": "glm53fr", "mimo-v2.6-flash-free": "mimo26fr", "longcat-2.5-preview-free": "lc25fr",
@@ -736,12 +754,12 @@ def check_bind(host):
     if not (ip.is_loopback or ip in ipaddress.ip_network("100.64.0.0/10") or ip in ipaddress.ip_network("fd7a:115c:a1e0::/48")):
         raise SystemExit(f"refusing to bind {host}: only loopback or a Tailscale address is allowed")
 
-_KEY_ENV = {"go": "ORBIT_WORKER_GO_KEY", "deepseek": "DEEPSEEK_API_KEY"}
-_KEY_FILE_CFG = {"go": "go_key_file", "deepseek": "deepseek_key_file"}
-_KEY_FILE_NAME = {"go": "go.key", "deepseek": "deepseek.key"}
+_KEY_ENV = {"go": "ORBIT_WORKER_GO_KEY", "deepseek": "DEEPSEEK_API_KEY", "zoo": "ORBIT_WORKER_ZOO_KEY"}
+_KEY_FILE_CFG = {"go": "go_key_file", "deepseek": "deepseek_key_file", "zoo": "zoo_key_file"}
+_KEY_FILE_NAME = {"go": "go.key", "deepseek": "deepseek.key", "zoo": "zoo.key"}
 
 def provider_key(cfg, source):
-    """Provider key for a named source (`go` or `deepseek`): env first, else a user-only file. Never logged."""
+    """Provider key for a named source (`go`, `deepseek` or `zoo`): env first, else a user-only file. Never logged."""
     env_name = _KEY_ENV.get(source)
     if env_name:
         v = os.environ.get(env_name)
@@ -1003,7 +1021,7 @@ class CuaBackend:
             attempt.update(workdir=wd, local_base_rev=base, seed_commit=seed)
         spec = model_spec(cfg, attempt.get("model"), attempt.get("brief"))
         env = {"OPENCODE_CONFIG_CONTENT": json.dumps(dict(WORKER_OPENCODE_CONFIG, **({"model": spec["model"]} if spec["key"] == "none" else {})))}
-        if spec["key"] in ("go", "deepseek"): env["OPENAI_API_KEY"] = key  # OpenAI-compatible: DeepSeek official or OpenCode Go
+        if spec["key"] in ("go", "deepseek", "zoo"): env["OPENAI_API_KEY"] = key  # OpenAI-compatible: DeepSeek official, OpenCode Go or the Zoo gateway
         if b.get("verify_of") and wd:  # verify bee: hand it the finished work bee's patch (never a credential)
             vp = Path(cfg["data_dir"]) / "attempts" / f"{b['verify_of']}.result.json"
             diff = ((json.loads(vp.read_text("utf-8")).get("patch") or {}).get("diff") or "") if vp.exists() else ""
@@ -1297,8 +1315,10 @@ class FakeBackend:
         evs = list(f.get("events") or [{"kind": "turn_started"}, {"kind": "message", "text": "done"}, {"kind": "turn_ended", "stop_reason": "end_turn"}])
         if f.get("monthly_limit_first", 0) > a.get("rate_limited", 0) or (not a.get("fallback") and f.get("monthly_limit") and a.get("model") in f.get("monthly_limit_models", [a.get("model")])):
             evs = [{"kind": "error", "text": f.get("monthly_limit_text") or "HTTP 429 GoUsageLimitError: usage limit reached monthly limitName=monthly"}]
+        elif f.get("error_first", 0) > a.get("rate_limited", 0) and f.get("error_text"):
+            evs = [{"kind": "error", "text": f["error_text"]}]
         elif f.get("rate_limit_first", 0) > a.get("rate_limited", 0) or a.get("model") in f.get("rate_limit_models", []):
-            evs = [{"kind": "error", "text": "HTTP 429 Too Many Requests"}]
+            evs = [{"kind": "error", "text": f.get("rate_limit_text") or "HTTP 429 Too Many Requests"}]
         if a.get("model") in f.get("deny_models", []):
             evs = [{"kind": "error", "text": "FreeTierError: OpenCode's free tier can only be used from within OpenCode."}]
         self.models = getattr(self, "models", []) + [a.get("model")]
@@ -1636,10 +1656,14 @@ class Launcher:
                     if e["kind"] == "error" and a.get("kind") == "agy-cua": continue  # agy has no backoff/fallback path
                     if e["kind"] == "error" and FREE_TIER_DENIED.search(txt):
                         return await self._backoff(a, exhausted=True, reason="free tier refused")
+                    if e["kind"] == "error" and ZOO_ADMISSION.search(txt) and is_zoo_model(self.cfg, a.get("model"), a.get("brief")):
+                        # Zoo: 402 "Insufficient credits" is an admission/concurrency refusal, not a
+                        # permanent failure -- retry it on the same model, honouring Retry-After if sent.
+                        return await self._backoff(a, reason="zoo admission 402", retry_after=retry_after_s(txt))
                     if e["kind"] == "error" and RATE_LIMIT.search(txt):
                         if is_monthly_limit(txt) and is_go_model(self.cfg, a.get("model"), a.get("brief")) and not a.get("fallback"):
                             return await self._fallback_to_deepseek(a, reason="go monthly-limit 429")
-                        return await self._backoff(a)
+                        return await self._backoff(a, retry_after=retry_after_s(txt))
                     if e["kind"] in ("turn_ended", "exited"):
                         return await self._finish(a, e)
                 await asyncio.sleep(1.0)
@@ -1703,7 +1727,7 @@ class Launcher:
         for k in ("run_id", "sandbox"): a.pop(k, None)
         self._set(a, "queued", f"{reason}; fallback=deepseek")
 
-    async def _backoff(self, a, exhausted=False, reason="provider rate limit"):
+    async def _backoff(self, a, exhausted=False, reason="provider rate limit", retry_after=None):
         if a.get("pool") and a.get("model") in FREE_POOL:
             await self.backend.cleanup(a)
             bad = a["model"]; self.model_health[bad]["last_limited"] = time.time(); a["tried"].append(bad)
@@ -1726,11 +1750,19 @@ class Launcher:
                 for k in ("run_id", "sandbox"): a.pop(k, None)
                 self._set(a, "queued", f"{reason} on {spec['name']}; falling back to {fb}"); return
             self._set(a, "failed", f"{reason} persisted after retries"); return
-        a["rate_limited"] = n + 1; a["retry_at"] = time.time() + delays[n]
+        a["rate_limited"] = n + 1
+        delay = delays[n]
+        if retry_after is not None:
+            # The provider told us when to come back; waiting the fixed schedule instead either
+            # retries too early (another 429) or wastes the pass. Record what was honoured.
+            delay = retry_after
+        a["retry_at"] = time.time() + delay
+        a["retry_after_s"] = retry_after
         for k in ("run_id", "sandbox"): a.pop(k, None)
         a["cursor"] = 0
-        self._set(a, "backoff", f"provider returned 429; retry {n + 1}/{len(delays)} in {delays[n]}s (queued)")
-        self.loop.call_later(delays[n] + 0.05, self.kick)
+        hint = " (provider Retry-After)" if retry_after is not None else " (queued)"
+        self._set(a, "backoff", f"{reason}; retry {n + 1}/{len(delays)} in {delay:g}s{hint}")
+        self.loop.call_later(delay + 0.05, self.kick)
 
     async def _finish(self, a, e):
         res = await self.backend.result(a)
@@ -1958,6 +1990,28 @@ def is_go_model(cfg, name, brief=None):
     except ValueError:
         return False
 
+def is_zoo_model(cfg, name, brief=None):
+    """True when the attempt's model is served through the Zoo gateway key."""
+    try:
+        return model_spec(cfg, name, brief).get("key") == "zoo"
+    except ValueError:
+        return False
+
+def retry_after_s(text, cap=ZOO_RETRY_AFTER_MAX):
+    """Seconds the provider asked us to wait (`Retry-After: 6`), or None.
+
+    Only the delta-seconds form is honoured; an HTTP-date is not guessed at (it would depend on the
+    provider's clock), and an absent or non-numeric hint falls back to the configured backoff schedule.
+    """
+    m = RETRY_AFTER.search(text or "")
+    if not m:
+        return None
+    try:
+        n = int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(int(cap), n))
+
 def model_spec(cfg, name, brief=None):
     """Resolve an allow-listed model name (or tier) to its run spec.
 
@@ -2103,6 +2157,8 @@ def doctor(cfg):
     line("deepseek key present (value not shown)", bool(provider_key(cfg, "deepseek")))
     go = bool(provider_key(cfg, "go"))
     line("go key present (value not shown)", True, "yes" if go else "optional, not set")
+    zoo = bool(provider_key(cfg, "zoo"))
+    line("zoo key present (value not shown)", True, "yes" if zoo else "optional, not set")
     tf = Path(cfg.get("api_token_file") or Path(cfg["data_dir"]) / "orbit-api.token"); line("orbit api token file", tf.exists(), str(tf))
     try:
         import cua; line("cua sdk", True, cua.cua_sdk_version())
