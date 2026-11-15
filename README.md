@@ -17,12 +17,12 @@ This repository is the fourth layer: the runtime on each machine where work happ
 
 ## Status
 
-The imported runtime is **v0.1.15**. This branch bumps the package to **v0.1.16** so a deployed build can be told apart; the release is still 0.1.15. It already routes unprefixed and `go:` models to OpenCode Go, and `deepseek:` or `priority: high` to the official DeepSeek API, with automatic DeepSeek fallback. It also carries a `zoo` key source and `zoo:glm-5.3-flash` (the `standard` tier), with Retry-After-aware 429 backoff, a retried 402 admission error, and Go as the fallback.
+The imported runtime is **v0.1.15**. This branch bumps the package to **v0.1.17** so a deployed build can be told apart; the release is still 0.1.15. A brief that names no model now defaults to `zoo:glm-5.3-flash` whenever the host has a `zoo` key (set `"prefer_zoo": false` in `config.json` to opt out), and Zoo's fallback is DeepSeek official flash. Named models keep the 0.1.15 routing: unprefixed and `go:` go to OpenCode Go, `deepseek:` or `priority: high` to the official DeepSeek API.
 
 The `/v1` contract in `contract/v1` is the source of truth going forward:
 
 - OpenAPI plus JSON Schemas for attempts, artifacts (`hyvv.worker-artifact/1`), errors, and usage records (`bee.usage/v1`)
-- `GET /v1/version` returns `api_version` (`v1`, the contract version) and `version` (the hyvv / launcher release, `0.1.16` on this branch, `0.1.15` released), plus the capabilities this host supports (`priority_routing`, `go_fallback`). `artifact_fetch` and `leases` are advertised only once those routes ship
+- `GET /v1/version` returns `api_version` (`v1`, the contract version) and `version` (the hyvv / launcher release, `0.1.17` on this branch, `0.1.15` released), plus the capabilities this host supports (`priority_routing`, `go_fallback`). `artifact_fetch` and `leases` are advertised only once those routes ship
 - Semver: `/v1` only ever gets additive changes. A breaking change is `/v2`, served alongside `/v1` for one release
 - Conformance tests, including artifact acceptance criteria `AC-001`–`AC-010`
 
@@ -133,9 +133,12 @@ The API token is created by `scripts/new-token.ps1` and is not printed.
 
 `zoo:glm-5.3-flash` sends `zoo/glm-5.3-flash` to `https://www.zoocode.dev/api/gateway/v1` over the
 OpenAI-compatible wire, authenticated with the `zoo` key. The id matters: `zai/glm-5.3-flash` is the
-paid model. The `standard` tier resolves to this model, `priority: high` briefs still go to DeepSeek
-direct, and the spec's fallback is `go:deepseek-v4.1-flash` once rate limits persist or the free pass
-ends. A `models` entry in `config.json` overrides or extends the built-in spec (for example a shorter
+paid model. This is the default for a bee brief that names no model, so the free pass carries normal
+work while it lasts; the `simple` tier (`pool:free`), `priority: high` briefs and any explicitly named
+model are untouched. When rate limits persist or the pass ends, the spec falls back to
+`deepseek:deepseek-flash` (DeepSeek official, not Go's metered quota). A host without a readable `zoo`
+key keeps its configured default model, and `"prefer_zoo": false` in `config.json` opts out explicitly.
+A `models` entry in `config.json` overrides or extends the built-in spec (for example a shorter
 `backoff_s`).
 
 Free-pass facts baked into the spec and worth knowing when tuning:
