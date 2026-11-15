@@ -131,6 +131,8 @@ The API token is created by `scripts/new-token.ps1` and is not printed.
 
 ## Zoo routing (free GLM 5.3 Flash)
 
+**Setting the zoo key on a host:** put `zoo.key` beside `config.json` in the launcher data directory with the same user-only ACL as `go.key` and `deepseek.key` (`scripts/set-go-key.ps1` shows the pattern), or point `zoo_key_file` in `config.json` at an existing file, then restart the launcher so it reloads its keys. A host with no zoo key fails a `zoo` brief closed with `provider key not configured on this PC` instead of silently routing it elsewhere.
+
 `zoo:glm-5.3-flash` sends `zoo/glm-5.3-flash` to `https://www.zoocode.dev/api/gateway/v1` over the
 OpenAI-compatible wire, authenticated with the `zoo` key. The id matters: `zai/glm-5.3-flash` is the
 paid model. The `standard` tier resolves to this model, `priority: high` briefs still go to DeepSeek
