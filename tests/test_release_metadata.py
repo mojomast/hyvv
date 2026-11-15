@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib.util
 import io
 import re
+import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -53,7 +55,11 @@ class MetadataAgrees(unittest.TestCase):
 
     def test_install_sh_defaults_and_flags(self):
         sh = _read("scripts/install.sh")
-        self.assertRegex(sh, rf'(?m)^version="{re.escape(VERSION)}"$')
+        # pyproject.toml is the single version source: the installer derives
+        # its default from it and hard-codes no release version.
+        self.assertNotRegex(sh, r'(?m)^version="[0-9][0-9.]*"$')
+        self.assertIn("pyproject.toml", sh)
+        self.assertIn('version="${HYVV_VERSION:-$default_version}"', sh)
         self.assertIn(f'"{NAME}==$version"', sh)
         self.assertIn("/.venv/bin/hyvv", sh)  # the entry-point name
         # Fallback config path matches the wheel's force-include target.
@@ -84,6 +90,64 @@ class MetadataAgrees(unittest.TestCase):
         self.assertIn(f"uv tool install {NAME}", readme)
         self.assertIn("uv run hyvv version", readme)
         self.assertNotIn("exits 2 until that installer ships", readme)
+
+
+class InstallerDerivesItsDefault(unittest.TestCase):
+    """install.sh must read its default version from pyproject.toml the way the
+    runtime does, so one version edit propagates without touching the installer.
+    A standalone installer (a release asset ships without the checkout) must be
+    told the version explicitly, as docs/DEPLOYMENT.md already documents."""
+
+    @staticmethod
+    def _sh() -> bool:
+        return bool(shutil.which("sh"))
+
+    def test_dry_run_derives_the_pyproject_version(self):
+        if not self._sh():
+            self.skipTest("sh is required")
+        result = subprocess.run(
+            ["sh", str(ROOT / "scripts/install.sh"), "--dry-run"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"hyvv install version={VERSION} ", result.stdout)
+        self.assertIn("dry-run:", result.stdout)
+
+    def test_version_flag_overrides_the_derived_default(self):
+        if not self._sh():
+            self.skipTest("sh is required")
+        result = subprocess.run(
+            ["sh", str(ROOT / "scripts/install.sh"), "--dry-run", "--version", "9.9.9"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("hyvv install version=9.9.9 ", result.stdout)
+
+    def test_standalone_installer_requires_an_explicit_version(self):
+        if not self._sh():
+            self.skipTest("sh is required")
+        with tempfile.TemporaryDirectory() as t:
+            download = Path(t, "download")
+            download.mkdir()
+            standalone = download / "install.sh"
+            shutil.copyfile(ROOT / "scripts/install.sh", standalone)
+            without = subprocess.run(
+                ["sh", str(standalone), "--dry-run"], cwd=t, capture_output=True, text=True
+            )
+            self.assertEqual(without.returncode, 2, without.stdout + without.stderr)
+            self.assertIn("--version", without.stderr)
+            with_version = subprocess.run(
+                ["sh", str(standalone), "--dry-run", "--version", VERSION],
+                cwd=t,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(with_version.returncode, 0, with_version.stdout + with_version.stderr)
+            self.assertIn(f"hyvv install version={VERSION} ", with_version.stdout)
 
 
 class ReleaseAssets(unittest.TestCase):

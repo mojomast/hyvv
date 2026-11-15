@@ -1,6 +1,6 @@
 """0.1.14: export_project must not fetch when source_rev is already local, or when origin is missing,
 and must not fail if the brief's work branch is not on the remote yet."""
-import importlib.util, subprocess, sys, tempfile, unittest
+import importlib.util, subprocess, sys, tempfile, tomllib, unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
@@ -8,6 +8,9 @@ spec = importlib.util.spec_from_file_location("launcher", HERE / "launcher.py")
 L = importlib.util.module_from_spec(spec)
 sys.modules["launcher"] = L
 spec.loader.exec_module(L)
+# pyproject.toml is the single version source; a stale launcher.VERSION copy
+# must fail here instead of matching a hard-coded value.
+PYPROJECT_VERSION = tomllib.loads((HERE / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 
 
 def _run(args, cwd=None, check=True):
@@ -29,7 +32,7 @@ def _init_repo(path, text="v1\n"):
 
 class ExportProjectSourceRev(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(L.VERSION, "0.1.17")
+        self.assertEqual(L.VERSION, PYPROJECT_VERSION)
 
     def test_no_origin_local_source_rev_new_work_branch_succeeds(self):
         with tempfile.TemporaryDirectory(prefix="exp14-") as d:
