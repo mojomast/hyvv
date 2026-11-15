@@ -44,6 +44,9 @@ following artifacts and SHA-256 digests.
 
 The values below are derived from `pyproject.toml`, `uv.lock` and the release
 asset builder. They are the identity CI builds and tests, not a new pin.
+`tests/test_stack_pins.py` parses this table and compares every row to those
+sources, so a copy that disagrees with `pyproject.toml` fails the suite here
+instead of drifting silently.
 
 | Field | Value |
 | --- | --- |

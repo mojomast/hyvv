@@ -11,8 +11,18 @@ set -eu
 mode=user
 dry_run=0
 prefix="${HYVV_PREFIX:-}"
-version="0.1.17"
 source_root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+
+# pyproject.toml is the single authoritative version source. The default is
+# read from the checkout beside this installer; HYVV_VERSION or --version
+# overrides it. A standalone installer (e.g. a verified release asset, which
+# ships without the checkout) must be given the version explicitly.
+if [ -f "$source_root/pyproject.toml" ]; then
+  default_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$source_root/pyproject.toml" | head -n 1)"
+else
+  default_version=""
+fi
+version="${HYVV_VERSION:-$default_version}"
 
 usage() {
   cat <<USAGE
@@ -23,6 +33,9 @@ hyvv install (Linux and macOS)
 Default mode is user (logged-in account). --mode system is opt-in for
 headless hosts and is not fully wired in 0.1.15 (the files are copied;
 the unit/plist is planned).
+
+The default version is read from pyproject.toml beside this checkout;
+standalone installers must pass --version VER.
 
 Data dir (compat): \$HYVV_DATA or ~/.orbit-launcher
 Config is never overwritten if it already exists.
@@ -46,6 +59,11 @@ case "$uname_s" in
   Linux|Darwin) ;;
   *) echo "unsupported OS: $uname_s (use scripts/install.ps1 on Windows)" >&2; exit 2 ;;
 esac
+
+if [ -z "$version" ]; then
+  echo "no pyproject.toml beside this installer; pass --version VER or set HYVV_VERSION (docs/DEPLOYMENT.md)" >&2
+  exit 2
+fi
 
 if [ -z "$prefix" ]; then
   case "$mode" in

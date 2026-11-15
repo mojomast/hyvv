@@ -1,5 +1,5 @@
 """0.1.15: unprefixed / go: -> OpenCode Go; deepseek: or priority: high -> DeepSeek official."""
-import importlib.util, json, os, sys, tempfile, threading, time, unittest
+import importlib.util, json, os, sys, tempfile, threading, time, tomllib, unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -8,6 +8,9 @@ spec = importlib.util.spec_from_file_location("launcher", HERE / "launcher.py")
 L = importlib.util.module_from_spec(spec)
 sys.modules["launcher"] = L
 spec.loader.exec_module(L)
+# pyproject.toml is the single version source; a stale launcher.VERSION copy
+# must fail here instead of matching a hard-coded value.
+PYPROJECT_VERSION = tomllib.loads((HERE / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 TOKEN = "t" * 40
 
 
@@ -34,7 +37,7 @@ class DeepSeekModels(unittest.TestCase):
         return cfg
 
     def test_version(self):
-        self.assertEqual(L.VERSION, "0.1.17")
+        self.assertEqual(L.VERSION, PYPROJECT_VERSION)
 
     def test_deepseek_flash_is_official(self):
         # Unprefixed names go to Go in 0.1.15; official requires the deepseek: prefix (or priority: high).

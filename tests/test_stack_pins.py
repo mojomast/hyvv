@@ -32,6 +32,11 @@ FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 ACTION_SPEC = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}")
 
+# The documented build identity rows (docs/STACK-PINS.md, "Current build
+# identity"). Each row is re-derived here from its configured source, so a
+# stale copy in the document fails instead of matching a hard-coded value.
+BUILD_IDENTITY_ROWS = ("Package", "Version", "sdist", "wheel", "Server header", "Editable lock entry")
+
 
 def _read(rel: str) -> str:
     return (ROOT / rel).read_text(encoding="utf-8")
@@ -49,6 +54,17 @@ def _load_builder():
 def _action_specs(text: str) -> list[str]:
     found = re.findall(r"(?m)^\s*uses:\s*([^\s#]+)", text)
     return [spec.strip().strip("'\"") for spec in found]
+
+
+def _documented_build_identity(text: str) -> dict[str, str]:
+    section = re.search(r"(?ms)^## Current build identity[^\n]*\n(.*?)(?=^## |\Z)", text)
+    if not section:
+        raise AssertionError("STACK-PINS.md lost the build identity section")
+    rows = dict(re.findall(r"(?m)^\| ([^|`]+) \| `([^`]+)` \|\s*$", section.group(1)))
+    missing = [row for row in BUILD_IDENTITY_ROWS if row not in rows]
+    if missing:
+        raise AssertionError(f"build identity table is missing rows: {missing}")
+    return rows
 
 
 def _documented_action_specs(text: str) -> set[str]:
@@ -236,11 +252,22 @@ class BuildIdentity(unittest.TestCase):
         self.assertIn("packages-dir: dist", release)
         self.assertIn("dist/*.tar.gz dist/*.whl release-assets/*", release)
 
-    def test_evidence_records_the_generated_identity_without_a_self_pin(self):
+    def test_documented_build_identity_table_matches_the_sources(self):
+        """Every row of the STACK-PINS build identity table is re-derived from
+        pyproject.toml, uv.lock and the release-asset builder."""
         sdist, wheel = _load_builder().expected_dist_names(NAME, VERSION)
-        for value in (NAME, VERSION, sdist, wheel, f"orbit-launcher/{VERSION}"):
-            self.assertIn(value, EVIDENCE)
+        packages = {pkg["name"]: pkg for pkg in LOCK["package"]}
+        rows = _documented_build_identity(EVIDENCE)
+        self.assertEqual(rows["Package"], NAME)
+        self.assertEqual(rows["Version"], VERSION)
+        self.assertEqual(rows["sdist"], sdist)
+        self.assertEqual(rows["wheel"], wheel)
+        self.assertEqual(rows["Server header"], f"orbit-launcher/{VERSION}")
+        self.assertEqual(rows["Editable lock entry"], f"{NAME} {VERSION}")
+        # the lock entry documents the uv.lock resolution reflected above
+        self.assertEqual(packages[NAME]["version"], VERSION)
 
+    def test_evidence_carries_no_self_pin(self):
         head = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             cwd=ROOT,
