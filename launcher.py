@@ -60,9 +60,10 @@ def _go_free(model_id, ctx_tokens):
     # OpenAI-compatible endpoint with the Go key, instead of Zen's built-in provider.
     return {**_free(model_id, ctx_tokens), "model": model_id, "base_url": GO_BASE_URL, "wire": "openai-chat", "key": "go", "via": "go"}
 
-# Routing (0.1.15): a model with no prefix, or a `go:` prefix (including bare
-# `deepseek-v4.1-flash`), goes to OpenCode Go. `deepseek:<model>` (e.g.
-# `deepseek:deepseek-flash`), or a brief with priority: high, goes to DeepSeek official.
+# Routing (0.1.15, precedence owner-decided 2026-11-15): a model with no prefix, or a `go:`
+# prefix (including bare `deepseek-v4.1-flash`), goes to OpenCode Go. `deepseek:<model>` (e.g.
+# `deepseek:deepseek-flash`) goes to DeepSeek official. An explicitly named model or tier is
+# authoritative; priority: high reroutes only a brief that names no model.
 # A Go monthly-limit 429 retries once on DeepSeek direct and records fallback="deepseek".
 # Free models only work from inside OpenCode, so they use OpenCode's built-in provider (opencode/<id>, no base_url).
 # Every free id below answered `opencode run -m opencode/<id>` on Oct 20, 2026 (jev-1.13-free and space-bunny-free were "Model unavailable").
@@ -1954,7 +1955,7 @@ def make_handler(L, token):
                 return self._send(201 if created else 200, L.public(a))
             if p == ["v1", "route"]:  # preview: what this request would resolve to; no run is started
                 brief = b.get("brief") if isinstance(b.get("brief"), dict) else {}
-                try: return self._send(200, route_preview(L.cfg, b.get("model") or b.get("tier"), brief))
+                try: return self._send(200, route_preview(L.cfg, b.get("model") or b.get("tier"), brief, b.get("kind")))
                 except ValueError as ex: return self._send(400, {"error": str(ex)})
             if p == ["v1", "provision", "project"]:
                 svc = getattr(L, "provisioner", None)
@@ -2049,14 +2050,20 @@ def default_model(cfg):
 def model_spec(cfg, name, brief=None):
     """Resolve an allow-listed model name (or tier) to its run spec.
 
-    0.1.17 routing: a brief that names no model gets `default_model(cfg)` - Zoo's free GLM 5.3 Flash
-    pass while this host can authenticate to it, else the host default. 0.1.15 routing still holds
-    for named models: no prefix or `go:` -> OpenCode Go (including bare deepseek-v4.1-flash);
-    `deepseek:<model>` or brief priority: high -> DeepSeek official. Free-pool ids are unchanged.
+    0.1.17 routing, owner precedence (2026-11-15): an explicitly named model or tier is
+    authoritative - priority: high routes only UNNAMED briefs to DeepSeek official. A brief that
+    names no model gets `default_model(cfg)`: Zoo's free GLM 5.3 Flash pass while this host can
+    authenticate to it, else the host default. Named models: no prefix or `go:` -> OpenCode Go
+    (including bare deepseek-v4.1-flash); `deepseek:<model>` -> DeepSeek official. Free-pool ids
+    are unchanged.
     """
+    # Owner precedence (2026-11-15): an explicitly named model or tier is authoritative -
+    # priority: high routes only UNNAMED briefs to DeepSeek official. Whatever the brief names
+    # is what runs; high is a default-level signal, not an override of an explicit choice.
+    named = bool(name)
     name = TIERS.get(name, name) if name else default_model(cfg)
     if name == "pool:free": return {"name": "pool:free", "pool": "free"}
-    high = is_high_priority(brief)
+    high = is_high_priority(brief) and not named
     prefix, _, rest = name.partition(":")
     if prefix in ("deepseek", "go") and rest:
         inner = rest
@@ -2090,15 +2097,29 @@ def model_spec(cfg, name, brief=None):
             spec.update(base_url=cfg["base_url"], wire=cfg.get("wire") or "openai-chat")
     return spec
 
-def route_preview(cfg, model=None, brief=None):
+def route_preview(cfg, model=None, brief=None, kind=None):
     """What a dispatch of this request would resolve to, without starting one.
 
     Mirrors submit(): the request model field, then the brief's own model, then its tier, then
     default_model(cfg). The reply names each provider's credential source (zoo, deepseek, go or
     none) and never carries a credential value or a provider endpoint, so the payload is safe to
     log and to hand back to a coordinator.
+
+    Only kind=opencode is previewable: submit() resolves agy-cua through AGY_TIERS/AGY_MODELS and
+    runs check briefs without a model, so any answer for those kinds would describe a route the
+    dispatch never takes (found by the independent review of the first version of this endpoint).
+    The kind is read the way dispatch reads it: the request's top-level field first, then the
+    brief's own, then the opencode default. The preview covers model resolution only - it does not
+    run the brief validation dispatch applies (security profile, check commands), so a 200 means
+    "this is the model a dispatch would pick", not "dispatch would accept this brief".
     """
     brief = brief if isinstance(brief, dict) else {}
+    kind = kind or brief.get("kind") or "opencode"
+    if kind != "opencode":
+        raise ValueError(
+            "route preview supports only kind=opencode; dispatch would resolve kind="
+            + str(kind) + " outside the model resolver"
+        )
     requested = model or brief.get("model") or brief.get("tier") or None
     spec = model_spec(cfg, requested, brief)  # ValueError -> the handler answers 400
     src = spec.get("key") or "none"
@@ -2109,12 +2130,12 @@ def route_preview(cfg, model=None, brief=None):
         except KeyError: creds[source] = False  # a partial cfg (unit tests) has no data_dir to read from
     if spec.get("pool"):
         why = "the free pool is used, so the launcher picks one free model per attempt"
-    elif is_high_priority(brief):
-        why = "brief priority is high, so DeepSeek official flash is used"
     elif requested and requested in TIERS:
         why = "tier " + requested + " maps to " + TIERS[requested]
     elif requested:
         why = "a model was named, so its allow-listed spec is used"
+    elif is_high_priority(brief):
+        why = "no model was named and brief priority is high, so DeepSeek official flash is used"
     elif creds["zoo"] and cfg.get("prefer_zoo", True):
         why = "no model was named and this host can authenticate to Zoo, so the preferred free pass is used"
     elif not cfg.get("prefer_zoo", True):
