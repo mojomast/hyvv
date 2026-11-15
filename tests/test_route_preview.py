@@ -275,6 +275,19 @@ class RoutePreview(unittest.TestCase):
         finally:
             srv.shutdown()
 
+    def test_a_non_opencode_kind_is_refused_because_dispatch_resolves_it_differently(self):
+        # Found by review: submit() only routes kind=opencode through model_spec; agy-cua resolves
+        # through AGY_TIERS/AGY_MODELS and check uses no model at all. A preview that answered 200 for
+        # those kinds would report a route the dispatch never takes.
+        la, srv = serve(self.tmp)
+        try:
+            for kind in ("agy-cua", "check", "bogus"):
+                st, body = post(srv, "/v1/route", {"brief": {"objective": "x", "kind": kind}})
+                self.assertEqual(st, 400, kind)
+                self.assertIn("kind", body["error"], kind)
+        finally:
+            srv.shutdown()
+
     def test_an_explicit_model_via_the_brief_is_honoured_too(self):
         # Mirrors submit(): the request model field first, then the brief's own model.
         la, srv = serve(self.tmp)

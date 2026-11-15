@@ -2097,8 +2097,18 @@ def route_preview(cfg, model=None, brief=None):
     default_model(cfg). The reply names each provider's credential source (zoo, deepseek, go or
     none) and never carries a credential value or a provider endpoint, so the payload is safe to
     log and to hand back to a coordinator.
+
+    Only kind=opencode is previewable: submit() resolves agy-cua through AGY_TIERS/AGY_MODELS and
+    runs check briefs without a model, so any answer for those kinds would describe a route the
+    dispatch never takes (found by the independent review of the first version of this endpoint).
     """
     brief = brief if isinstance(brief, dict) else {}
+    kind = brief.get("kind") or "opencode"
+    if kind != "opencode":
+        raise ValueError(
+            "route preview supports only kind=opencode; dispatch would resolve kind="
+            + str(kind) + " outside the model resolver"
+        )
     requested = model or brief.get("model") or brief.get("tier") or None
     spec = model_spec(cfg, requested, brief)  # ValueError -> the handler answers 400
     src = spec.get("key") or "none"
