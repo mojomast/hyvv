@@ -33,7 +33,7 @@ Nothing below the first row ships in the launcher yet. `GET /v1/attempts/{attemp
 <!-- status:begin (generated from contract/v1/STATUS.json; python -m contract.v1.status --write) -->
 | Status | Endpoints | Features |
 | --- | --- | --- |
-| **Implemented in launcher 0.1.15** (`launcher-0.1.15`) | `GET /v1/version`, `GET /v1/health`, `GET /v1/attempts`, `POST /v1/attempts`, `GET /v1/attempts/{attempt_id}`, `GET /v1/attempts/{attempt_id}/events`, `GET /v1/attempts/{attempt_id}/result`, `POST /v1/attempts/{attempt_id}/review`, `POST /v1/attempts/{attempt_id}/cancel`, `GET /v1/projects`, `GET /v1/containers`, `POST /v1/config` | host bearer token on every route; priority_routing (deepseek: or priority high to DeepSeek official); go_fallback (automatic DeepSeek fallback on Go limits); GET /v1/version capabilities list |
+| **Implemented in launcher 0.1.15, precedence owner-decided 2026-11-15** (`launcher-0.1.15`) | `GET /v1/version`, `GET /v1/health`, `GET /v1/attempts`, `POST /v1/attempts`, `GET /v1/attempts/{attempt_id}`, `GET /v1/attempts/{attempt_id}/events`, `GET /v1/attempts/{attempt_id}/result`, `POST /v1/attempts/{attempt_id}/review`, `POST /v1/attempts/{attempt_id}/cancel`, `GET /v1/projects`, `GET /v1/containers`, `POST /v1/config` | host bearer token on every route; priority_routing (deepseek: or priority high to DeepSeek official); go_fallback (automatic DeepSeek fallback on Go limits); GET /v1/version capabilities list |
 | **Implemented in the /v1 reference only** (`reference`) | `GET /v1/attempts/{attempt_id}/artifact` | artifact_fetch (hyvv.worker-artifact/1); per-coordinator keys plus per-attempt artifact capability; result_sha256 pinned on first read; owner-only result files (POSIX 0600, Windows owner-only ACL); bee.usage/v1 records in the artifact payload; project-state dispatch gate (409 project_parked / project_archived / project_state_changed, override plus reason, snapshot_path containment) |
 | **Specified, not implemented** (`specified`) | `GET /v1/leases`, `POST /v1/leases`, `DELETE /v1/leases/{lease_id}`, `POST /v1/leases/{lease_id}/renew` | bee-slot leases (capability leases, 429 capacity_exhausted) |
 | **Proposed** (`proposed`) | — | coordinator-signed briefs (HMAC over the canonical brief with the per-coordinator key, verified at settle) |
@@ -135,7 +135,8 @@ The API token is created by `scripts/new-token.ps1` and is not printed.
 OpenAI-compatible wire, authenticated with the `zoo` key. The id matters: `zai/glm-5.3-flash` is the
 paid model. This is the default for a bee brief that names no model, so the free pass carries normal
 work while it lasts; the `simple` tier (`pool:free`) and any explicitly named model or tier are
-untouched. A brief that names no model and is `priority: high` goes to DeepSeek official. When rate limits persist or the pass ends, the spec falls back to
+untouched. A brief that names no model and is `priority: high` goes to DeepSeek official - except
+when the host default is the free pool, which is picked before priority is considered. When rate limits persist or the pass ends, the spec falls back to
 `deepseek:deepseek-flash` (DeepSeek official, not Go's metered quota). A host without a readable `zoo`
 key keeps its configured default model, and `"prefer_zoo": false` in `config.json` opts out explicitly.
 A `models` entry in `config.json` overrides or extends the built-in spec (for example a shorter

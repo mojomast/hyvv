@@ -60,9 +60,10 @@ def _go_free(model_id, ctx_tokens):
     # OpenAI-compatible endpoint with the Go key, instead of Zen's built-in provider.
     return {**_free(model_id, ctx_tokens), "model": model_id, "base_url": GO_BASE_URL, "wire": "openai-chat", "key": "go", "via": "go"}
 
-# Routing (0.1.15): a model with no prefix, or a `go:` prefix (including bare
-# `deepseek-v4.1-flash`), goes to OpenCode Go. `deepseek:<model>` (e.g.
-# `deepseek:deepseek-flash`), or a brief with priority: high, goes to DeepSeek official.
+# Routing (0.1.15, precedence owner-decided 2026-11-15): a model with no prefix, or a `go:`
+# prefix (including bare `deepseek-v4.1-flash`), goes to OpenCode Go. `deepseek:<model>` (e.g.
+# `deepseek:deepseek-flash`) goes to DeepSeek official. An explicitly named model or tier is
+# authoritative; priority: high reroutes only a brief that names no model.
 # A Go monthly-limit 429 retries once on DeepSeek direct and records fallback="deepseek".
 # Free models only work from inside OpenCode, so they use OpenCode's built-in provider (opencode/<id>, no base_url).
 # Every free id below answered `opencode run -m opencode/<id>` on Oct 20, 2026 (jev-1.13-free and space-bunny-free were "Model unavailable").
