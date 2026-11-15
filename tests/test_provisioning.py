@@ -78,6 +78,31 @@ class Harness(unittest.TestCase):
         return body
 
 
+class GitEnvironmentTests(unittest.TestCase):
+    def test_windows_git_environment_includes_windows_runtime_vars(self):
+        env = P._git_env(
+            {
+                "PATH": "C:\\Windows\\System32",
+                "SYSTEMROOT": "C:\\Windows",
+                "WINDIR": "C:\\Windows",
+                "TEMP": "C:\\Users\\kyle\\AppData\\Local\\Temp",
+                "TMP": "C:\\Users\\kyle\\AppData\\Local\\Temp",
+                "UNRELATED_SECRET": "must-not-leak",
+            },
+            windows=True,
+        )
+
+        self.assertEqual(env["SYSTEMROOT"], "C:\\Windows")
+        self.assertEqual(env["WINDIR"], "C:\\Windows")
+        self.assertEqual(env["TEMP"], "C:\\Users\\kyle\\AppData\\Local\\Temp")
+        self.assertEqual(env["TMP"], "C:\\Users\\kyle\\AppData\\Local\\Temp")
+        self.assertNotIn("UNRELATED_SECRET", env)
+
+    def test_non_windows_git_environment_does_not_add_windows_vars(self):
+        env = P._git_env({"PATH": "/usr/bin", "SYSTEMROOT": "C:\\Windows"}, windows=False)
+        self.assertNotIn("SYSTEMROOT", env)
+
+
 class PathTests(Harness):
     def test_unsafe_names_are_refused(self):
         for bad in ["..", "../escape", "a/b", "a\\b", "", ".", "C:evil", "con", "com1"]:
