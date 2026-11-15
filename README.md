@@ -17,7 +17,7 @@ This repository is the fourth layer: the runtime on each machine where work happ
 
 ## Status
 
-The imported runtime is **v0.1.15**. This branch bumps the package to **v0.1.16** so a deployed build can be told apart; the release is still 0.1.15. It already routes unprefixed and `go:` models to OpenCode Go, and `deepseek:` or `priority: high` to the official DeepSeek API, with automatic DeepSeek fallback.
+The imported runtime is **v0.1.15**. This branch bumps the package to **v0.1.16** so a deployed build can be told apart; the release is still 0.1.15. It already routes unprefixed and `go:` models to OpenCode Go, and `deepseek:` or `priority: high` to the official DeepSeek API, with automatic DeepSeek fallback. It also carries a `zoo` key source and `zoo:glm-5.3-flash` (the `standard` tier), with Retry-After-aware 429 backoff, a retried 402 admission error, and Go as the fallback.
 
 The `/v1` contract in `contract/v1` is the source of truth going forward:
 
@@ -123,8 +123,31 @@ Provider keys belong in the environment or in a user-only file, never in the rep
 | --- | --- | --- |
 | OpenCode Go | `ORBIT_WORKER_GO_KEY` | `go.key` |
 | Official DeepSeek | `DEEPSEEK_API_KEY` | `deepseek.key` |
+| Zoo gateway (GLM 5.3 Flash) | `ORBIT_WORKER_ZOO_KEY` | `zoo.key` |
+
+A `zoo` spec is sent to the sandbox as `OPENAI_API_KEY`, exactly like `go` and `deepseek`; `zoo_key_file` overrides the default path. See [Zoo routing](#zoo-routing-free-glm-53-flash) for the model id and its limits.
 
 The API token is created by `scripts/new-token.ps1` and is not printed.
+
+## Zoo routing (free GLM 5.3 Flash)
+
+`zoo:glm-5.3-flash` sends `zoo/glm-5.3-flash` to `https://www.zoocode.dev/api/gateway/v1` over the
+OpenAI-compatible wire, authenticated with the `zoo` key. The id matters: `zai/glm-5.3-flash` is the
+paid model. The `standard` tier resolves to this model, `priority: high` briefs still go to DeepSeek
+direct, and the spec's fallback is `go:deepseek-v4.1-flash` once rate limits persist or the free pass
+ends. A `models` entry in `config.json` overrides or extends the built-in spec (for example a shorter
+`backoff_s`).
+
+Free-pass facts baked into the spec and worth knowing when tuning:
+
+- Thinking is always on and spends the output budget first, so callers must allow at least **4096**
+  output tokens (**8192** for coding); anything below 1024 is raised to 1024 by the gateway. Truncated
+  reasoning shows up as an empty answer, not as an error.
+- 16 concurrent runs are clean and 20 is the edge; the launcher's `MAX_WORKERS` ceiling of 10 keeps a
+  host under it, so no extra Zoo-specific limiter is needed.
+- A 429 carries `Retry-After` (5-7s) and the launcher waits that long instead of its fixed schedule;
+  a 402 "Insufficient credits" is really an admission error and is retried on the same model.
+- Streaming usage is always zero, so per-attempt metrics come from non-stream usage or an estimate.
 
 ## Contract
 
