@@ -1901,10 +1901,14 @@ def make_handler(L, token):
             if p == ["v1", "health"]:
                 # `models` is the dispatchable allow-list (built-ins plus this host's config entries),
                 # so a coordinator can validate a brief's model before it dispatches; `model` stays
-                # the host default and is always a member.
+                # the host default and is always a member. configured_model repeats it explicitly and
+                # effective_model is what an unnamed brief resolves to on the wire (the Zoo
+                # preference applies while that credential is readable).
                 allow = sorted({L.cfg["model"], *MODELS, *((L.cfg.get("models") or {}).keys())})
+                try: eff_model = model_spec(L.cfg, default_model(L.cfg)).get("model") or L.cfg["model"]
+                except ValueError: eff_model = L.cfg["model"]
                 return self._send(200, {"ok": True, "version": VERSION, "max_concurrent": L.cfg["max_concurrent"], "active": len(L._active()), "queued": len(L._queue()), "model": L.cfg["model"],
-                                       "models": allow, "uptime_s": round(time.time() - L.started_at), "loop_lag_ms": round(L.loop_lag_ms, 1)})
+                                       "configured_model": L.cfg["model"], "effective_model": eff_model, "models": allow, "uptime_s": round(time.time() - L.started_at), "loop_lag_ms": round(L.loop_lag_ms, 1)})
             if p == ["v1", "landing", "events"]:  # authenticated export of the durable canonical outbox
                 if _landing_export is None:
                     return self._send(501, {"error": "landing export is unavailable"})
@@ -1948,6 +1952,10 @@ def make_handler(L, token):
                 try: a, created = L.submit(aid, b["brief"], b.get("model") or b.get("tier"), b.get("kind"), b.get("mode"))
                 except ValueError as ex: return self._send(400, {"error": str(ex)})
                 return self._send(201 if created else 200, L.public(a))
+            if p == ["v1", "route"]:  # preview: what this request would resolve to; no run is started
+                brief = b.get("brief") if isinstance(b.get("brief"), dict) else {}
+                try: return self._send(200, route_preview(L.cfg, b.get("model") or b.get("tier"), brief))
+                except ValueError as ex: return self._send(400, {"error": str(ex)})
             if p == ["v1", "provision", "project"]:
                 svc = getattr(L, "provisioner", None)
                 if svc is None: return self._send(501, {"error": "provisioning is not enabled on this host"})
@@ -2081,6 +2089,47 @@ def model_spec(cfg, name, brief=None):
         if cfg.get("base_url") in (None, GO_BASE_URL) or (cfg.get("base_url") or "").startswith("https://opencode.ai/"):
             spec.update(base_url=cfg["base_url"], wire=cfg.get("wire") or "openai-chat")
     return spec
+
+def route_preview(cfg, model=None, brief=None):
+    """What a dispatch of this request would resolve to, without starting one.
+
+    Mirrors submit(): the request model field, then the brief's own model, then its tier, then
+    default_model(cfg). The reply names each provider's credential source (zoo, deepseek, go or
+    none) and never carries a credential value or a provider endpoint, so the payload is safe to
+    log and to hand back to a coordinator.
+    """
+    brief = brief if isinstance(brief, dict) else {}
+    requested = model or brief.get("model") or brief.get("tier") or None
+    spec = model_spec(cfg, requested, brief)  # ValueError -> the handler answers 400
+    src = spec.get("key") or "none"
+    eff = dict([("name", spec.get("name")), ("model", spec.get("model")), ("key", src)])
+    creds = {}
+    for source in ("zoo", "deepseek", "go"):
+        try: creds[source] = bool(provider_key(cfg, source))
+        except KeyError: creds[source] = False  # a partial cfg (unit tests) has no data_dir to read from
+    if spec.get("pool"):
+        why = "the free pool is used, so the launcher picks one free model per attempt"
+    elif is_high_priority(brief):
+        why = "brief priority is high, so DeepSeek official flash is used"
+    elif requested and requested in TIERS:
+        why = "tier " + requested + " maps to " + TIERS[requested]
+    elif requested:
+        why = "a model was named, so its allow-listed spec is used"
+    elif creds["zoo"] and cfg.get("prefer_zoo", True):
+        why = "no model was named and this host can authenticate to Zoo, so the preferred free pass is used"
+    elif not cfg.get("prefer_zoo", True):
+        why = "no model was named and the Zoo preference is off on this host, so the host default is used"
+    else:
+        why = "no model was named and there is no Zoo credential, so the host default is used"
+    out = {}
+    out["requested"] = requested
+    out["effective"] = eff
+    out["why"] = why
+    out["fallback"] = spec.get("fallback")
+    out["credentials"] = creds
+    out["configured_model"] = cfg["model"]
+    out["effective_model"] = spec.get("model")
+    return out
 
 def export_project(src, sync_branch=None, source_rev=None, branch=None):
     """Tree of an authorized repo as (rev, tar bytes), byte-exact as committed (LF).
