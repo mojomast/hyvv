@@ -48,11 +48,11 @@ asset builder. They are the identity CI builds and tests, not a new pin.
 | Field | Value |
 | --- | --- |
 | Package | `hyvv` |
-| Version | `0.1.16` |
-| sdist | `hyvv-0.1.16.tar.gz` |
-| wheel | `hyvv-0.1.16-py3-none-any.whl` |
-| Server header | `orbit-launcher/0.1.16` |
-| Editable lock entry | `hyvv 0.1.16` |
+| Version | `0.1.17` |
+| sdist | `hyvv-0.1.17.tar.gz` |
+| wheel | `hyvv-0.1.17-py3-none-any.whl` |
+| Server header | `orbit-launcher/0.1.17` |
+| Editable lock entry | `hyvv 0.1.17` |
 
 No commit hash is recorded for this build identity: doing so would pin the
 document to its own containing commit.

@@ -34,7 +34,7 @@ if _landing_export is None:  # pragma: no cover - loaded from a sibling copy
     except Exception:
         _landing_export = None
 
-VERSION = "0.1.16"
+VERSION = "0.1.17"
 HEARTBEAT_S = 60  # controller emits a heartbeat event after this many quiet seconds
 MAX_WORKERS = 10  # hard ceiling for max_concurrent
 TERMINAL = {"succeeded", "failed", "cancelled"}
@@ -74,10 +74,10 @@ _GO_FLASH = {"model": "deepseek-v4.1-flash", "base_url": GO_BASE_URL, "wire": "o
 # launcher's own MAX_WORKERS=10 ceiling sits well under. Thinking is always on and spends the
 # output budget FIRST, so callers must allow at least 4096 output tokens (8192 for coding); any
 # max_tokens below 1024 is silently raised to 1024 by the gateway. Streaming usage is always
-# zeros, so metrics must come from non-stream usage or an estimate. Go is the fallback once Zoo
-# rate limits persist (or after the free pass ends).
+# zeros, so metrics must come from non-stream usage or an estimate. DeepSeek official flash is the
+# fallback once Zoo rate limits persist (or after the free pass ends).
 _ZOO_GLM = {"model": "zoo/glm-5.3-flash", "base_url": ZOO_BASE_URL, "wire": "openai-chat", "key": "zoo",
-            "fallback": "go:deepseek-v4.1-flash", "backoff_s": [15, 30, 60]}
+            "fallback": "deepseek:deepseek-flash", "backoff_s": [15, 30, 60]}
 MODELS = {
     "deepseek-flash": dict(_GO_FLASH),  # unprefixed -> Go (0.1.15)
     "deepseek-v4.1-flash": dict(_GO_FLASH),  # unprefixed / default briefs -> Go
@@ -2016,13 +2016,37 @@ def retry_after_s(text, cap=ZOO_RETRY_AFTER_MAX):
         return None
     return max(0, min(int(cap), n))
 
+PREFERRED_MODEL = "zoo:glm-5.3-flash"  # free Zoo pass; DeepSeek official flash is its fallback
+
+
+def default_model(cfg):
+    """Model for a bee brief that names none.
+
+    Zoo's free GLM 5.3 Flash pass is preferred while this host can authenticate to it: it costs
+    nothing until ~Nov 29 and routes the same `deepseek-flash`-class work. The host's configured
+    `model` is used when no zoo key is readable, and `"prefer_zoo": false` in config.json opts a
+    host out. A named model, an explicit tier and a `priority: high` brief are never affected.
+    """
+    if cfg.get("prefer_zoo", True):
+        try:
+            if provider_key(cfg, "zoo"):
+                return PREFERRED_MODEL
+        except KeyError:
+            # A cfg without `data_dir` (partial cfgs in unit tests) cannot resolve a key file; the
+            # env var was already checked, so treat it as "no zoo key" rather than raising here.
+            pass
+    return cfg["model"]
+
+
 def model_spec(cfg, name, brief=None):
     """Resolve an allow-listed model name (or tier) to its run spec.
 
-    0.1.15 routing: no prefix or `go:` -> OpenCode Go (including bare deepseek-v4.1-flash).
+    0.1.17 routing: a brief that names no model gets `default_model(cfg)` - Zoo's free GLM 5.3 Flash
+    pass while this host can authenticate to it, else the host default. 0.1.15 routing still holds
+    for named models: no prefix or `go:` -> OpenCode Go (including bare deepseek-v4.1-flash);
     `deepseek:<model>` or brief priority: high -> DeepSeek official. Free-pool ids are unchanged.
     """
-    name = TIERS.get(name, name) if name else cfg["model"]
+    name = TIERS.get(name, name) if name else default_model(cfg)
     if name == "pool:free": return {"name": "pool:free", "pool": "free"}
     high = is_high_priority(brief)
     prefix, _, rest = name.partition(":")

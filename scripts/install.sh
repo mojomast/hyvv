@@ -11,7 +11,7 @@ set -eu
 mode=user
 dry_run=0
 prefix="${HYVV_PREFIX:-}"
-version="0.1.16"
+version="0.1.17"
 source_root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 
 usage() {
