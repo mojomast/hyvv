@@ -15,7 +15,19 @@ RunFinishedInsideBudgetWasForceFailed FAILED with the reviewer's repro shape - a
 the 2 s budget landed state='failed' with detail='budget timeout: worker outlived
 brief.budget.timeout_s=2s (launcher stopped the run after 2s)' and no result; both
 BudgetStopCrashWindow tests FAILED with the attempt wedged at state='running' forever after a
-restart (budget_stop marked, terminal write never happened, nothing ever finishes it)."""
+restart (budget_stop marked, terminal write never happened, nothing ever finishes it).
+
+RED-first record for the #20 review followups (unmodified tree at 58610f3, base of this branch):
+HangingResultCollectionAfterBudgetStop FAILED - a drain terminal event plus a backend.result()
+that never returns left the attempt state='running' with budget_stop set past the window, no
+terminal write, no cleanup, slot never freed (the exact failure class #18 fixed, reopened by the
+unbounded _finish wait); MultiPageEventDrain FAILED with the reviewer's repro shape - a finished
+run whose events span more than one SDK page (CuaBackend requests 200 per call) landed
+state='failed' with detail='budget timeout: worker outlived brief.budget.timeout_s=2s (launcher
+stopped the run after 2s)' and no result manifest; SuccessPathCleanupCount FAILED - the
+budget-stop success path tore the worker down twice; RestoreVerdictMatchesTerminalWriteRule
+FAILED - a status completed / stop_reason max_tokens manifest restored as succeeded while the
+live terminal write lands the same shape failed."""
 import asyncio, json, os, sys, tempfile, time, unittest
 from pathlib import Path
 from unittest import mock
@@ -49,8 +61,11 @@ def _agy_backend(d):
     return be, (lambda cfg, p, m, t: [sys.executable, str(fake)] + real(cfg, p, m, t)[1:])
 
 
-async def _run_control_until_terminal(L, a, window):
-    """Drive L._control(a) as a task; return (task, seconds until a terminal state or None)."""
+async def _run_control_until_terminal(L, a, window, settle=0.0):
+    """Drive L._control(a) as a task; return (task, seconds until a terminal state or None).
+
+    settle: seconds to keep the loop alive after the terminal state (or the cancel) so a shielded
+    teardown running outside the observed task can finish before the caller asserts on it."""
     task = asyncio.ensure_future(L._control(a))
     t0 = time.monotonic()
     while a["state"] not in launcher.TERMINAL and time.monotonic() - t0 < window:
@@ -60,6 +75,7 @@ async def _run_control_until_terminal(L, a, window):
         task.cancel()
         try: await task
         except asyncio.CancelledError: pass
+    if settle: await asyncio.sleep(settle)
     return task, elapsed
 
 
@@ -171,6 +187,60 @@ class _HungBackend:
     async def cleanup(self, a): self.cleaned.append(a.get("run_id"))
 
 
+class _CountingBackend(launcher.FakeBackend):
+    """FakeBackend plus a cleanup counter: teardown-once claims are measured, not trusted."""
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.cleaned = []
+
+    async def cleanup(self, a): self.cleaned.append(a.get("run_id"))
+
+
+class _PagedBackend(_CountingBackend):
+    """CuaBackend pages worker events (launcher.py: 200 per backend.events call): one poll can
+    leave a terminal event sitting in the next page."""
+
+    PAGE = 200
+
+    async def events(self, a, cursor):
+        r = self.runs[a["run_id"]]
+        if r["cancelled"]: return [], cursor
+        if time.time() - r["t0"] < r["delay"]: return [], cursor
+        out = [e for e in r["events"] if e["seq"] > cursor][:self.PAGE]
+        return out, (out[-1]["seq"] if out else cursor)
+
+
+class _CollectHangBackend(_CountingBackend):
+    """The drain finds the terminal event, then backend.result() never returns: the exact shape
+    that left budget-stop attempts running forever before the finish wait was bounded."""
+
+    async def result(self, a):
+        await asyncio.Future()  # collection never returns
+
+
+class _ConcurrentTeardownBackend(launcher.FakeBackend):
+    """A backend whose calls really suspend, so two racing teardowns interleave the way they do
+    against the real SDK (every backend call crosses the network and yields); a fully inline fake
+    would serialize the racers and never reach the guard under test. Crash-window shape: the
+    worker is gone, so events and interrupt raise."""
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.cleaned = []
+
+    async def events(self, a, cursor):
+        await asyncio.sleep(0)  # real suspension point, like the SDK's network calls
+        raise KeyError("no such run")
+
+    async def interrupt(self, a):
+        await asyncio.sleep(0)
+
+    async def cleanup(self, a):
+        await asyncio.sleep(0)
+        self.cleaned.append(a.get("run_id"))
+
+
 def _crash_window_attempt(aid, project=None):
     """The journal exactly as a crash between the budget_stop mark and the terminal write leaves it:
     the deadline had been reached (budget_stop was saved), the worker is gone with the dead process,
@@ -272,6 +342,158 @@ class BudgetStopCrashWindow(unittest.TestCase):
                 self.assertEqual(L._active(), [], "crash-window attempt still holds the worker slot")
             finally:
                 L.loop.close()
+
+    def test_restore_verdict_matches_the_terminal_write_rule(self):
+        """The restore rule must judge a manifest the way the live terminal write judges the same
+        shape: the terminal write lands stop_reason max_tokens FAILED, so restoring a status
+        completed / stop_reason max_tokens manifest as succeeded is a false success."""
+        with tempfile.TemporaryDirectory() as d:
+            a = _crash_window_attempt("att_bud00000013", project="proj")
+            result = {"schema": "orbit.local-worker.result/v1", "attempt_id": a["attempt_id"],
+                      "source": {"kind": "opencode", "harness": "opencode"},
+                      "observed": {"status": "completed", "stop_reason": "max_tokens", "error": None}}
+            L, a, elapsed = self._restart(d, a, result)
+            try:
+                self.assertEqual(a["state"], "failed",
+                                 f"a max_tokens manifest restored as succeeded: {a.get('detail')!r}")
+                self.assertIsNotNone(elapsed, "attempt never reached a terminal state inside the window")
+                self.assertIn(f"timeout_s={BUDGET}", a.get("detail") or "")
+                self.assertNotIn("outlived", (a.get("detail") or "").lower(),
+                                 "the manifest proves the run finished; the detail must not claim outliving")
+                self.assertEqual(launcher.active_attempts_for(L.attempts, "proj"), 0,
+                                 "wedged nonterminal attempt keeps apply-update blocked")
+            finally:
+                L.loop.close()
+
+
+class HangingResultCollectionAfterBudgetStop(unittest.TestCase):
+    """F3 (bounded-wait): at the budget stop the drain finds a terminal event and _finish runs -
+    but backend.result() hangs, and the old tree awaited it unbounded. The attempt stayed
+    state='running' with budget_stop set forever: no terminal write, no cleanup, slot never
+    freed - the exact failure class #18 fixed, reopened through the success branch."""
+
+    def test_hanging_result_collection_is_bounded_and_still_cleans_up_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = _cfg(d); be = _CollectHangBackend(cfg)
+            L = launcher.Launcher(cfg, be)
+            kicks = []; L.kick = lambda: kicks.append(1)
+            grace = getattr(launcher, "BUDGET_STOP_GRACE_S", 15)
+            now = time.time()
+            a = {"attempt_id": "att_bud00000020", "kind": "opencode", "state": "running",
+                 "detail": "opencode run started", "run_id": "run-hangresult01", "cursor": 0, "lseq": 0,
+                 "created_at": now, "updated_at": now, "rate_limited": 0, "model": "deepseek-flash",
+                 "brief": {"objective": "x", "budget": {"timeout_s": BUDGET}}, "budget_started_at": now - (BUDGET + 1)}
+            L.attempts[a["attempt_id"]] = a
+            L.backend.runs[a["run_id"]] = {"events": [{"kind": "turn_started", "seq": 1},
+                                                      {"kind": "message", "text": "done", "seq": 2},
+                                                      {"kind": "turn_ended", "stop_reason": "end_turn", "seq": 3}],
+                                           "delay": 0, "t0": time.time(), "cancelled": False}
+            with mock.patch.object(launcher, "BUDGET_STOP_GRACE_S", 1):  # bound the finish wait fast in-test
+                _, elapsed = asyncio.run(_run_control_until_terminal(L, a, WINDOW, settle=1.0))
+            try:
+                self.assertEqual(a["state"], "failed",
+                                 f"a hanging collection wedged the budget stop forever: {a.get('detail')!r}")
+                self.assertIsNotNone(elapsed, "attempt never reached a terminal state inside the window")
+                self.assertLessEqual(elapsed, BUDGET + 2 * grace + 5, f"budget stop unbounded: terminal after {elapsed:.1f}s")
+                self.assertIn("budget timeout", (a.get("detail") or "").lower())
+                self.assertIn("collecting its result failed", (a.get("detail") or "").lower())
+                self.assertIn(f"timeout_s={BUDGET}", a.get("detail") or "")
+                self.assertTrue(a.get("budget_stop"), "the stop was not marked budget_stop")
+                self.assertEqual(len(be.cleaned), 1, f"teardown cleaned up {len(be.cleaned)} times, not exactly once")
+                self.assertGreaterEqual(len(kicks), 1, "the slot kick never happened after the stop")
+                self.assertEqual(L._active(), [], "budget-stop attempt still holds the worker slot")
+            finally:
+                L.loop.close()
+
+
+class MultiPageEventDrain(unittest.TestCase):
+    """F4 (single-page drain): CuaBackend pages worker events (200 per call) and the budget-stop
+    drain polled exactly once - a run that finished INSIDE its budget whose terminal event sits
+    past the first page got a false 'worker outlived' verdict and its result was never collected.
+    Reviewer repro: run finished at 1.5 s against a 2 s budget, still failed with no manifest."""
+
+    def test_run_whose_events_span_two_pages_lands_succeeded_with_its_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = _cfg(d); be = _PagedBackend(cfg)
+            L = launcher.Launcher(cfg, be); L.kick = lambda: None
+            with mock.patch.dict(os.environ, {"ORBIT_WORKER_GO_KEY": "fixture-value-not-a-real-key"}):
+                # 200 non-terminal events fill page 1; the terminal event sits on page 2. The worker
+                # needs 1.5 s (inside the 2 s budget), so the deadline check fires before any poll
+                # consumed a page and the whole stream is still pending at the stop.
+                a, _ = L.submit("att_bud00000021", {"objective": "x", "budget": {"timeout_s": BUDGET},
+                                                    "fake": {"delay": 1.5,
+                                                             "events": [{"kind": "message", "text": "step"}] * _PagedBackend.PAGE
+                                                                       + [{"kind": "turn_ended", "stop_reason": "end_turn"}]}})
+                man = Path(d, "attempts", "att_bud00000021.result.json")
+                _, elapsed = asyncio.run(_run_control_until_terminal(L, a, WINDOW))
+                try:
+                    self.assertEqual(a["state"], "succeeded",
+                                     f"a finished run past the first event page was force-failed: {a.get('detail')!r}")
+                    self.assertEqual(a.get("detail"), "turn ended: end_turn")
+                    self.assertNotIn("outlived", (a.get("detail") or "").lower())
+                    self.assertNotIn("budget timeout", (a.get("detail") or "").lower())
+                    self.assertTrue(man.exists(), "the finished run's result was never collected")
+                    self.assertIsNotNone(elapsed, "attempt never reached a terminal state inside the window")
+                    self.assertLessEqual(elapsed, BUDGET + 5, f"budget not authoritative: terminal after {elapsed:.1f}s")
+                    self.assertEqual(a.get("cursor"), _PagedBackend.PAGE + 1,
+                                     "the drain stopped at the first SDK page instead of exhausting the stream")
+                    self.assertEqual(L._active(), [], "finished attempt still holds the worker slot")
+                finally:
+                    r = be.runs.get(a.get("run_id") or "")
+                    if r: r["delay"] = 0
+                    L.loop.close()
+
+
+class SuccessPathCleanupCount(unittest.TestCase):
+    """F5 (double teardown): the budget-stop success path ran _finish (which cleans up) and then
+    the teardown's own finally cleaned up again - two teardowns where the stop owns exactly one."""
+
+    def test_budget_stop_success_path_cleans_up_exactly_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = _cfg(d); be = _CountingBackend(cfg)
+            L = launcher.Launcher(cfg, be); L.kick = lambda: None
+            with mock.patch.dict(os.environ, {"ORBIT_WORKER_GO_KEY": "fixture-value-not-a-real-key"}):
+                a, _ = L.submit("att_bud00000022", {"objective": "x", "budget": {"timeout_s": BUDGET},
+                                                    "fake": {"delay": 1.5}})
+                _, elapsed = asyncio.run(_run_control_until_terminal(L, a, WINDOW))
+                try:
+                    self.assertEqual(a["state"], "succeeded", f"success path disturbed: {a.get('detail')!r}")
+                    self.assertIsNotNone(elapsed, "attempt never reached a terminal state inside the window")
+                    self.assertEqual(len(be.cleaned), 1,
+                                     f"the success path tore the worker down {len(be.cleaned)} times, not exactly once")
+                finally:
+                    r = be.runs.get(a.get("run_id") or "")
+                    if r: r["delay"] = 0
+                    L.loop.close()
+
+
+class BudgetStopSingleFlight(unittest.TestCase):
+    """Discriminator for the in-memory single-flight guard: two teardowns racing for the same
+    budget-stop attempt (two restart recoveries spawned back to back, or a watchdog racing its
+    controller) must tear down exactly once. Without the guard both run the full teardown."""
+
+    def test_concurrent_budget_finishes_tear_down_exactly_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = _cfg(d); be = _ConcurrentTeardownBackend(cfg)
+            L = launcher.Launcher(cfg, be); L.kick = lambda: None
+            now = time.time()
+            a = {"attempt_id": "att_bud00000023", "kind": "opencode", "state": "running",
+                 "detail": "opencode run started", "run_id": "run-singlefligh1", "cursor": 0, "lseq": 0,
+                 "created_at": now, "updated_at": now, "rate_limited": 0, "model": "deepseek-flash",
+                 "brief": {"objective": "x", "budget": {"timeout_s": BUDGET}},
+                 "budget_started_at": now - (BUDGET + 1), "budget_stop": True}
+            L.attempts[a["attempt_id"]] = a
+
+            async def go():
+                await asyncio.gather(L._budget_finish(a, BUDGET, a["budget_started_at"], recover=True),
+                                     L._budget_finish(a, BUDGET, a["budget_started_at"], recover=True))
+
+            asyncio.run(go())
+            self.assertEqual(a["state"], "failed", f"the attempt never landed: {a.get('detail')!r}")
+            self.assertIn(f"timeout_s={BUDGET}", a.get("detail") or "")
+            self.assertEqual(len(be.cleaned), 1,
+                             f"two racing teardowns cleaned up {len(be.cleaned)} times; the guard must keep it at one")
+            L.loop.close()
 
 
 class WatchdogStopsAControllerTheLoopCannotSave(unittest.TestCase):
