@@ -26,7 +26,7 @@
   },
   "features": {
     "host bearer token on every route": "launcher-0.1.15",
-    "priority_routing (deepseek: or priority high to DeepSeek official)": "launcher-0.1.15",
+    "priority_routing (an explicitly named model or tier is authoritative; priority high reroutes only a brief that names no model to DeepSeek official)": "launcher-0.1.15",
     "go_fallback (automatic DeepSeek fallback on Go limits)": "launcher-0.1.15",
     "artifact_fetch (hyvv.worker-artifact/1)": "reference",
     "per-coordinator keys plus per-attempt artifact capability": "reference",
