@@ -145,7 +145,10 @@ paths:
                       items: {type: string}
                     priority:
                       type: string
-                      description: "high selects the official DeepSeek route (priority_routing)."
+                      description: >
+                        An explicitly named model or tier is authoritative; priority: high
+                        reroutes only a brief that names no model to the official DeepSeek
+                        route (priority_routing).
                 model: {type: string}
                 kind: {type: string}
                 mode: {type: string}
