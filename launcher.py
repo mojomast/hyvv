@@ -131,9 +131,11 @@ AGY_TIMEOUT_S = (60, 600, 3600)  # min, default, max for brief.budget.timeout_s
 # worker (or a backend call) never returns. The grace covers stopping the worker; the terminal
 # journal write happens inside it, so the attempt slot always frees.
 BUDGET_STOP_GRACE_S = 15
-BUDGET_STOP_DRAIN_S = 2.0  # one bounded final event poll at the budget stop: the stop decision must
+BUDGET_STOP_DRAIN_S = 2.0  # bounded final event drain at the budget stop: the stop decision must
 # not preempt the event drain, or a run that finished INSIDE its budget is force-failed with a false
-# outlived detail and its result is lost; a backend that cannot answer in time just gets force-failed.
+# outlived detail and its result is lost. The SDK pages events, so the drain repeats across pages
+# until the stream is exhausted or this window elapses; a backend that cannot answer in time just
+# gets force-failed.
 CHECK_ATTEMPT_OVERHEAD_S = 300  # launcher-side slack (container create/seed/cleanup) atop a check job's per-command clocks
 AGY_MODES = ("ui", "code")  # code: repo seeded into the attempt's sandbox; agy edits/runs ONLY there via orbit-cua shell+file
 AGY_CODE_PERMS = "computer:shell,computer:file,computer:screenshot,computer:click,computer:type,computer:key,computer:scroll"
@@ -1753,26 +1755,33 @@ class Launcher:
         await asyncio.shield(self._budget_finish(a, budget, started, controller))
 
     async def _drain_terminal_event(self, a):
-        """One bounded final poll at the budget stop: persist whatever the worker already produced
-        and return its terminal event (turn_ended/exited), or None when none is pending.
+        """Bounded final drain at the budget stop: persist whatever the worker already produced and
+        return its terminal event (turn_ended/exited), or None when none is pending.
 
         The deadline decision must not preempt the event drain: a poll loop that wakes at/after the
         deadline would otherwise force-fail a run that finished INSIDE its budget with a false
-        'worker outlived' detail, and its collected result would be lost. The controller is already
-        stopped when this runs, so the cursor cannot be advanced concurrently."""
-        try:
-            evs, cur = await asyncio.wait_for(self.backend.events(a, a.get("cursor", 0)), BUDGET_STOP_DRAIN_S)
-        except Exception:  # no run, dead backend call, drain timeout: fall through to the honest stop
-            return None
-        with self.lock:
-            out = []
-            for e in evs:
-                a["lseq"] += 1; out.append(dict(e, lseq=a["lseq"], kind="worker:" + e["kind"], ts=e.get("ts") or time.time()))
-            a["cursor"] = cur
-            if out: self._append_events(a, out); a["updated_at"] = time.time(); self._save(a)
+        'worker outlived' detail, and its collected result would be lost. The backend pages events
+        (CuaBackend requests 200 per call), so the drain repeats until the stream returns an empty
+        page or BUDGET_STOP_DRAIN_S elapses - a terminal event sitting past the first page must not
+        flip the verdict. The controller is already stopped when this runs, so the cursor cannot be
+        advanced concurrently."""
         terminal = None
-        for e in evs:
-            if e.get("kind") in ("turn_ended", "exited"): terminal = e
+        end = time.monotonic() + BUDGET_STOP_DRAIN_S
+        while True:
+            try:
+                evs, cur = await asyncio.wait_for(self.backend.events(a, a.get("cursor", 0)),
+                                                  max(0.0, end - time.monotonic()))
+            except Exception:  # no run, dead backend call, drain timeout: fall through to the honest stop
+                return terminal
+            with self.lock:
+                out = []
+                for e in evs:
+                    a["lseq"] += 1; out.append(dict(e, lseq=a["lseq"], kind="worker:" + e["kind"], ts=e.get("ts") or time.time()))
+                a["cursor"] = cur
+                if out: self._append_events(a, out); a["updated_at"] = time.time(); self._save(a)
+            for e in evs:
+                if e.get("kind") in ("turn_ended", "exited"): terminal = e
+            if not evs: break  # stream exhausted: every page has been drained
         return terminal
 
     def _recovered_manifest(self, a):
@@ -1812,12 +1821,15 @@ class Launcher:
         and an admin apply-update is no longer blocked by a runaway. Shielded by callers: once
         started, the teardown survives the controller's finally cancelling the watchdog.
 
-        Before the verdict the stop drains the worker's pending events (a run that finished inside
-        its budget lands succeeded with its result, never a false outlived detail) and restores an
-        already-collected result when a crash left one behind; with recover=True it completes a
-        stop a previous process died in the middle of, with a detail that does not claim what it
-        cannot know about the worker's fate."""
+        Before the verdict the stop drains the worker's pending events across SDK pages (a run that
+        finished inside its budget lands succeeded with its result, never a false outlived detail)
+        and restores an already-collected result when a crash left one behind, with the same verdict
+        the terminal write would land for that shape; with recover=True it completes a stop a
+        previous process died in the middle of, with a detail that does not claim what it cannot
+        know about the worker's fate. Every stop step is bounded, collection included: a backend
+        that never answers lands the attempt failed honestly instead of wedging the teardown."""
         aid = a["attempt_id"]
+        cleaned = False
         with self.lock:
             if a["state"] in TERMINAL or a["state"] not in ("starting", "running", "cancel_requested"):
                 return
@@ -1834,7 +1846,10 @@ class Launcher:
             done = await self._drain_terminal_event(a)
             if done is not None:  # the run already finished: land it with its collected result
                 try:
-                    await self._finish(a, done)
+                    # bounded like every other stop step: a backend.result() that never returns
+                    # must not leave the attempt budget_stop-marked and non-terminal forever.
+                    await asyncio.wait_for(self._finish(a, done), BUDGET_STOP_GRACE_S)
+                    cleaned = True  # _finish tore the worker down itself; the finally must not repeat it
                 except Exception as ex:
                     with self.lock:
                         if a["state"] not in TERMINAL:
@@ -1842,7 +1857,9 @@ class Launcher:
                                                    f"the run finished but collecting its result failed ({type(ex).__name__})")
             elif (man := self._recovered_manifest(a)) is not None:
                 obs = man.get("observed") or {}
-                ok = obs.get("status") == "completed" and not obs.get("error")
+                # same verdict the terminal write lands for this manifest shape (status completed,
+                # no error, and a stop reason the live path accepts: end_turn or unknown)
+                ok = obs.get("status") == "completed" and not obs.get("error") and obs.get("stop_reason") in ("end_turn", None)
                 self._set(a, "succeeded" if ok else "failed",
                           f"collected result restored after the budget stop was interrupted "
                           f"(brief.budget.timeout_s={int(budget)}s)")
@@ -1860,8 +1877,9 @@ class Launcher:
                                                    f"(launcher stopped the run after {elapsed:.0f}s)")
         finally:
             with self.lock: self._budget_finishing.discard(aid)
-            try: await asyncio.wait_for(self.backend.cleanup(a), 2 * BUDGET_STOP_GRACE_S)
-            except Exception: pass
+            if not cleaned:  # the success path already cleaned up inside _finish: exactly one teardown
+                try: await asyncio.wait_for(self.backend.cleanup(a), 2 * BUDGET_STOP_GRACE_S)
+                except Exception: pass
             self.kick()
 
     async def _control_check(self, a):
