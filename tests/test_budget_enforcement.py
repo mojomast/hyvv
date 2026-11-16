@@ -8,7 +8,14 @@ RED-first record (unmodified tree at e48328fe): these tests FAILED - the agy chi
 its --print-timeout stayed alive, the attempt stayed state='running' with detail='agy run started'
 past the window, and launcher.attempt_budget_s did not exist. The budget only reached the child as
 a flag plus a distant timeout+60 poll-time kill inside AgyCuaRunner.events; no attempt wall clock.
-Run: python3 tests/test_budget_enforcement.py   (no cua, no Docker, no network, no real agy)"""
+Run: python3 tests/test_budget_enforcement.py   (no cua, no Docker, no network, no real agy)
+
+RED-first record for the #18 review followups (unmodified tree at b7c724d1, base of this branch):
+RunFinishedInsideBudgetWasForceFailed FAILED with the reviewer's repro shape - a ~1.5 s run against
+the 2 s budget landed state='failed' with detail='budget timeout: worker outlived
+brief.budget.timeout_s=2s (launcher stopped the run after 2s)' and no result; both
+BudgetStopCrashWindow tests FAILED with the attempt wedged at state='running' forever after a
+restart (budget_stop marked, terminal write never happened, nothing ever finishes it)."""
 import asyncio, json, os, sys, tempfile, time, unittest
 from pathlib import Path
 from unittest import mock
@@ -149,6 +156,149 @@ class OpencodeWorkerOutlivesBudget(unittest.TestCase):
                 self.assertEqual(a.get("detail"), "turn ended: end_turn")
                 self.assertNotIn("budget timeout", (a.get("detail") or "").lower())
                 self.assertLess(elapsed, 5)
+
+
+class _HungBackend:
+    """The watchdog's reason to exist: a backend call that never returns, so the controller's
+    polling loop - and its own fast-path deadline check with it - can never fire again."""
+
+    def __init__(self):
+        self.cleaned = []
+
+    async def start(self, a, key): return {"sandbox": "fake", "run_id": "run-hang0000001"}
+    async def events(self, a, cursor): await asyncio.Future()  # wedged backend call
+    async def interrupt(self, a): pass
+    async def cleanup(self, a): self.cleaned.append(a.get("run_id"))
+
+
+def _crash_window_attempt(aid, project=None):
+    """The journal exactly as a crash between the budget_stop mark and the terminal write leaves it:
+    the deadline had been reached (budget_stop was saved), the worker is gone with the dead process,
+    and no terminal state was ever recorded."""
+    now = time.time()
+    return {"attempt_id": aid, "kind": "opencode", "state": "running", "detail": "opencode run started",
+            "run_id": "run-crash" + aid[-8:], "cursor": 0, "lseq": 3, "created_at": now - 10, "updated_at": now - 1,
+            "rate_limited": 0, "model": "deepseek-flash",
+            "brief": {"objective": "x", "budget": {"timeout_s": BUDGET}, **({"project": project} if project else {})},
+            "budget_started_at": now - (BUDGET + 1), "budget_stop": True}
+
+
+class RunFinishedInsideBudgetWasForceFailed(unittest.TestCase):
+    """F1 (event-drain race): the deadline check precedes the event drain, so a poll loop that
+    wakes at/after the deadline force-fails a run that finished INSIDE its budget - a false
+    'worker outlived' detail, and the collected result is lost. Reviewer repro: a ~1.5 s run
+    against a 2 s budget force-failed at ~2.01 s."""
+
+    def test_run_that_finishes_inside_its_budget_lands_succeeded_with_its_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            L = launcher.Launcher(_cfg(d), launcher.FakeBackend(None)); L.kick = lambda: None
+            grace = getattr(launcher, "BUDGET_STOP_GRACE_S", 15)
+            with mock.patch.dict(os.environ, {"ORBIT_WORKER_GO_KEY": "fixture-value-not-a-real-key"}):
+                # worker needs 1.5 s (inside the 2 s budget); the poll loop's 1 s cadence puts the
+                # next drain at ~2.0 s, straddling the deadline - exactly the reviewer's repro.
+                a, _ = L.submit("att_bud00000006", {"objective": "x", "budget": {"timeout_s": BUDGET},
+                                                    "fake": {"delay": 1.5}})
+                _, elapsed = asyncio.run(_run_control_until_terminal(L, a, WINDOW))
+                man = Path(d, "attempts", "att_bud00000006.result.json")
+                try:
+                    self.assertEqual(a["state"], "succeeded",
+                                     f"a run that finished inside its budget was force-failed: {a.get('detail')!r}")
+                    self.assertEqual(a.get("detail"), "turn ended: end_turn")
+                    self.assertNotIn("budget timeout", (a.get("detail") or "").lower())
+                    self.assertNotIn("outlived", (a.get("detail") or "").lower())
+                    self.assertTrue(man.exists(), "the finished run's result was never collected")
+                    self.assertIsNotNone(elapsed, "attempt never reached a terminal state inside the window")
+                    self.assertLessEqual(elapsed, BUDGET + 5, f"budget not authoritative: terminal after {elapsed:.1f}s")
+                    self.assertEqual(L._active(), [], "finished attempt still holds the worker slot")
+                finally:
+                    r = L.backend.runs.get(a.get("run_id") or "")
+                    if r: r["delay"] = 0
+                    L.loop.close()
+
+
+class BudgetStopCrashWindow(unittest.TestCase):
+    """F2 (crash-window wedge): a crash (or kill) between the budget_stop mark and the terminal
+    write leaves the attempt non-terminal forever - it is not in _active(), so no restart path
+    ever finishes it, and the nonterminal attempt keeps apply-update blocked."""
+
+    def _restart(self, d, a, result=None):
+        (Path(d, "attempts")).mkdir(parents=True, exist_ok=True)
+        (Path(d, "attempts", a["attempt_id"] + ".json")).write_text(json.dumps(a), "utf-8")
+        if result is not None:
+            (Path(d, "attempts", a["attempt_id"] + ".result.json")).write_text(json.dumps(result, indent=1), "utf-8")
+        L = launcher.Launcher(_cfg(d), launcher.FakeBackend(None)); L.kick = lambda: None
+        loaded = L.attempts[a["attempt_id"]]
+
+        async def go():
+            await L._schedule()  # startup recovery path: serve() kicks once, this is that kick
+            t0 = time.monotonic()
+            while loaded["state"] not in launcher.TERMINAL and time.monotonic() - t0 < WINDOW:
+                await asyncio.sleep(0.02)
+            return time.monotonic() - t0 if loaded["state"] in launcher.TERMINAL else None
+
+        return L, loaded, asyncio.run(go())
+
+    def test_restart_completes_a_budget_stop_the_crash_interrupted(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = _crash_window_attempt("att_bud00000010", project="proj")
+            L, a, elapsed = self._restart(d, a)
+            try:
+                self.assertEqual(a["state"], "failed", f"crash-window attempt wedged forever: {a.get('detail')!r}")
+                self.assertIsNotNone(elapsed, "attempt never reached a terminal state inside the window")
+                self.assertIn("budget timeout", (a.get("detail") or "").lower())
+                self.assertIn(f"timeout_s={BUDGET}", a.get("detail") or "")
+                self.assertNotIn("outlived", (a.get("detail") or "").lower(),
+                                 "the worker's fate is unknowable after the crash; the detail must not claim it")
+                self.assertEqual(launcher.active_attempts_for(L.attempts, "proj"), 0,
+                                 "wedged nonterminal attempt keeps apply-update blocked")
+                self.assertEqual(L._active(), [], "crash-window attempt still holds the worker slot")
+            finally:
+                L.loop.close()
+
+    def test_restart_restores_an_already_collected_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = _crash_window_attempt("att_bud00000012", project="proj")
+            result = {"schema": "orbit.local-worker.result/v1", "attempt_id": a["attempt_id"],
+                      "source": {"kind": "opencode", "harness": "opencode"},
+                      "observed": {"status": "completed", "stop_reason": "end_turn", "error": None}}
+            L, a, elapsed = self._restart(d, a, result)
+            try:
+                self.assertEqual(a["state"], "succeeded",
+                                 f"a collected result was thrown away by the crash window: {a.get('detail')!r}")
+                self.assertIsNotNone(elapsed, "attempt never reached a terminal state inside the window")
+                self.assertIn(f"timeout_s={BUDGET}", a.get("detail") or "")
+                self.assertEqual(launcher.active_attempts_for(L.attempts, "proj"), 0,
+                                 "wedged nonterminal attempt keeps apply-update blocked")
+                self.assertEqual(L._active(), [], "crash-window attempt still holds the worker slot")
+            finally:
+                L.loop.close()
+
+
+class WatchdogStopsAControllerTheLoopCannotSave(unittest.TestCase):
+    """T1: the watchdog path must be genuinely exercised. The controller here is wedged inside a
+    backend call when the deadline passes, so the loop's own fast-path check can never fire:
+    without _budget_watchdog nothing stops this attempt, and it stays non-terminal forever."""
+
+    def test_watchdog_stops_attempt_when_controller_is_wedged_in_a_backend_call(self):
+        with tempfile.TemporaryDirectory() as d:
+            be = _HungBackend()
+            L = launcher.Launcher(_cfg(d), be); L.kick = lambda: None
+            grace = getattr(launcher, "BUDGET_STOP_GRACE_S", 15)
+            now = time.time()
+            a = {"attempt_id": "att_bud00000011", "kind": "opencode", "state": "running",
+                 "detail": "opencode run started", "run_id": "run-hang0000001", "cursor": 0, "lseq": 0,
+                 "created_at": now, "updated_at": now, "rate_limited": 0, "model": "deepseek-flash",
+                 "brief": {"objective": "x", "budget": {"timeout_s": BUDGET}}, "budget_started_at": now}
+            L.attempts[a["attempt_id"]] = a
+            _, elapsed = asyncio.run(_run_control_until_terminal(L, a, WINDOW))
+            self.assertEqual(a["state"], "failed", f"wedged controller was never stopped: {a.get('detail')!r}")
+            self.assertIsNotNone(elapsed, "attempt never reached a terminal state inside the window (no watchdog enforcement)")
+            self.assertLessEqual(elapsed, BUDGET + grace + 5, f"budget not authoritative: terminal after {elapsed:.1f}s")
+            self.assertIn("budget timeout", (a.get("detail") or "").lower())
+            self.assertIn(f"timeout_s={BUDGET}", a.get("detail") or "")
+            self.assertEqual(L._active(), [], "wedged attempt still holds the worker slot")
+            self.assertIn("run-hang0000001", be.cleaned, "budget stop did not clean the wedged attempt up")
+            L.loop.close()
 
 
 class BudgetResolution(unittest.TestCase):
