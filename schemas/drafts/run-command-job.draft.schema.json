@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mojomast/hyvv/main/schemas/drafts/run-command-job.draft.schema.json",
+  "title": "hyvv run-command job request (DRAFT, not frozen)",
+  "description": "Draft request shape for POST /v1/attempts with the proposed kind run-command. DESIGN-ONLY: this file describes a proposed kind gate, not an implemented endpoint; nothing here is authorized for implementation without the owner approvals listed in docs/design/r4-run-command.md. The transport boundary keeps validate_brief unchanged; the strict choices in this draft describe the kind-specific gate a future implementation would enforce.",
+  "x-hyvv-status": "draft",
+  "x-hyvv-draft-rev": 2,
+  "x-hyvv-frozen": false,
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["kind", "brief"],
+  "properties": {
+    "kind": {
+      "const": "run-command",
+      "description": "Dispatch reads the top-level kind first; this draft pins the canonical top-level form."
+    },
+    "attempt_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{8,64}$",
+      "description": "Optional. When omitted the launcher mints one (existing behavior); the pattern matches both client-supplied and minted shapes."
+    },
+    "model": {
+      "enum": [null],
+      "description": "Must be absent or null: a run-command attempt has no inference, and a named model is refused by the kind gate (400)."
+    },
+    "tier": {
+      "enum": [null],
+      "description": "Same rule as model; tiers are model resolution and do not apply to this kind."
+    },
+    "brief": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["objective", "command"],
+      "properties": {
+        "objective": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Required non-empty statement of what the single command is for (validate_brief requires it non-empty after trimming)."
+        },
+        "kind": {
+          "const": "run-command",
+          "description": "Optional echo of the kind; the top-level field wins at dispatch."
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "description": "The single command, byte-exact. It must equal one enrolled allowlist entry (no normalization, no prefix or wildcard) or the request is refused 403 before any attempt exists. The 2000-character cap is a draft value pending owner confirmation."
+        },
+        "purpose": {
+          "enum": ["diagnostics", "maintenance"],
+          "default": "diagnostics",
+          "description": "Draft enum pending owner confirmation. When the matched allowlist entry declares a purpose, it must equal this value."
+        },
+        "project": {
+          "type": "string",
+          "description": "Optional authorized project key. When present it must exist in the launcher's project registry (403 otherwise) and, when the project has a local path, the container is seeded from it exactly as check jobs are."
+        },
+        "branch": {
+          "type": "string",
+          "description": "Optional; seeding uses it the way check jobs do."
+        },
+        "source_rev": {
+          "type": "string",
+          "description": "Optional; exact-revision seeding, the way check jobs do it."
+        },
+        "security_profile": {
+          "type": "string",
+          "description": "Optional; resolved like check jobs (the default profile unless the host defines others). When the matched allowlist entry pins a profile, the request must name the same one."
+        },
+        "budget": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "timeout_s": {
+              "type": "integer",
+              "minimum": 10,
+              "maximum": 7200,
+              "description": "Per-command clock bounds mirrored from CHECK_TIMEOUT_S. The kind gate refuses out-of-range values (400) instead of silently clamping; a draft decision pending owner confirmation."
+            }
+          }
+        },
+        "commands": {
+          "not": {},
+          "description": "Forbidden: a run-command attempt runs exactly one command; multi-command work belongs to kind=check."
+        },
+        "verify_of": {
+          "not": {},
+          "description": "Forbidden: verify_of applies to opencode attempts only, as for check jobs today."
+        },
+        "assigned_files": {
+          "not": {},
+          "description": "Forbidden: there is no patch and no file collection, so a file scope has no meaning for this kind."
+        },
+        "workdir": {
+          "not": {},
+          "description": "Forbidden: the reused container path chooses the working directory (the seeded /work/<project> when a project is named)."
+        }
+      }
+    }
+  }
+}
