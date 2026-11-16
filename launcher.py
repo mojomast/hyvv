@@ -126,6 +126,12 @@ USAGE_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "thinking_
 AGY_MCP_NAME = "orbit-cua"  # registered once in ~/.gemini/config/mcp_config.json (scripts/setup-agy-cua.ps1)
 AGY_ALLOW_RULE = f"mcp({AGY_MCP_NAME}/*)"
 AGY_TIMEOUT_S = (60, 600, 3600)  # min, default, max for brief.budget.timeout_s
+# budget.timeout_s is also an ATTEMPT wall clock, not just a value handed to a worker: a controller
+# watchdog force-finishes an attempt this many seconds after the budget expires even when the
+# worker (or a backend call) never returns. The grace covers stopping the worker; the terminal
+# journal write happens inside it, so the attempt slot always frees.
+BUDGET_STOP_GRACE_S = 15
+CHECK_ATTEMPT_OVERHEAD_S = 300  # launcher-side slack (container create/seed/cleanup) atop a check job's per-command clocks
 AGY_MODES = ("ui", "code")  # code: repo seeded into the attempt's sandbox; agy edits/runs ONLY there via orbit-cua shell+file
 AGY_CODE_PERMS = "computer:shell,computer:file,computer:screenshot,computer:click,computer:type,computer:key,computer:scroll"
 # ---- sandbox naming: <model abbr>-<slug>-<short attempt id>, e.g. ds41-fix-login-bug-89abcdef01
@@ -693,6 +699,11 @@ def _proc_run(argv, input=None, timeout=None):
 CHECK_TAIL = 16_000  # chars of stdout/stderr kept per check in the result (full log on disk)
 CHECK_TIMEOUT_S = (10, 1800, 7200)  # min, default, max for brief.budget.timeout_s per command
 
+def check_timeout_s(b):
+    """brief.budget.timeout_s for ONE check command, clamped to CHECK_TIMEOUT_S (min, default, max)."""
+    t = int(((b or {}).get("budget") or {}).get("timeout_s") or CHECK_TIMEOUT_S[1])
+    return max(CHECK_TIMEOUT_S[0], min(CHECK_TIMEOUT_S[2], t))
+
 class DockerCheckRunner:
     """Runs a check job: one throwaway container per attempt (security profile applied at `docker run`), the project
     seeded at /work/<project> as a fresh git repo, then each brief.commands entry via `docker exec`. The result is
@@ -726,7 +737,7 @@ class DockerCheckRunner:
 
     async def run_checks(self, a):
         b = a["brief"]; out = []
-        t = int(((b.get("budget") or {}).get("timeout_s")) or CHECK_TIMEOUT_S[1]); t = max(CHECK_TIMEOUT_S[0], min(CHECK_TIMEOUT_S[2], t))
+        t = check_timeout_s(b)
         logs = Path(self.cfg["data_dir"]) / "attempts"
         for i, cmd in enumerate(b.get("commands") or []):
             if a.get("cancel"): break
@@ -1104,6 +1115,29 @@ def agy_argv(cfg, prompt, model, timeout_s):
 def agy_timeout(b, mode="ui"):
     t = (b.get("budget") or {}).get("timeout_s") or (1800 if mode == "code" else AGY_TIMEOUT_S[1])
     return max(AGY_TIMEOUT_S[0], min(AGY_TIMEOUT_S[2], int(t)))
+
+def attempt_budget_s(a):
+    """The attempt wall clock in seconds from brief.budget.timeout_s, or None when none applies.
+
+    budget.timeout_s must bound the whole attempt, not only the child it is handed to: whatever a
+    worker does with its own flag, the launcher stops the attempt at this deadline plus
+    BUDGET_STOP_GRACE_S. Kind semantics preserved: agy-cua keeps the AGY_TIMEOUT_S min/default/max
+    clamp (and the code-mode default), check keeps the CHECK_TIMEOUT_S per-command clamp and gets a
+    per-command-derived attempt clock (each command stays individually bounded), opencode enforces
+    exactly the configured value and only when the brief carries one.
+    """
+    b = a.get("brief") or {}
+    kind = a.get("kind") or b.get("kind") or "opencode"
+    if kind == "agy-cua":
+        return agy_timeout(b, a.get("mode") or "ui")
+    if kind == "check":
+        return check_timeout_s(b) * (len(b.get("commands") or []) + 1) + CHECK_ATTEMPT_OVERHEAD_S
+    raw = (b.get("budget") or {}).get("timeout_s")
+    try:
+        t = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return t if t > 0 else None
 
 def render_agy_prompt(b):
     parts = [f"# Objective\n{b['objective']}"]
@@ -1599,7 +1633,8 @@ class Launcher:
             except Exception as ex:  # keep the durable journal transition; recovery on restart will retry
                 self.landing_conflicts.append({"attempt_id": a.get("attempt_id"), "error": type(ex).__name__})
 
-    def _active(self): return [x for x in self.attempts.values() if x["state"] in ("starting", "running", "cancel_requested")]
+    def _active(self): return [x for x in self.attempts.values() if x["state"] in ("starting", "running", "cancel_requested")
+                               and not x.get("budget_stop")]  # budget_stop: the watchdog owns the teardown
 
     def kick(self): asyncio.run_coroutine_threadsafe(self._schedule(), self.loop)
 
@@ -1621,7 +1656,20 @@ class Launcher:
 
     async def _control(self, a):
         aid = a["attempt_id"]
+        budget = deadline = started = None
+        watchdog = None
         try:
+            # budget.timeout_s as an attempt wall clock: anchored at dispatch, kept across a
+            # restart-reattach, enforced by the loop's fast path below and by the watchdog even
+            # when this controller is itself stuck inside a backend call.
+            budget = attempt_budget_s(a)
+            if budget:
+                with self.lock:
+                    started = a.get("budget_started_at") if a.get("run_id") else None  # resumed: keep the original clock
+                    if not started:
+                        started = time.time(); a["budget_started_at"] = started; self._save(a)
+                deadline = started + budget
+                watchdog = asyncio.ensure_future(self._budget_watchdog(a, asyncio.current_task(), deadline, budget, started))
             if a.get("kind") == "check": return await self._control_check(a)
             if not a.get("run_id"):
                 agy = a.get("kind") == "agy-cua"
@@ -1637,6 +1685,8 @@ class Launcher:
                 a.update(ids); self._set(a, "running", ("agy" if agy else "opencode") + " run started", {"run_id": ids["run_id"]})
             last_hb = last_ev = time.time()
             while True:
+                if deadline and time.time() >= deadline:  # fast path: a healthy loop stops exactly at the budget
+                    return await asyncio.shield(self._budget_finish(a, budget, started))
                 if a.get("cancel") and not a.get("interrupted"):
                     await self.backend.interrupt(a); a["interrupted"] = True
                     self._set(a, "cancelled", "interrupt confirmed; run stopped"); await self.backend.cleanup(a); return
@@ -1676,7 +1726,45 @@ class Launcher:
             try: await self.backend.cleanup(a)
             except Exception: pass
         finally:
+            if watchdog is not None and not watchdog.done(): watchdog.cancel()
             self.controllers.pop(aid, None); self.kick()
+
+    async def _budget_watchdog(self, a, controller, deadline, budget, started):
+        """One-shot wall-clock enforcer for one attempt's budget.timeout_s.
+
+        Runs beside the controller so the budget holds regardless of worker behavior: at the
+        deadline it stops the controller (whose polling loop - or a backend call inside it - may
+        itself be stuck) and drives the attempt through _budget_finish to a terminal state."""
+        await asyncio.sleep(max(0.0, deadline - time.time()))
+        await asyncio.shield(self._budget_finish(a, budget, started, controller))
+
+    async def _budget_finish(self, a, budget, started, controller=None):
+        """Force one attempt past its budget wall clock to an honest terminal state (idempotent).
+
+        Whoever arrives first - the controller's own deadline check, or this watchdog when the
+        controller is stuck - marks the attempt budget_stop (so _schedule cannot resurrect a
+        controller for it), stops the worker, and lands failed with a detail naming the budget.
+        The terminal write happens before cleanup, so the active-attempt slot frees immediately
+        and an admin apply-update is no longer blocked by a runaway. Shielded by callers: once
+        started, the teardown survives the controller's finally cancelling the watchdog."""
+        with self.lock:
+            if a["state"] in TERMINAL or a.get("budget_stop") or a["state"] not in ("starting", "running", "cancel_requested"):
+                return
+            a["budget_stop"] = True; self._save(a)
+        if controller is not None and not controller.done():
+            controller.cancel()
+            try: await asyncio.wait_for(controller, BUDGET_STOP_GRACE_S)
+            except (asyncio.CancelledError, Exception): pass
+        try: await asyncio.wait_for(self.backend.interrupt(a), BUDGET_STOP_GRACE_S)
+        except Exception: pass
+        elapsed = max(0.0, time.time() - (started or time.time()))
+        with self.lock:
+            if a["state"] not in TERMINAL:
+                self._set(a, "failed", f"budget timeout: worker outlived brief.budget.timeout_s={int(budget)}s "
+                                       f"(launcher stopped the run after {elapsed:.0f}s)")
+        try: await asyncio.wait_for(self.backend.cleanup(a), 2 * BUDGET_STOP_GRACE_S)
+        except Exception: pass
+        self.kick()
 
     async def _control_check(self, a):
         """Check-run job: start the container, run brief.commands, record exit codes + logs. The result never
