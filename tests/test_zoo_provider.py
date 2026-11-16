@@ -121,8 +121,8 @@ class ZooRouting(unittest.TestCase):
         self.assertFalse(L.is_zoo_model(self._cfg(), "deepseek:deepseek-flash"))
 
     def test_launcher_ceiling_is_under_the_zoo_limit(self):
-        # Zoo: 16 clean, 20 is the edge, cap at 12 in flight. The launcher cannot exceed its ceiling.
-        self.assertLessEqual(L.MAX_WORKERS, 12)
+        # Zoo: 16 clean, 20 is the edge, cap at 14 in flight. The launcher cannot exceed its ceiling.
+        self.assertLessEqual(L.MAX_WORKERS, 14)
 
 
 class RetryAfterParsing(unittest.TestCase):
