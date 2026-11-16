@@ -1507,7 +1507,7 @@ class Launcher:
         d = {k: a.get(k) for k in keys}
         if a.get("workspace_error"):
             d["workspace_error"] = a["workspace_error"]
-        if d["state"] == "queued": d["queue_position"] = self._queue().index(a["attempt_id"]) + 1 if a["attempt_id"] in self._queue() else None
+        if d["state"] == "queued": q = self._queue(); d["queue_position"] = q.index(a["attempt_id"]) + 1 if a["attempt_id"] in q else None  # one snapshot: a second _queue() call could race the .index()
         return d
 
     def listing(self, a):
