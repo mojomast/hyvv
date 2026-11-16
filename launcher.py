@@ -1844,6 +1844,142 @@ def build_provisioner(cfg):
     )
 
 
+# Routing-relevant keys a POST /v1/config applies to the RUNNING launcher's in-memory cfg and
+# persists to the config file. max_concurrent is accepted too but stays runtime-only (a restart
+# reverts it), exactly as before hot apply existed.
+CONFIG_HOT_KEYS = ("model", "models", "prefer_zoo", "projects")
+
+
+def config_backup_path(path):
+    """Timestamped backup name beside `path` (UTC; Windows-safe, no colons in the stamp)."""
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    cand = path.with_name(path.name + ".bak-" + stamp)
+    n = 1
+    while cand.exists():  # two applies within one second must not overwrite each other's backup
+        cand = path.with_name(path.name + ".bak-" + stamp + "-" + str(n))
+        n += 1
+    return cand
+
+
+def write_config_file(path, raw):
+    """Persist a config dict with the admin path's atomic write plus a timestamped backup.
+
+    The previous file is copied to `<name>.bak-<UTC stamp>` first, then the new content is
+    written to a temp file in the same directory, fsynced, and os.replace()d over the target, so
+    a crash leaves either the old or the new file - never a partial one. Returns the backup path,
+    or None when there was no previous file to back up.
+    """
+    path = Path(path)
+    bak = None
+    if path.exists():
+        bak = config_backup_path(path)
+        data = path.read_bytes()
+        fd = os.open(bak, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(raw, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(path.parent)
+    return bak
+
+
+def apply_config_patch(L, b):
+    """Validate and apply one POST /v1/config body to the running launcher.
+
+    Returns (status, payload) without touching the socket, so the handler can send after the lock
+    is released. Runs under L.lock: validation, the persisted write and the in-memory apply are
+    one step, so concurrent POSTs cannot lose updates and /v1/health never observes a
+    half-applied patch. The persisted write happens BEFORE the in-memory apply, so a failed disk
+    write leaves the running cfg exactly as it was.
+
+    `models` and `projects` are entry-level upserts (a POST that pins one project must not drop
+    the others); `model` and `prefer_zoo` are scalars. Model names - the host default and every
+    project override - are validated against the allow-list as the patch would leave it, so a bad
+    name fails here instead of turning into 400s at dispatch time.
+    """
+    if not isinstance(b, dict):
+        return 400, {"error": "config body must be a JSON object"}
+    allowed = ("max_concurrent",) + CONFIG_HOT_KEYS
+    unknown = sorted(set(b) - set(allowed))
+    if unknown:
+        return 400, {"error": "unsupported config key(s): " + ", ".join(unknown) + " (allowed: " + ", ".join(allowed) + ")"}
+    if not b:
+        return 400, {"error": "nothing to apply (allowed: " + ", ".join(allowed) + ")"}
+    patch = {}
+    if "max_concurrent" in b:
+        try: n = int(b["max_concurrent"])
+        except (TypeError, ValueError): return 400, {"error": "max_concurrent must be an integer"}
+        if not 1 <= n <= MAX_WORKERS: return 400, {"error": f"max_concurrent must be 1..{MAX_WORKERS}"}
+        patch["max_concurrent"] = n
+    if "prefer_zoo" in b:
+        if not isinstance(b["prefer_zoo"], bool): return 400, {"error": "prefer_zoo must be true or false"}
+        patch["prefer_zoo"] = b["prefer_zoo"]
+    if "models" in b:
+        ms = b["models"]
+        if not isinstance(ms, dict): return 400, {"error": "models must be an object of per-model overrides"}
+        for k2, v2 in ms.items():
+            if not isinstance(v2, dict): return 400, {"error": "models." + k2 + " must be an object"}
+        patch["models"] = {**(L.cfg.get("models") or {}), **ms}
+    if "projects" in b:
+        pr = b["projects"]
+        if not isinstance(pr, dict): return 400, {"error": "projects must be an object of per-project entries"}
+        for k2, v2 in pr.items():
+            if not isinstance(v2, dict): return 400, {"error": "projects." + k2 + " must be an object"}
+            pm = v2.get("model")
+            if pm is not None and (not isinstance(pm, str) or not pm.strip()):
+                return 400, {"error": "projects." + k2 + ".model must be a non-empty string"}
+        patch["projects"] = {**(L.cfg.get("projects") or {}), **pr}
+    if "model" in b:
+        m = b["model"]
+        if not isinstance(m, str) or not m.strip(): return 400, {"error": "model must be a non-empty string"}
+        patch["model"] = m.strip()
+    probe = dict(L.cfg)
+    if "models" in patch: probe["models"] = patch["models"]
+    if "model" in patch: probe["model"] = patch["model"]
+    if "model" in patch:
+        try: model_spec(probe, patch["model"])
+        except ValueError as ex: return 400, {"error": str(ex)}
+    for k2, v2 in (patch.get("projects") or {}).items():
+        pm = (v2 or {}).get("model")
+        if pm is not None:
+            try: model_spec(probe, pm.strip())
+            except ValueError as ex: return 400, {"error": "projects." + k2 + ".model: " + str(ex)}
+    persisted = [k for k in CONFIG_HOT_KEYS if k in patch]
+    if persisted:
+        cfg_path = Path(L.cfg.get("_config_path") or "config.json")
+        try:
+            raw = json.loads(cfg_path.read_text("utf-8-sig")) if cfg_path.exists() else None
+        except ValueError:
+            return 400, {"error": str(cfg_path) + " is not valid JSON; repair it before applying config"}
+        except OSError as ex:
+            return 500, {"error": "config read failed: " + type(ex).__name__}
+        if raw is not None and not isinstance(raw, dict):
+            return 400, {"error": str(cfg_path) + " must contain a JSON object"}
+        if raw is None:  # no file (or unreadable): rebuild one from the running cfg, minus memory-only keys
+            raw = {k: v for k, v in L.cfg.items() if k not in ("_config_path", "extra_binds")}
+        for k in persisted: raw[k] = patch[k]
+        try: write_config_file(cfg_path, raw)
+        except OSError as ex:
+            return 500, {"error": "config write failed: " + type(ex).__name__ + ": " + redact(str(ex))[:200]}
+    # Mutate the maps IN PLACE (clear + update): the provisioning RegistryStore holds the same
+    # projects dict object as its cache, so rebinding would desync it.
+    if "models" in patch:
+        d = L.cfg.setdefault("models", {}); d.clear(); d.update(patch["models"])
+    if "projects" in patch:
+        d = L.cfg.setdefault("projects", {}); d.clear(); d.update(patch["projects"])
+    for k in ("model", "prefer_zoo", "max_concurrent"):
+        if k in patch: L.cfg[k] = patch[k]
+    return 200, {"ok": True, "applied": sorted(patch), "persisted": persisted,
+                 "max_concurrent": L.cfg["max_concurrent"], "model": L.cfg["model"]}
+
+
 def make_handler(L, token):
     class H(BaseHTTPRequestHandler):
         server_version = "orbit-launcher/" + VERSION
@@ -1955,6 +2091,12 @@ def make_handler(L, token):
                 return self._send(201 if created else 200, L.public(a))
             if p == ["v1", "route"]:  # preview: what this request would resolve to; no run is started
                 brief = b.get("brief") if isinstance(b.get("brief"), dict) else {}
+                proj = b.get("project")
+                # A top-level project stands in for the brief's own when the brief names none, so a
+                # coordinator can preflight a project's default; dispatch reads brief.project, and
+                # the brief wins here too, so preview and dispatch cannot disagree.
+                if isinstance(proj, str) and proj.strip() and not brief.get("project"):
+                    brief = dict(brief, project=proj.strip())
                 try: return self._send(200, route_preview(L.cfg, b.get("model") or b.get("tier"), brief, b.get("kind")))
                 except ValueError as ex: return self._send(400, {"error": str(ex)})
             if p == ["v1", "provision", "project"]:
@@ -1971,13 +2113,14 @@ def make_handler(L, token):
                 except _provisioning.ProvisionError as ex: return self._send(409, ex.to_dict())
                 return self._send(200, result)
             if p == ["v1", "config"]:
-                # runtime-only: set max_concurrent (1..MAX_WORKERS); config.json on disk is unchanged, a restart reverts
-                try: n = int(b.get("max_concurrent"))
-                except Exception: return self._send(400, {"error": "max_concurrent must be an integer"})
-                if not 1 <= n <= MAX_WORKERS: return self._send(400, {"error": f"max_concurrent must be 1..{MAX_WORKERS}"})
-                with L.lock: L.cfg["max_concurrent"] = n
-                L.kick()
-                return self._send(200, {"ok": True, "max_concurrent": n})
+                # max_concurrent stays runtime-only (1..MAX_WORKERS; a restart reverts it). The
+                # routing-relevant keys (CONFIG_HOT_KEYS) are applied to the RUNNING launcher's
+                # in-memory cfg AND persisted to the config file with the admin path's atomic
+                # write plus a timestamped backup, so the next dispatch and /v1/health see the
+                # change without a restart.
+                with L.lock: code, out = apply_config_patch(L, b)
+                if code == 200: L.kick()
+                return self._send(code, out)
             if len(p) == 4 and p[:2] == ["v1", "attempts"] and p[3] == "review":  # 0.1.11: record a coordinator verdict
                 if not isinstance(b.get("accepted"), bool): return self._send(400, {"error": "accepted must be true or false"})
                 a, err = L.review(p[2], b["accepted"], b.get("note"))
@@ -2028,6 +2171,25 @@ def retry_after_s(text, cap=ZOO_RETRY_AFTER_MAX):
 PREFERRED_MODEL = "zoo:glm-5.3-flash"  # free Zoo pass; DeepSeek official flash is its fallback
 
 
+def project_model(cfg, brief):
+    """The model override one project entry carries (`projects.<name>.model` in config.json), or None.
+
+    Owner decision (2026-11-15): a brief that names no model and is not priority high resolves to
+    its project's override before the host default. The override uses the same allow-listed names
+    (and tiers) as a named model, so an unknown one fails dispatch the same way a named one would.
+    """
+    projects = cfg.get("projects") or {}
+    if not isinstance(projects, dict):
+        return None
+    entry = projects.get(str((brief or {}).get("project") or ""))
+    if not isinstance(entry, dict):
+        return None
+    m = entry.get("model")
+    if isinstance(m, str) and m.strip():
+        return m.strip()
+    return None
+
+
 def default_model(cfg):
     """Model for a bee brief that names none.
 
@@ -2052,15 +2214,20 @@ def model_spec(cfg, name, brief=None):
 
     0.1.17 routing, owner precedence (2026-11-15): an explicitly named model or tier is
     authoritative - priority: high routes only UNNAMED briefs to DeepSeek official. A brief that
-    names no model gets `default_model(cfg)`: Zoo's free GLM 5.3 Flash pass while this host can
-    authenticate to it, else the host default. Named models: no prefix or `go:` -> OpenCode Go
-    (including bare deepseek-v4.1-flash); `deepseek:<model>` -> DeepSeek official. Free-pool ids
-    are unchanged.
+    names no model gets its project's model override when the project sets one, else
+    `default_model(cfg)`: Zoo's free GLM 5.3 Flash pass while this host can authenticate to it,
+    else the host default. Named models: no prefix or `go:` -> OpenCode Go (including bare
+    deepseek-v4.1-flash); `deepseek:<model>` -> DeepSeek official. Free-pool ids are unchanged.
     """
     # Owner precedence (2026-11-15): an explicitly named model or tier is authoritative -
     # priority: high routes only UNNAMED briefs to DeepSeek official. Whatever the brief names
     # is what runs; high is a default-level signal, not an override of an explicit choice.
     named = bool(name)
+    if not name:
+        # Unnamed and not high: the brief's project model override wins before the host default
+        # (priority high already beats the project override via the `high` branch below).
+        if not is_high_priority(brief):
+            name = project_model(cfg, brief) or ""
     name = TIERS.get(name, name) if name else default_model(cfg)
     if name == "pool:free": return {"name": "pool:free", "pool": "free"}
     high = is_high_priority(brief) and not named
@@ -2100,18 +2267,22 @@ def model_spec(cfg, name, brief=None):
 def route_preview(cfg, model=None, brief=None, kind=None):
     """What a dispatch of this request would resolve to, without starting one.
 
-    Mirrors submit(): the request model field, then the brief's own model, then its tier, then
-    default_model(cfg). The reply names each provider's credential source (zoo, deepseek, go or
-    none) and never carries a credential value or a provider endpoint, so the payload is safe to
-    log and to hand back to a coordinator.
+    Mirrors submit(): the request model field, then the brief's own model, then its tier, then -
+    when the brief names none and priority is not high - the brief's project's model override,
+    then default_model(cfg). The reply names each provider's credential source (zoo, deepseek, go
+    or none) and never carries a credential value or a provider endpoint, so the payload is safe
+    to log and to hand back to a coordinator.
 
     Only kind=opencode is previewable: submit() resolves agy-cua through AGY_TIERS/AGY_MODELS and
     runs check briefs without a model, so any answer for those kinds would describe a route the
     dispatch never takes (found by the independent review of the first version of this endpoint).
     The kind is read the way dispatch reads it: the request's top-level field first, then the
     brief's own, then the opencode default. The preview covers model resolution only - it does not
-    run the brief validation dispatch applies (security profile, check commands), so a 200 means
-    "this is the model a dispatch would pick", not "dispatch would accept this brief".
+    run the brief validation dispatch applies (security profile, check commands, project
+    authorization), so a 200 means "this is the model a dispatch would pick", not "dispatch would
+    accept this brief". A top-level `project` on the request stands in for the brief's own project
+    when the brief names none, so a coordinator can preflight a project's default; a dispatch of
+    the same brief reads the project the same way.
     """
     brief = brief if isinstance(brief, dict) else {}
     kind = kind or brief.get("kind") or "opencode"
@@ -2128,6 +2299,7 @@ def route_preview(cfg, model=None, brief=None, kind=None):
     for source in ("zoo", "deepseek", "go"):
         try: creds[source] = bool(provider_key(cfg, source))
         except KeyError: creds[source] = False  # a partial cfg (unit tests) has no data_dir to read from
+    pm = project_model(cfg, brief)
     if spec.get("pool"):
         why = "the free pool is used, so the launcher picks one free model per attempt"
     elif requested and requested in TIERS:
@@ -2136,6 +2308,9 @@ def route_preview(cfg, model=None, brief=None, kind=None):
         why = "a model was named, so its allow-listed spec is used"
     elif is_high_priority(brief):
         why = "no model was named and brief priority is high, so DeepSeek official flash is used"
+    elif pm:
+        why = ("no model was named and project " + str(brief.get("project") or "")
+               + " sets model " + pm + ", so the project default is used")
     elif creds["zoo"] and cfg.get("prefer_zoo", True):
         why = "no model was named and this host can authenticate to Zoo, so the preferred free pass is used"
     elif not cfg.get("prefer_zoo", True):

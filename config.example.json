@@ -16,7 +16,8 @@
   ],
   "projects": {
     "example": {
-      "repo": "https://github.com/mojomast/example.git"
+      "repo": "https://github.com/mojomast/example.git",
+      "model": "deepseek:deepseek-flash"
     }
   }
 }
