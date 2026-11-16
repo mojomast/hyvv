@@ -131,6 +131,9 @@ AGY_TIMEOUT_S = (60, 600, 3600)  # min, default, max for brief.budget.timeout_s
 # worker (or a backend call) never returns. The grace covers stopping the worker; the terminal
 # journal write happens inside it, so the attempt slot always frees.
 BUDGET_STOP_GRACE_S = 15
+BUDGET_STOP_DRAIN_S = 2.0  # one bounded final event poll at the budget stop: the stop decision must
+# not preempt the event drain, or a run that finished INSIDE its budget is force-failed with a false
+# outlived detail and its result is lost; a backend that cannot answer in time just gets force-failed.
 CHECK_ATTEMPT_OVERHEAD_S = 300  # launcher-side slack (container create/seed/cleanup) atop a check job's per-command clocks
 AGY_MODES = ("ui", "code")  # code: repo seeded into the attempt's sandbox; agy edits/runs ONLY there via orbit-cua shell+file
 AGY_CODE_PERMS = "computer:shell,computer:file,computer:screenshot,computer:click,computer:type,computer:key,computer:scroll"
@@ -1452,6 +1455,7 @@ class Launcher:
         self.lock = threading.RLock()
         self.attempts = {}
         self.controllers = {}  # attempt_id -> asyncio task (exactly one per attempt)
+        self._budget_finishing = set()  # attempt_ids with a budget teardown in flight (in-memory single-flight)
         self.loop = asyncio.new_event_loop()
         self._ev_lock = threading.Lock(); self._ev_idx = {}  # events_since offset index
         self.started_at = time.time(); self.loop_lag_ms = 0.0
@@ -1646,6 +1650,16 @@ class Launcher:
                     self.controllers[a["attempt_id"]] = asyncio.ensure_future(self._control(a))
                 elif a["attempt_id"] not in self.controllers and a["state"] == "starting":
                     self._set(a, "failed", "launcher restarted during start; no run id recorded (retry from Orbit)")
+            # a crash between the budget_stop mark and the terminal write leaves the attempt
+            # non-terminal forever: it is not in _active(), so no restart path would ever finish
+            # it, and the nonterminal attempt keeps apply-update blocked. Complete the stop honestly.
+            # A teardown that is already in flight lands the attempt itself; skipping it here keeps
+            # every kick from spawning a no-op recovery that kicks again.
+            for a in [x for x in self.attempts.values()
+                      if x.get("budget_stop") and x["state"] in ("starting", "running", "cancel_requested")
+                      and x["attempt_id"] not in self.controllers
+                      and x["attempt_id"] not in self._budget_finishing]:
+                self.controllers[a["attempt_id"]] = asyncio.ensure_future(self._budget_stop_recover(a))
             free = self.cfg["max_concurrent"] - len(self._active())
             for aid in self._queue():
                 if free <= 0: break
@@ -1738,7 +1752,57 @@ class Launcher:
         await asyncio.sleep(max(0.0, deadline - time.time()))
         await asyncio.shield(self._budget_finish(a, budget, started, controller))
 
-    async def _budget_finish(self, a, budget, started, controller=None):
+    async def _drain_terminal_event(self, a):
+        """One bounded final poll at the budget stop: persist whatever the worker already produced
+        and return its terminal event (turn_ended/exited), or None when none is pending.
+
+        The deadline decision must not preempt the event drain: a poll loop that wakes at/after the
+        deadline would otherwise force-fail a run that finished INSIDE its budget with a false
+        'worker outlived' detail, and its collected result would be lost. The controller is already
+        stopped when this runs, so the cursor cannot be advanced concurrently."""
+        try:
+            evs, cur = await asyncio.wait_for(self.backend.events(a, a.get("cursor", 0)), BUDGET_STOP_DRAIN_S)
+        except Exception:  # no run, dead backend call, drain timeout: fall through to the honest stop
+            return None
+        with self.lock:
+            out = []
+            for e in evs:
+                a["lseq"] += 1; out.append(dict(e, lseq=a["lseq"], kind="worker:" + e["kind"], ts=e.get("ts") or time.time()))
+            a["cursor"] = cur
+            if out: self._append_events(a, out); a["updated_at"] = time.time(); self._save(a)
+        terminal = None
+        for e in evs:
+            if e.get("kind") in ("turn_ended", "exited"): terminal = e
+        return terminal
+
+    def _recovered_manifest(self, a):
+        """The attempt's already-collected result, when a stop that crashed before the terminal
+        write left one on disk (result manifest written by _finish before the state could land)."""
+        try:
+            m = json.loads((self.dir / "attempts" / f"{a['attempt_id']}.result.json").read_text("utf-8"))
+        except Exception:
+            return None
+        return m if isinstance(m, dict) and m.get("schema") == "orbit.local-worker.result/v1" \
+            and m.get("attempt_id") == a["attempt_id"] else None
+
+    async def _budget_stop_recover(self, a):
+        """Finish a budget stop that a crash interrupted between the budget_stop mark and the
+        terminal write (started by _schedule when a restart finds the attempt in that state)."""
+        aid = a["attempt_id"]
+        try:
+            budget = attempt_budget_s(a)
+            if budget:
+                await self._budget_finish(a, budget, a.get("budget_started_at"), recover=True)
+            else:
+                with self.lock:
+                    if a["state"] not in TERMINAL:
+                        self._set(a, "failed", "budget stop was interrupted by a restart before the outcome was recorded")
+                try: await asyncio.wait_for(self.backend.cleanup(a), 2 * BUDGET_STOP_GRACE_S)
+                except Exception: pass
+        finally:
+            self.controllers.pop(aid, None); self.kick()
+
+    async def _budget_finish(self, a, budget, started, controller=None, recover=False):
         """Force one attempt past its budget wall clock to an honest terminal state (idempotent).
 
         Whoever arrives first - the controller's own deadline check, or this watchdog when the
@@ -1746,25 +1810,59 @@ class Launcher:
         controller for it), stops the worker, and lands failed with a detail naming the budget.
         The terminal write happens before cleanup, so the active-attempt slot frees immediately
         and an admin apply-update is no longer blocked by a runaway. Shielded by callers: once
-        started, the teardown survives the controller's finally cancelling the watchdog."""
+        started, the teardown survives the controller's finally cancelling the watchdog.
+
+        Before the verdict the stop drains the worker's pending events (a run that finished inside
+        its budget lands succeeded with its result, never a false outlived detail) and restores an
+        already-collected result when a crash left one behind; with recover=True it completes a
+        stop a previous process died in the middle of, with a detail that does not claim what it
+        cannot know about the worker's fate."""
+        aid = a["attempt_id"]
         with self.lock:
-            if a["state"] in TERMINAL or a.get("budget_stop") or a["state"] not in ("starting", "running", "cancel_requested"):
+            if a["state"] in TERMINAL or a["state"] not in ("starting", "running", "cancel_requested"):
                 return
-            a["budget_stop"] = True; self._save(a)
-        if controller is not None and not controller.done():
-            controller.cancel()
-            try: await asyncio.wait_for(controller, BUDGET_STOP_GRACE_S)
-            except (asyncio.CancelledError, Exception): pass
-        try: await asyncio.wait_for(self.backend.interrupt(a), BUDGET_STOP_GRACE_S)
-        except Exception: pass
-        elapsed = max(0.0, time.time() - (started or time.time()))
-        with self.lock:
-            if a["state"] not in TERMINAL:
-                self._set(a, "failed", f"budget timeout: worker outlived brief.budget.timeout_s={int(budget)}s "
-                                       f"(launcher stopped the run after {elapsed:.0f}s)")
-        try: await asyncio.wait_for(self.backend.cleanup(a), 2 * BUDGET_STOP_GRACE_S)
-        except Exception: pass
-        self.kick()
+            if aid in self._budget_finishing: return  # one teardown per attempt; the runner lands it
+            if a.get("budget_stop") and not recover: return
+            self._budget_finishing.add(aid)
+            if not a.get("budget_stop"):
+                a["budget_stop"] = True; self._save(a)
+        try:
+            if controller is not None and not controller.done():
+                controller.cancel()
+                try: await asyncio.wait_for(controller, BUDGET_STOP_GRACE_S)
+                except (asyncio.CancelledError, Exception): pass
+            done = await self._drain_terminal_event(a)
+            if done is not None:  # the run already finished: land it with its collected result
+                try:
+                    await self._finish(a, done)
+                except Exception as ex:
+                    with self.lock:
+                        if a["state"] not in TERMINAL:
+                            self._set(a, "failed", f"budget timeout: brief.budget.timeout_s={int(budget)}s reached; "
+                                                   f"the run finished but collecting its result failed ({type(ex).__name__})")
+            elif (man := self._recovered_manifest(a)) is not None:
+                obs = man.get("observed") or {}
+                ok = obs.get("status") == "completed" and not obs.get("error")
+                self._set(a, "succeeded" if ok else "failed",
+                          f"collected result restored after the budget stop was interrupted "
+                          f"(brief.budget.timeout_s={int(budget)}s)")
+            else:
+                try: await asyncio.wait_for(self.backend.interrupt(a), BUDGET_STOP_GRACE_S)
+                except Exception: pass
+                elapsed = max(0.0, time.time() - (started or time.time()))
+                with self.lock:
+                    if a["state"] not in TERMINAL:
+                        if recover:
+                            self._set(a, "failed", f"budget timeout: brief.budget.timeout_s={int(budget)}s reached; "
+                                                   "the stop was interrupted by a restart before the outcome was recorded")
+                        else:
+                            self._set(a, "failed", f"budget timeout: worker outlived brief.budget.timeout_s={int(budget)}s "
+                                                   f"(launcher stopped the run after {elapsed:.0f}s)")
+        finally:
+            with self.lock: self._budget_finishing.discard(aid)
+            try: await asyncio.wait_for(self.backend.cleanup(a), 2 * BUDGET_STOP_GRACE_S)
+            except Exception: pass
+            self.kick()
 
     async def _control_check(self, a):
         """Check-run job: start the container, run brief.commands, record exit codes + logs. The result never
