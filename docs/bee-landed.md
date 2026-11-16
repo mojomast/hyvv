@@ -73,10 +73,13 @@ root, not inside `data`.
 
 Optionally, the envelope carries the attempt receipt's usage block as the
 CloudEvents extension attribute `rizzstackusage` (envelope root, sibling of
-`id`, `source`, `data`; never inside `data`). This is how every completed attempt
-delivers its token data to the coordinator's ledger without any extra fetch: the
-coordinator-side outbox ingest reads the attribute when present and leaves the
-event alone otherwise.
+`id`, `source`, `data`; never inside `data`). The launcher emits the attribute
+today, but nothing consumes it yet: no coordinator-side reader exists in the
+current stack. Two consumer changes are explicitly pending — the bundlebees
+envelope allowlist still has to learn `rizzstackusage`, and the orbitdesktop
+outbox source still has to cross to this event type — so until both land the
+attribute rides the event unread, and consumers that ignore unknown envelope
+attributes are unaffected.
 
 ```json
 {
@@ -84,10 +87,13 @@ event alone otherwise.
   "type": "rizzstack.bee.landed.v1",
   "id": "urn:rizzstack:bee-landed:0123456789abcdef0123456789abcdef",
   "rizzstackusage": {
-    "input_tokens": 120,
-    "output_tokens": 45,
-    "cache_read_tokens": 30,
-    "total_tokens": 195,
+    "input": 120,
+    "output": 45,
+    "cache_read": 30,
+    "cache_write": 12,
+    "reasoning": 8,
+    "thinking": 5,
+    "total": 195,
     "tool_calls": 7,
     "stop_reason": "end_turn",
     "model": "zoo:glm-5.3-flash",
@@ -108,11 +114,28 @@ Attributes are optional and scrubbed:
 
 | Attribute | Source | Rule |
 | --- | --- | --- |
-| `input_tokens`, `cache_read_tokens`, `cache_write_tokens`, `output_tokens`, `reasoning_tokens`, `thinking_tokens`, `total_tokens` | the receipt's `observed.usage` (provider usage object or JSON string), normalized onto these canonical counts | numeric, non-negative integers only; a count the provider never reported is absent, never zero-filled (a zero the provider actually reported is kept) |
-| `tool_calls` | the receipt's `observed.tool_calls` | non-negative integer, else absent |
-| `stop_reason` | the receipt's `observed.stop_reason` | at most 64 characters, secret-shaped runs redacted |
-| `model` | the attempt model, then the receipt's `source.model` | identifier only |
+| `input`, `output`, `cache_read`, `cache_write`, `reasoning`, `thinking`, `total` | the receipt's `observed.usage` (provider usage object or JSON string), normalized onto these canonical counts | numeric, non-negative integers under the magnitude bound: a count at or above 1,000,000,000 is refused (absent, never clamped — no single run consumes a billion tokens or issues a billion tool calls); a count the provider never reported is absent, never zero-filled (a zero the provider actually reported is kept) |
+| `tool_calls` | the receipt's `observed.tool_calls` | non-negative integer under the same magnitude bound, else absent |
+| `stop_reason` | the receipt's `observed.stop_reason` | at most 64 characters. A known launcher stop reason (`end_turn`, `max_tokens`, `stop_sequence`, `tool_use`, `tool_calls`, `content_filter`, `length`, `stop`, `error`, `timeout`, `aborted`, `cancelled`, `canceled`, `interrupted`, `refusal`, `unknown`, `other`) passes lowercased. Any other value must survive strict scrubbing: it is refused — the field stays absent — when the redactor would rewrite it or when it is a URL, a host/IP, a host:port or a filesystem path |
+| `model` | the attempt model, then the receipt's `source.model` | identifier only. The value passes through the redactor and the same URL/path refusal: a value the redactor would rewrite, or one that looks like a URL, a host/IP, a host:port or a filesystem path, is refused and the field stays absent (a dotted version segment such as `v4.1` is kept) |
 | `route` | provider path that served the run: `zoo` / `go` / `deepseek` from the model prefix or allow-list entry, `free` for keyless free-pool entries, `agy` for agy-cua | absent when it cannot be derived |
+
+Legacy receipt spellings are accepted as input and never emitted: each is
+mapped onto the canonical count it names, and the canonical name wins when both
+spellings appear in one usage object.
+
+| Legacy spelling (accepted as input only) | Emitted key |
+| --- | --- |
+| `input_tokens`, `prompt_tokens` | `input` |
+| `output_tokens`, `completion_tokens` | `output` |
+| `cache_read_tokens` | `cache_read` |
+| `cache_write_tokens`, `cache_creation_input_tokens` | `cache_write` |
+| `reasoning_tokens` | `reasoning` |
+| `thinking_tokens` | `thinking` |
+| `total_tokens` | `total` |
+
+Alias forms without separators (`inputTokens`, `cacheRead`) normalize the same
+way; the bare `input` / `output` / `total` shapes are themselves canonical.
 
 Everything else the receipt's usage block may carry — prompts or completion
 text, tool arguments, file lists, provider quota state, daily totals, local log
@@ -123,8 +146,9 @@ are byte-identical to the pre-usage shape.
 Idempotence is unchanged: the attribute lives outside the conflict evidence, the
 event id stays `(attempt_id, terminal state, transition)`, and a re-observed
 attempt returns the existing durable event whether or not the new observation
-carries usage. The outbox file is written once; the coordinator deduplicates by
-the attempt key, so a re-emitted event never double-counts.
+carries usage. The outbox file is written once; the pending coordinator-side
+consumer will deduplicate by the attempt key, so a re-emitted event never
+double-counts.
 
 ### Field sources
 
@@ -231,12 +255,14 @@ returns `(delivered, total)`.
 
 The event only includes identifiers, state, the backend harness/model,
 `source_rev`, lease digests, repository-relative assigned file paths, and logical
-result references. It never includes the brief objective, prompt, tokens,
-provider keys, patches, logs, local paths, or `result.json` contents. Lease
-material is hashed, not embedded. The `rizzstackusage` attribute adds only
-numeric token counts, `tool_calls`, `stop_reason` and the model/route identity;
-every other part of the receipt's usage block (quota state, daily totals, local
-log paths, prompt or completion text) is dropped before the event is built.
+result references. It never includes the brief objective, prompt text, provider
+keys, patches, logs, local paths, or `result.json` contents. Lease material is
+hashed, not embedded. The one exception is the `rizzstackusage` attribute, which
+adds only the scrubbed numeric counts and identity fields described above —
+`tool_calls`, a validated-or-refused `stop_reason`, and the model/route
+identity; every other part of the receipt's usage block (quota state, daily
+totals, local log paths, prompt or completion text) is dropped before the event
+is built.
 
 ## Tests
 

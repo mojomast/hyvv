@@ -192,19 +192,28 @@ _LANDED_EVIDENCE_KEYS = ("schema", "feature_id", "job_id", "task_id", "attempt_i
 # schema version bump or repin). Contents are scrubbed to numeric token counts plus
 # tool_calls, stop_reason and the model/route identity.
 LANDED_USAGE_ATTR = "rizzstackusage"
-_USAGE_TOKEN_KEYS = ("input_tokens", "cache_read_tokens", "cache_write_tokens",
-                     "output_tokens", "reasoning_tokens", "thinking_tokens", "total_tokens")
+# Canonical count keys emitted under `rizzstackusage`. The emitted names carry no
+# credential-heuristic substring anywhere in the string: validating consumers
+# refuse attribute sub-keys whose names look like credential words, so the bare
+# count names are emitted and every legacy spelling stays input-only (mapped
+# through _USAGE_TOKEN_ALIASES, never emitted).
+_USAGE_TOKEN_KEYS = ("input", "cache_read", "cache_write", "output", "reasoning", "thinking", "total")
 _USAGE_TOKEN_ALIASES = {
-    "inputtokens": "input_tokens", "prompttokens": "input_tokens", "input": "input_tokens",
-    "cacheread": "cache_read_tokens", "cachereadtokens": "cache_read_tokens",
-    "cachedtokens": "cache_read_tokens", "cachereadinputtokens": "cache_read_tokens",
-    "cachewrite": "cache_write_tokens", "cachewritetokens": "cache_write_tokens",
-    "cachecreationtokens": "cache_write_tokens", "cachecreationinputtokens": "cache_write_tokens",
-    "outputtokens": "output_tokens", "completiontokens": "output_tokens", "output": "output_tokens",
-    "reasoningtokens": "reasoning_tokens", "reasoning": "reasoning_tokens",
-    "thinkingtokens": "thinking_tokens", "thinking": "thinking_tokens",
-    "totaltokens": "total_tokens", "total": "total_tokens",
+    "inputtokens": "input", "prompttokens": "input",
+    "cacheread": "cache_read", "cachereadtokens": "cache_read",
+    "cachedtokens": "cache_read", "cachereadinputtokens": "cache_read",
+    "cachewrite": "cache_write", "cachewritetokens": "cache_write",
+    "cachecreationtokens": "cache_write", "cachecreationinputtokens": "cache_write",
+    "outputtokens": "output", "completiontokens": "output",
+    "reasoningtokens": "reasoning",
+    "thinkingtokens": "thinking",
+    "totaltokens": "total",
 }
+# A sane per-run magnitude bound for every numeric count in the attribute: no
+# single run consumes a billion tokens or issues a billion tool calls, so a
+# count at or above this bound is a corrupted or hostile value. It is refused
+# (the count stays absent), never clamped into a fabricated number.
+_USAGE_COUNT_LIMIT = 1_000_000_000
 
 
 class LandedEventConflict(ValueError):
@@ -357,17 +366,85 @@ def _landed_result(a, result_path, attempt_id=None):
 
 
 def _usage_count(value):
-    """A non-negative integer token count, or None when the source has none.
+    """A non-negative integer count under the magnitude bound, or None when the source has none.
 
     Zeros are kept only when the provider itself reported 0; a missing value never
-    becomes 0 as a stand-in."""
+    becomes 0 as a stand-in. A count at or above _USAGE_COUNT_LIMIT is an absurd
+    magnitude and is refused, never clamped."""
     if isinstance(value, bool):
         return None
-    if isinstance(value, int) and value >= 0:
+    if isinstance(value, int) and 0 <= value < _USAGE_COUNT_LIMIT:
         return value
-    if isinstance(value, float) and value >= 0 and value.is_integer():
+    if isinstance(value, float) and 0 <= value < _USAGE_COUNT_LIMIT and value.is_integer():
         return int(value)
     return None
+
+
+# Free-text refusal shapes for the usage attribute: a URL (any scheme), a
+# filesystem path, an IPv4 address, a drive path, a host:port or a dotted host
+# must never reach the event as free text. Used for non-enum stop reasons.
+_USAGE_FREEFORM_RE = re.compile(
+    r"(?i)(?:[a-z][a-z0-9+.\-]*://"  # URL scheme
+    r"|[/\\]"                        # path separator
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}\b"  # IPv4 address
+    r"|\b[a-z]:[\\/]"                # drive path
+    r"|[a-z0-9_\-]+:\d"              # host:port
+    r"|[a-z0-9_\-]+\.[a-z0-9_\-]+)"  # dotted host or domain-ish run
+)
+
+# Model refusal shapes: narrower than the free-text rule because model ids
+# legitimately carry dotted version segments (deepseek-v4.1-flash). A URL
+# scheme, a path separator, an IPv4 address, a drive path or a host:port is
+# refused; a dotted version segment is kept.
+_USAGE_MODEL_RE = re.compile(
+    r"(?i)(?:[a-z][a-z0-9+.\-]*://"
+    r"|[/\\]"
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}\b"
+    r"|\b[a-z]:[\\/]"
+    r"|[a-z0-9_\-]+:\d"
+    r")")
+
+# The launcher's known stop reasons. A receipt stop reason matching one of these
+# (case-insensitively) is emitted lowercased; any other free text must survive
+# strict scrubbing or the field stays absent.
+_USAGE_STOP_REASONS = frozenset((
+    "end_turn", "max_tokens", "stop_sequence", "tool_use", "tool_calls",
+    "content_filter", "length", "stop", "error", "timeout", "aborted",
+    "cancelled", "canceled", "interrupted", "refusal", "unknown", "other",
+))
+
+
+def _usage_stop_reason(value):
+    """A stop reason that may cross the event, or None when it must not.
+
+    Known launcher stop reasons pass lowercased. Anything else must survive
+    strict scrubbing: the value is refused when the redactor would rewrite it
+    (a secret-shaped run) or when it looks like a URL, a host/IP, a host:port
+    or a filesystem path - such a value never reaches the event."""
+    text = _bounded_text(value, 64)
+    if not text:
+        return None
+    low = text.lower()
+    if low in _USAGE_STOP_REASONS:
+        return low
+    if redact(text) != text or _USAGE_FREEFORM_RE.search(text):
+        return None
+    return text
+
+
+def _usage_model(value):
+    """An identifier-only model name that may cross the event, or None.
+
+    The value passes through the redactor first: a secret-shaped run is refused,
+    so the redaction marker never masquerades as a model id. URL, host/IP,
+    host:port and filesystem-path shapes are refused the same way; dotted
+    version segments (deepseek-v4.1-flash) stay fine."""
+    text = _bounded_text(value, 128)
+    if not text:
+        return None
+    if redact(text) != text or _USAGE_MODEL_RE.search(text):
+        return None
+    return text
 
 
 def _usage_route(kind, model):
@@ -385,11 +462,13 @@ def _usage_route(kind, model):
 
 
 def _usage_tokens(value):
-    """Allowlist projection of a provider usage object onto canonical token-count keys.
+    """Allowlist projection of a provider usage object onto canonical count keys.
 
     Accepts a dict or a JSON string (the SDK reports usage_json). Unknown keys are
-    dropped, never copied through: only numeric token counts survive. A canonical
-    snake_case spelling wins over an alias of the same count, whatever the order."""
+    dropped, never copied through: only numeric counts survive, emitted under the
+    canonical names in _USAGE_TOKEN_KEYS. Legacy and alias spellings are accepted
+    as input (mapped through _USAGE_TOKEN_ALIASES) and never emitted; a canonical
+    name wins over an alias of the same count, whatever the order."""
     if isinstance(value, str) and value.strip():
         try:
             value = json.loads(value)
@@ -419,13 +498,13 @@ def _landed_usage(a, result_path):
     """The receipt's scrubbed usage block for the landed event, or None when there is none.
 
     Reads the persisted receipt (orbit.local-worker.result/v1) and projects
-    observed.usage onto numeric token counts, plus observed tool_calls and stop_reason
-    and the model/route identity. Nothing else crosses: no prompts, file contents,
-    provider credentials, quota state or local paths. Without at least one token count
-    the attribute stays absent entirely, so receipts without usage produce events
-    byte-identical to the pre-usage shape (never zero-filled). The attempt keeps the
-    event identity it already has, since the attribute lives outside the conflict
-    evidence."""
+    observed.usage onto numeric counts under the canonical count names, plus
+    observed tool_calls, a gated stop_reason and the gated model/route identity.
+    Nothing else crosses: no prompts, file contents, provider credentials, quota
+    state or local paths. Without at least one count the attribute stays absent
+    entirely, so receipts without usage produce events byte-identical to the
+    pre-usage shape (never zero-filled). The attempt keeps the event identity it
+    already has, since the attribute lives outside the conflict evidence."""
     if result_path is None:
         return None
     try:
@@ -442,13 +521,13 @@ def _landed_usage(a, result_path):
     tool_calls = _usage_count(observed.get("tool_calls"))
     if tool_calls is not None:
         block["tool_calls"] = tool_calls
-    stop_reason = redact(_bounded_text(observed.get("stop_reason"), 64) or "")
+    stop_reason = _usage_stop_reason(observed.get("stop_reason"))
     if stop_reason:
         block["stop_reason"] = stop_reason
     source = receipt.get("source") if isinstance(receipt.get("source"), dict) else {}
     brief = a.get("brief") or {}
     kind = a.get("kind") or source.get("kind") or brief.get("kind") or "opencode"
-    model = _bounded_text(a.get("model") or source.get("model") or brief.get("model"), 128)
+    model = _usage_model(a.get("model") or source.get("model") or brief.get("model"))
     if model:
         block["model"] = model
         route = _usage_route(kind, model)
