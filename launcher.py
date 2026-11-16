@@ -185,6 +185,26 @@ LANDED_EVENT_ID_PREFIX = "urn:rizzstack:bee-landed:"
 _LANDED_EVIDENCE_KEYS = ("schema", "feature_id", "job_id", "task_id", "attempt_id",
                          "coordinator", "backend", "state", "source_rev", "lease", "result",
                          "correlation_id", "causation_id")
+# The receipt's usage block rides the envelope as an optional CloudEvents extension
+# attribute, not inside `data`: the frozen rizzstack.bee-landed/1 payload keeps its
+# closed field set (docs/bee-landed.md), and an envelope-root extension is the additive,
+# backward-compatible evolution path (old consumers ignore unknown attributes, so no
+# schema version bump or repin). Contents are scrubbed to numeric token counts plus
+# tool_calls, stop_reason and the model/route identity.
+LANDED_USAGE_ATTR = "rizzstackusage"
+_USAGE_TOKEN_KEYS = ("input_tokens", "cache_read_tokens", "cache_write_tokens",
+                     "output_tokens", "reasoning_tokens", "thinking_tokens", "total_tokens")
+_USAGE_TOKEN_ALIASES = {
+    "inputtokens": "input_tokens", "prompttokens": "input_tokens", "input": "input_tokens",
+    "cacheread": "cache_read_tokens", "cachereadtokens": "cache_read_tokens",
+    "cachedtokens": "cache_read_tokens", "cachereadinputtokens": "cache_read_tokens",
+    "cachewrite": "cache_write_tokens", "cachewritetokens": "cache_write_tokens",
+    "cachecreationtokens": "cache_write_tokens", "cachecreationinputtokens": "cache_write_tokens",
+    "outputtokens": "output_tokens", "completiontokens": "output_tokens", "output": "output_tokens",
+    "reasoningtokens": "reasoning_tokens", "reasoning": "reasoning_tokens",
+    "thinkingtokens": "thinking_tokens", "thinking": "thinking_tokens",
+    "totaltokens": "total_tokens", "total": "total_tokens",
+}
 
 
 class LandedEventConflict(ValueError):
@@ -336,6 +356,107 @@ def _landed_result(a, result_path, attempt_id=None):
     return info
 
 
+def _usage_count(value):
+    """A non-negative integer token count, or None when the source has none.
+
+    Zeros are kept only when the provider itself reported 0; a missing value never
+    becomes 0 as a stand-in."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value >= 0:
+        return value
+    if isinstance(value, float) and value >= 0 and value.is_integer():
+        return int(value)
+    return None
+
+
+def _usage_route(kind, model):
+    """Coarse route identity for the usage attribute: which provider path served the run."""
+    if kind == "agy-cua":
+        return "agy"
+    text = str(model or "").strip()
+    prefix, _, rest = text.partition(":")
+    if prefix in ("zoo", "go", "deepseek") and rest:
+        return prefix
+    key = (MODELS.get(text) or {}).get("key")
+    if key == "none":
+        return "free"
+    return key if key in ("go", "deepseek", "zoo") else None
+
+
+def _usage_tokens(value):
+    """Allowlist projection of a provider usage object onto canonical token-count keys.
+
+    Accepts a dict or a JSON string (the SDK reports usage_json). Unknown keys are
+    dropped, never copied through: only numeric token counts survive. A canonical
+    snake_case spelling wins over an alias of the same count, whatever the order."""
+    if isinstance(value, str) and value.strip():
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    if not isinstance(value, dict):
+        return {}
+    out = {}
+    # canonical snake_case spellings win over aliases, whatever the key order
+    for key, raw in value.items():
+        if isinstance(key, str) and key.lower().replace("-", "_") in _USAGE_TOKEN_KEYS:
+            count = _usage_count(raw)
+            if count is not None:
+                out[key.lower().replace("-", "_")] = count
+    for key, raw in value.items():
+        if not isinstance(key, str):
+            continue
+        name = _USAGE_TOKEN_ALIASES.get(re.sub(r"[^a-z0-9]", "", key.lower()))
+        if name and name not in out:
+            count = _usage_count(raw)
+            if count is not None:
+                out[name] = count
+    return out
+
+
+def _landed_usage(a, result_path):
+    """The receipt's scrubbed usage block for the landed event, or None when there is none.
+
+    Reads the persisted receipt (orbit.local-worker.result/v1) and projects
+    observed.usage onto numeric token counts, plus observed tool_calls and stop_reason
+    and the model/route identity. Nothing else crosses: no prompts, file contents,
+    provider credentials, quota state or local paths. Without at least one token count
+    the attribute stays absent entirely, so receipts without usage produce events
+    byte-identical to the pre-usage shape (never zero-filled). The attempt keeps the
+    event identity it already has, since the attribute lives outside the conflict
+    evidence."""
+    if result_path is None:
+        return None
+    try:
+        receipt = json.loads(Path(result_path).read_text("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(receipt, dict):
+        return None
+    observed = receipt.get("observed")
+    observed = observed if isinstance(observed, dict) else {}
+    block = _usage_tokens(observed.get("usage"))
+    if not block:
+        return None
+    tool_calls = _usage_count(observed.get("tool_calls"))
+    if tool_calls is not None:
+        block["tool_calls"] = tool_calls
+    stop_reason = redact(_bounded_text(observed.get("stop_reason"), 64) or "")
+    if stop_reason:
+        block["stop_reason"] = stop_reason
+    source = receipt.get("source") if isinstance(receipt.get("source"), dict) else {}
+    brief = a.get("brief") or {}
+    kind = a.get("kind") or source.get("kind") or brief.get("kind") or "opencode"
+    model = _bounded_text(a.get("model") or source.get("model") or brief.get("model"), 128)
+    if model:
+        block["model"] = model
+        route = _usage_route(kind, model)
+        if route:
+            block["route"] = route
+    return block
+
+
 def build_landed_event(a, cfg=None, result_path=None):
     """Build the canonical CloudEvents envelope for a persisted terminal attempt."""
     state = a.get("state")
@@ -384,7 +505,7 @@ def build_landed_event(a, cfg=None, result_path=None):
         value = _bounded_text(brief.get(key) if brief.get(key) is not None else a.get(key), 256)
         if value:
             data[key] = value
-    return {
+    event = {
         "specversion": "1.0",
         "id": event_id,
         "source": landed_source(cfg),
@@ -395,6 +516,10 @@ def build_landed_event(a, cfg=None, result_path=None):
         "dataschema": LANDED_EVENT_SCHEMA,
         "data": data,
     }
+    usage = _landed_usage(a, result_path)
+    if usage:
+        event[LANDED_USAGE_ATTR] = usage
+    return event
 
 
 def _landing_evidence(data):
