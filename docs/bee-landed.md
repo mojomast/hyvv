@@ -69,6 +69,87 @@ the same terminal observation addresses the same file. Without an explicit
 `data` object is closed; CloudEvents extension attributes belong at the envelope
 root, not inside `data`.
 
+### Usage extension attribute (`rizzstackusage`)
+
+Optionally, the envelope carries the attempt receipt's usage block as the
+CloudEvents extension attribute `rizzstackusage` (envelope root, sibling of
+`id`, `source`, `data`; never inside `data`). The launcher emits the attribute
+today, but nothing consumes it yet: no coordinator-side reader exists in the
+current stack. Two consumer changes are explicitly pending — the bundlebees
+envelope allowlist still has to learn `rizzstackusage`, and the orbitdesktop
+outbox source still has to cross to this event type — so until both land the
+attribute rides the event unread, and consumers that ignore unknown envelope
+attributes are unaffected.
+
+```json
+{
+  "specversion": "1.0",
+  "type": "rizzstack.bee.landed.v1",
+  "id": "urn:rizzstack:bee-landed:0123456789abcdef0123456789abcdef",
+  "rizzstackusage": {
+    "input": 120,
+    "output": 45,
+    "cache_read": 30,
+    "cache_write": 12,
+    "reasoning": 8,
+    "thinking": 5,
+    "total": 195,
+    "tool_calls": 7,
+    "stop_reason": "end_turn",
+    "model": "zoo:glm-5.3-flash",
+    "route": "zoo"
+  },
+  "data": { "schema": "rizzstack.bee-landed/1" }
+}
+```
+
+Schema evolution: `data` is closed under the frozen `rizzstack.bee-landed/1`
+schema, so a `usage` field inside `data` would be a breaking change requiring a
+new schema id and a repin of the canonical validator. The envelope-root extension
+attribute is the additive path the CloudEvents spec (and this document, above)
+already provides: consumers that ignore unknown attributes are unaffected, the
+`data` field set stays frozen, and no version bump or repin is needed.
+
+Attributes are optional and scrubbed:
+
+| Attribute | Source | Rule |
+| --- | --- | --- |
+| `input`, `output`, `cache_read`, `cache_write`, `reasoning`, `thinking`, `total` | the receipt's `observed.usage` (provider usage object or JSON string), normalized onto these canonical counts | numeric, non-negative integers under the magnitude bound: a count at or above 1,000,000,000 is refused (absent, never clamped — no single run consumes a billion tokens or issues a billion tool calls); a count the provider never reported is absent, never zero-filled (a zero the provider actually reported is kept) |
+| `tool_calls` | the receipt's `observed.tool_calls` | non-negative integer under the same magnitude bound, else absent |
+| `stop_reason` | the receipt's `observed.stop_reason` | at most 64 characters. A known launcher stop reason (`end_turn`, `max_tokens`, `stop_sequence`, `tool_use`, `tool_calls`, `content_filter`, `length`, `stop`, `error`, `timeout`, `aborted`, `cancelled`, `canceled`, `interrupted`, `refusal`, `unknown`, `other`) passes lowercased. Any other value must survive strict scrubbing: it is refused — the field stays absent — when the redactor would rewrite it or when it is a URL, a host/IP (IPv4 or IPv6, bare or bracketed), a host:port or a filesystem path |
+| `model` | the attempt model, then the receipt's `source.model` | identifier only. The value passes through the redactor and the same URL/path refusal: a value the redactor would rewrite, or one that looks like a URL, a host/IP (IPv4 or IPv6, bare or bracketed), a host:port or a filesystem path, is refused and the field stays absent, as is a dotted host shape — a run of dot-separated name segments whose final segment is a private-network suffix (`internal`, `local`, `lan`, `corp`, `home.arpa`) or an alpha-only top-level domain of two or more letters (a dotted version segment such as `v4.1` or `deepseek-v4.1-flash` is kept) |
+| `route` | provider path that served the run: `zoo` / `go` / `deepseek` from the model prefix or allow-list entry, `free` for keyless free-pool entries, `agy` for agy-cua | absent when it cannot be derived |
+
+Legacy receipt spellings are accepted as input and never emitted: each is
+mapped onto the canonical count it names, and the canonical name wins when both
+spellings appear in one usage object.
+
+| Legacy spelling (accepted as input only) | Emitted key |
+| --- | --- |
+| `input_tokens`, `prompt_tokens` | `input` |
+| `output_tokens`, `completion_tokens` | `output` |
+| `cache_read_tokens` | `cache_read` |
+| `cache_write_tokens`, `cache_creation_input_tokens` | `cache_write` |
+| `reasoning_tokens` | `reasoning` |
+| `thinking_tokens` | `thinking` |
+| `total_tokens` | `total` |
+
+Alias forms without separators (`inputTokens`, `cacheRead`) normalize the same
+way; the bare `input` / `output` / `total` shapes are themselves canonical.
+
+Everything else the receipt's usage block may carry — prompts or completion
+text, tool arguments, file lists, provider quota state, daily totals, local log
+paths, keys — is dropped here, never copied through. A receipt without at least
+one token count yields no attribute at all, so events for attempts without usage
+are byte-identical to the pre-usage shape.
+
+Idempotence is unchanged: the attribute lives outside the conflict evidence, the
+event id stays `(attempt_id, terminal state, transition)`, and a re-observed
+attempt returns the existing durable event whether or not the new observation
+carries usage. The outbox file is written once; the pending coordinator-side
+consumer will deduplicate by the attempt key, so a re-emitted event never
+double-counts.
+
 ### Field sources
 
 | Field | Source |
@@ -90,6 +171,7 @@ root, not inside `data`.
 | `result.artifact_sha256` | SHA-256 of the result artifact bytes; omitted when no artifact exists |
 | `result.reference` | logical `hyvv://attempts/<attempt_id>/result`, never a filesystem path; omitted when no artifact exists |
 | `correlation_id`, `causation_id` | `brief` or the attempt record, when present |
+| `rizzstackusage` | the receipt's scrubbed usage block (see above); absent without token counts |
 
 ## Idempotency and conflicts
 
@@ -113,8 +195,10 @@ The identity of a landed event is `(attempt_id, terminal state)`.
 `Launcher._set()` emits the event immediately after it persists a terminal
 attempt state. `_finish()` and the check-run controller write the result artifact
 before calling `_set()`, so a successful event normally carries the artifact
-hash. Failed and cancelled attempts may have no result artifact; their event has
-`result: {"available": false}` and no artifact fields.
+hash — and, when the receipt's `observed.usage` holds token counts, the
+`rizzstackusage` attribute. Failed and cancelled attempts may have no result
+artifact; their event has `result: {"available": false}` and no artifact fields
+(and no usage attribute unless their receipt recorded token counts).
 
 If the process dies after the journal says terminal but before the event is
 written, the next `Launcher` construction scans terminal journal entries and
@@ -171,14 +255,20 @@ returns `(delivered, total)`.
 
 The event only includes identifiers, state, the backend harness/model,
 `source_rev`, lease digests, repository-relative assigned file paths, and logical
-result references. It never includes the brief objective, prompt, tokens,
-provider keys, patches, logs, local paths, or `result.json` contents. Lease
-material is hashed, not embedded.
+result references. It never includes the brief objective, prompt text, provider
+keys, patches, logs, local paths, or `result.json` contents. Lease material is
+hashed, not embedded. The one exception is the `rizzstackusage` attribute, which
+adds only the scrubbed numeric counts and identity fields described above —
+`tool_calls`, a validated-or-refused `stop_reason`, and the model/route
+identity; every other part of the receipt's usage block (quota state, daily
+totals, local log paths, prompt or completion text) is dropped before the event
+is built.
 
 ## Tests
 
 ```
 python3 -m unittest tests.test_landing_events -v
+python3 -m pytest tests/test_bee_landed_usage.py -q
 ```
 
 When `WORKFLOW_SRC` names a pinned workflow checkout, every event is validated

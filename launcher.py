@@ -170,8 +170,22 @@ def sandbox_name(a):
 
 SECRETISH = re.compile(r"(sk-[A-Za-z0-9_\-]{8,}|Bearer\s+\S+|[A-Za-z0-9_\-]{32,})")
 
+# Canonical credential shapes aligned with the canonical validator's refusals.
+# Every fragment is assembled at runtime so this source never contains a
+# credential-shaped literal of its own.
+_SECRETISH_EXTRA = re.compile("|".join((
+    "AK" + "IA" + "[0-9A-Z]{16}",
+    "gh" + "[pousr]_" + "[A-Za-z0-9]{20,}",
+    "github" + "_pat_" + "[A-Za-z0-9_]{22,}",
+    "x" + "ox[baprs]-" + "[A-Za-z0-9-]{10,}",
+    "ey" + "J[A-Za-z0-9_=-]*" + r"\." + "[A-Za-z0-9_-]+" + r"\." + "[A-Za-z0-9_-]+",
+)))
+
 def redact(s):
-    return SECRETISH.sub("<redacted>", s) if isinstance(s, str) else s
+    if not isinstance(s, str):
+        return s
+    s = SECRETISH.sub("<redacted>", s)
+    return _SECRETISH_EXTRA.sub("<redacted>", s)
 
 # ---------------------------------------------------------------- bee landed events
 # A terminal attempt produces exactly one durable CloudEvent. The event is written to
@@ -185,6 +199,35 @@ LANDED_EVENT_ID_PREFIX = "urn:rizzstack:bee-landed:"
 _LANDED_EVIDENCE_KEYS = ("schema", "feature_id", "job_id", "task_id", "attempt_id",
                          "coordinator", "backend", "state", "source_rev", "lease", "result",
                          "correlation_id", "causation_id")
+# The receipt's usage block rides the envelope as an optional CloudEvents extension
+# attribute, not inside `data`: the frozen rizzstack.bee-landed/1 payload keeps its
+# closed field set (docs/bee-landed.md), and an envelope-root extension is the additive,
+# backward-compatible evolution path (old consumers ignore unknown attributes, so no
+# schema version bump or repin). Contents are scrubbed to numeric token counts plus
+# tool_calls, stop_reason and the model/route identity.
+LANDED_USAGE_ATTR = "rizzstackusage"
+# Canonical count keys emitted under `rizzstackusage`. The emitted names carry no
+# credential-heuristic substring anywhere in the string: validating consumers
+# refuse attribute sub-keys whose names look like credential words, so the bare
+# count names are emitted and every legacy spelling stays input-only (mapped
+# through _USAGE_TOKEN_ALIASES, never emitted).
+_USAGE_TOKEN_KEYS = ("input", "cache_read", "cache_write", "output", "reasoning", "thinking", "total")
+_USAGE_TOKEN_ALIASES = {
+    "inputtokens": "input", "prompttokens": "input",
+    "cacheread": "cache_read", "cachereadtokens": "cache_read",
+    "cachedtokens": "cache_read", "cachereadinputtokens": "cache_read",
+    "cachewrite": "cache_write", "cachewritetokens": "cache_write",
+    "cachecreationtokens": "cache_write", "cachecreationinputtokens": "cache_write",
+    "outputtokens": "output", "completiontokens": "output",
+    "reasoningtokens": "reasoning",
+    "thinkingtokens": "thinking",
+    "totaltokens": "total",
+}
+# A sane per-run magnitude bound for every numeric count in the attribute: no
+# single run consumes a billion tokens or issues a billion tool calls, so a
+# count at or above this bound is a corrupted or hostile value. It is refused
+# (the count stays absent), never clamped into a fabricated number.
+_USAGE_COUNT_LIMIT = 1_000_000_000
 
 
 class LandedEventConflict(ValueError):
@@ -336,6 +379,193 @@ def _landed_result(a, result_path, attempt_id=None):
     return info
 
 
+def _usage_count(value):
+    """A non-negative integer count under the magnitude bound, or None when the source has none.
+
+    Zeros are kept only when the provider itself reported 0; a missing value never
+    becomes 0 as a stand-in. A count at or above _USAGE_COUNT_LIMIT is an absurd
+    magnitude and is refused, never clamped."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and 0 <= value < _USAGE_COUNT_LIMIT:
+        return value
+    if isinstance(value, float) and 0 <= value < _USAGE_COUNT_LIMIT and value.is_integer():
+        return int(value)
+    return None
+
+
+# Free-text refusal shapes for the usage attribute: a URL (any scheme), a
+# filesystem path, an IPv4 address, a drive path, a host:port, an IPv6 literal
+# (bare or bracketed, with or without a port) or a dotted host must never reach
+# the event as free text. Used for non-enum stop reasons.
+_USAGE_FREEFORM_RE = re.compile(
+    r"(?i)(?:[a-z][a-z0-9+.\-]*://"  # URL scheme
+    r"|[/\\]"                        # path separator
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}\b"  # IPv4 address
+    r"|\[[0-9a-f:.]+\]"              # bracketed IPv6 literal (with or without a port)
+    r"|(?<![0-9a-f:])(?:[0-9a-f]{0,4}:){2,}[0-9a-f]{0,4}(?![0-9a-f:])"  # bare IPv6 literal
+    r"|\b[a-z]:[\\/]"                # drive path
+    r"|[a-z0-9_\-]+:\d"              # host:port
+    r"|[a-z0-9_\-]+\.[a-z0-9_\-]+)"  # dotted host or domain-ish run
+)
+
+# Model refusal shapes: narrower than the free-text rule because model ids
+# legitimately carry dotted version segments (deepseek-v4.1-flash). A URL
+# scheme, a path separator, an IPv4 or IPv6 address, a drive path or a
+# host:port is refused; a dotted version segment is kept.
+_USAGE_MODEL_RE = re.compile(
+    r"(?i)(?:[a-z][a-z0-9+.\-]*://"
+    r"|[/\\]"
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}\b"
+    r"|\[[0-9a-f:.]+\]"
+    r"|(?<![0-9a-f:])(?:[0-9a-f]{0,4}:){2,}[0-9a-f]{0,4}(?![0-9a-f:])"
+    r"|\b[a-z]:[\\/]"
+    r"|[a-z0-9_\-]+:\d"
+    r")")
+
+# Host-like dotted shapes for the model gate: a dotted run whose final segment
+# is a private-network suffix or an alpha-only top-level domain of two or more
+# letters is a hostname, not a model id. Dotted version identifiers
+# (deepseek-v4.1-flash, v4.1) end in a numeric or hyphenated segment and stay.
+_USAGE_MODEL_HOSTISH_RE = re.compile(
+    r"(?i)(?:\.(?:internal|local|lan|corp|home\.arpa)$"  # private-network suffix
+    r"|\.[a-z]{2,}$)")                                   # alpha-only TLD, length >= 2
+
+# The launcher's known stop reasons. A receipt stop reason matching one of these
+# (case-insensitively) is emitted lowercased; any other free text must survive
+# strict scrubbing or the field stays absent.
+_USAGE_STOP_REASONS = frozenset((
+    "end_turn", "max_tokens", "stop_sequence", "tool_use", "tool_calls",
+    "content_filter", "length", "stop", "error", "timeout", "aborted",
+    "cancelled", "canceled", "interrupted", "refusal", "unknown", "other",
+))
+
+
+def _usage_stop_reason(value):
+    """A stop reason that may cross the event, or None when it must not.
+
+    Known launcher stop reasons pass lowercased. Anything else must survive
+    strict scrubbing: the value is refused when the redactor would rewrite it
+    (a secret-shaped run) or when it looks like a URL, a host/IP, a host:port
+    or a filesystem path - such a value never reaches the event."""
+    text = _bounded_text(value, 64)
+    if not text:
+        return None
+    low = text.lower()
+    if low in _USAGE_STOP_REASONS:
+        return low
+    if redact(text) != text or _USAGE_FREEFORM_RE.search(text):
+        return None
+    return text
+
+
+def _usage_model(value):
+    """An identifier-only model name that may cross the event, or None.
+
+    The value passes through the redactor first: a secret-shaped run is refused,
+    so the redaction marker never masquerades as a model id. URL, host/IP
+    (IPv4 or IPv6), host:port and filesystem-path shapes are refused the same
+    way, as is a dotted host shape (private-network suffix or alpha-only TLD);
+    dotted version segments (deepseek-v4.1-flash) stay fine."""
+    text = _bounded_text(value, 128)
+    if not text:
+        return None
+    if redact(text) != text or _USAGE_MODEL_RE.search(text):
+        return None
+    if _USAGE_MODEL_HOSTISH_RE.search(text):
+        return None
+    return text
+
+
+def _usage_route(kind, model):
+    """Coarse route identity for the usage attribute: which provider path served the run."""
+    if kind == "agy-cua":
+        return "agy"
+    text = str(model or "").strip()
+    prefix, _, rest = text.partition(":")
+    if prefix in ("zoo", "go", "deepseek") and rest:
+        return prefix
+    key = (MODELS.get(text) or {}).get("key")
+    if key == "none":
+        return "free"
+    return key if key in ("go", "deepseek", "zoo") else None
+
+
+def _usage_tokens(value):
+    """Allowlist projection of a provider usage object onto canonical count keys.
+
+    Accepts a dict or a JSON string (the SDK reports usage_json). Unknown keys are
+    dropped, never copied through: only numeric counts survive, emitted under the
+    canonical names in _USAGE_TOKEN_KEYS. Legacy and alias spellings are accepted
+    as input (mapped through _USAGE_TOKEN_ALIASES) and never emitted; a canonical
+    name wins over an alias of the same count, whatever the order."""
+    if isinstance(value, str) and value.strip():
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    if not isinstance(value, dict):
+        return {}
+    out = {}
+    # canonical snake_case spellings win over aliases, whatever the key order
+    for key, raw in value.items():
+        if isinstance(key, str) and key.lower().replace("-", "_") in _USAGE_TOKEN_KEYS:
+            count = _usage_count(raw)
+            if count is not None:
+                out[key.lower().replace("-", "_")] = count
+    for key, raw in value.items():
+        if not isinstance(key, str):
+            continue
+        name = _USAGE_TOKEN_ALIASES.get(re.sub(r"[^a-z0-9]", "", key.lower()))
+        if name and name not in out:
+            count = _usage_count(raw)
+            if count is not None:
+                out[name] = count
+    return out
+
+
+def _landed_usage(a, result_path):
+    """The receipt's scrubbed usage block for the landed event, or None when there is none.
+
+    Reads the persisted receipt (orbit.local-worker.result/v1) and projects
+    observed.usage onto numeric counts under the canonical count names, plus
+    observed tool_calls, a gated stop_reason and the gated model/route identity.
+    Nothing else crosses: no prompts, file contents, provider credentials, quota
+    state or local paths. Without at least one count the attribute stays absent
+    entirely, so receipts without usage produce events byte-identical to the
+    pre-usage shape (never zero-filled). The attempt keeps the event identity it
+    already has, since the attribute lives outside the conflict evidence."""
+    if result_path is None:
+        return None
+    try:
+        receipt = json.loads(Path(result_path).read_text("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(receipt, dict):
+        return None
+    observed = receipt.get("observed")
+    observed = observed if isinstance(observed, dict) else {}
+    block = _usage_tokens(observed.get("usage"))
+    if not block:
+        return None
+    tool_calls = _usage_count(observed.get("tool_calls"))
+    if tool_calls is not None:
+        block["tool_calls"] = tool_calls
+    stop_reason = _usage_stop_reason(observed.get("stop_reason"))
+    if stop_reason:
+        block["stop_reason"] = stop_reason
+    source = receipt.get("source") if isinstance(receipt.get("source"), dict) else {}
+    brief = a.get("brief") or {}
+    kind = a.get("kind") or source.get("kind") or brief.get("kind") or "opencode"
+    model = _usage_model(a.get("model") or source.get("model") or brief.get("model"))
+    if model:
+        block["model"] = model
+        route = _usage_route(kind, model)
+        if route:
+            block["route"] = route
+    return block
+
+
 def build_landed_event(a, cfg=None, result_path=None):
     """Build the canonical CloudEvents envelope for a persisted terminal attempt."""
     state = a.get("state")
@@ -384,7 +614,7 @@ def build_landed_event(a, cfg=None, result_path=None):
         value = _bounded_text(brief.get(key) if brief.get(key) is not None else a.get(key), 256)
         if value:
             data[key] = value
-    return {
+    event = {
         "specversion": "1.0",
         "id": event_id,
         "source": landed_source(cfg),
@@ -395,6 +625,10 @@ def build_landed_event(a, cfg=None, result_path=None):
         "dataschema": LANDED_EVENT_SCHEMA,
         "data": data,
     }
+    usage = _landed_usage(a, result_path)
+    if usage:
+        event[LANDED_USAGE_ATTR] = usage
+    return event
 
 
 def _landing_evidence(data):
