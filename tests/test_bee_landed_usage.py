@@ -41,6 +41,25 @@ PRIVATE_MODEL_PATH = "/" + "home" + "/" + "me" + "/" + "models" + "/" + "weights
 MODEL_URL = "https://" + "models" + "." + "internal" + "/serve"
 IP_LITERAL = "10" + "." + "0" + "." + "0" + "." + "1"
 HOST_PORT = PRIVATE_HOST + ":" + "9000"
+# IPv6 literals, bare and bracketed, assembled from fragments.
+IPV6_BARE = ":".join(["2001", "db8", "", "1"])
+IPV6_LOOPBACK = ":".join(["", "", "1"])
+IPV6_LINK_LOCAL = ":".join(["fe80", "", "1"])
+IPV6_BRACKETED = "[" + IPV6_BARE + "]"
+IPV6_BRACKETED_PORT = "[" + IPV6_BARE + "]" + ":" + "8080"
+# Host-like dotted shapes for the model gate, assembled from fragments.
+DOT_HOST_LAN = "db" + "." + "prod" + "." + "lan"
+DOT_HOST_LOCAL = "my" + "." + "host" + "." + "local"
+DOT_HOST_CORP = "srv" + "." + "corp"
+DOT_HOST_ARPA = "box" + "." + "home" + "." + "arpa"
+DOT_TLD = "api" + "." + "example" + "." + "com"
+# Canonical credential shapes, assembled from fragments.
+GH_CLASSIC = "gh" + "p_" + "a" * 20
+GH_APP = "gh" + "s_" + "b" * 24
+GH_FINE = "github" + "_pat_" + "c" * 22
+AWS_KEY = "AK" + "IA" + "A1B2" * 4
+SLACK = "x" + "ox" + "b-" + "d" * 12
+JWT_TRIPLE = "ey" + "J" + "e" * 10 + "." + "ey" + "J" + "f" * 10 + "." + "g" * 20
 
 
 def manifest(aid=AID, observed=None, source=None):
@@ -253,6 +272,25 @@ class Scrubbing(unittest.TestCase):
         self.assertIsNone(L._usage_model(None))
         self.assertIsNone(L._usage_model(""))
 
+    def test_stop_reason_gate_refuses_ipv6_literals(self):
+        # the docs promise host/IP refusal: bare and bracketed IPv6 literals are hosts
+        for value in (IPV6_BARE, IPV6_LOOPBACK, IPV6_LINK_LOCAL, IPV6_BRACKETED, IPV6_BRACKETED_PORT):
+            self.assertIsNone(L._usage_stop_reason(value))
+
+    def test_model_gate_refuses_ipv6_literals_and_dotted_hosts(self):
+        for value in (IPV6_BARE, IPV6_LOOPBACK, IPV6_LINK_LOCAL, IPV6_BRACKETED, IPV6_BRACKETED_PORT):
+            self.assertIsNone(L._usage_model(value))
+        for host in (PRIVATE_HOST, DOT_HOST_LAN, DOT_HOST_LOCAL, DOT_HOST_CORP, DOT_HOST_ARPA, DOT_TLD):
+            self.assertIsNone(L._usage_model(host))
+        # dotted version identifiers stay fine
+        for mid in ("deepseek-v4.1-flash", "v4.1", "claude-3.5-sonnet", "gemini-4.1"):
+            self.assertEqual(L._usage_model(mid), mid)
+
+    def test_redactor_matches_the_canonical_secret_shapes(self):
+        # every canonical credential shape is rewritten, so the gates refuse it
+        for value in (GH_CLASSIC, GH_APP, GH_FINE, AWS_KEY, SLACK, JWT_TRIPLE):
+            self.assertEqual(L.redact(value), "<redacted>")
+
     def test_route_identity(self):
         self.assertEqual(L._usage_route("opencode", "zoo:glm-5.3-flash"), "zoo")
         self.assertEqual(L._usage_route("opencode", "go:deepseek-v4.1-flash"), "go")
@@ -349,6 +387,52 @@ class LeakScrubbing(UsageBase):
         usage = self.events(la)[0][USAGE_ATTR]
         self.assertEqual(usage["model"], "go:deepseek-v4.1-flash")
         self.assertEqual(usage["route"], "go")
+
+    def test_ipv6_stop_reason_never_reaches_the_event(self):
+        la = self.mk()
+        a = self.add(la)
+        self.write_receipt(la, manifest(observed={
+            "status": "completed", "stop_reason": IPV6_BRACKETED_PORT, "tool_calls": 1,
+            "usage": {"input": 5, "output": 2}}))
+        la._set(a, "succeeded", "done")
+
+        blob = json.dumps(self.events(la)[0])
+        usage = json.loads(blob)[USAGE_ATTR]
+        self.assertNotIn("stop_reason", usage)
+        self.assertNotIn(IPV6_BRACKETED_PORT, blob)
+        self.assertNotIn(IPV6_BARE, blob)
+
+    def test_ipv6_and_dotted_host_source_model_never_reach_the_event(self):
+        for hostile in (IPV6_BARE, PRIVATE_HOST):
+            la = self.mk(data_dir=tempfile.mkdtemp(prefix="landed-scrub-host-"))
+            a = self.add(la, model=None)
+            self.write_receipt(la, manifest(
+                source={"project": "p", "kind": "opencode", "model": hostile, "launcher": "test"},
+                observed={"status": "completed", "usage": {"input": 5, "output": 2}}))
+            la._set(a, "succeeded", "done")
+            blob = json.dumps(self.events(la)[0])
+            usage = json.loads(blob)[USAGE_ATTR]
+            self.assertNotIn("model", usage)
+            self.assertNotIn("route", usage)
+            self.assertNotIn(hostile, blob)
+
+    def test_canonical_secret_shapes_never_reach_the_event(self):
+        # the producer must refuse these itself; the canonical consumer does
+        for hostile, field in ((JWT_TRIPLE, "stop_reason"), (GH_CLASSIC, "model")):
+            la = self.mk(data_dir=tempfile.mkdtemp(prefix="landed-scrub-cred-"))
+            a = self.add(la, model=None if field == "model" else "deepseek-v4.1-flash")
+            observed = {"status": "completed", "usage": {"input": 5, "output": 2}}
+            source = {"project": "p", "kind": "opencode", "model": hostile, "launcher": "test"}
+            if field == "stop_reason":
+                observed["stop_reason"] = hostile
+            self.write_receipt(la, manifest(source=source, observed=observed))
+            la._set(a, "succeeded", "done")
+            blob = json.dumps(self.events(la)[0])
+            usage = json.loads(blob)[USAGE_ATTR]
+            self.assertNotIn(field, usage)
+            if field == "model":
+                self.assertNotIn("route", usage)
+            self.assertNotIn(hostile, blob)
 
     def test_absurd_count_magnitudes_are_refused_in_the_event(self):
         la = self.mk()

@@ -170,8 +170,22 @@ def sandbox_name(a):
 
 SECRETISH = re.compile(r"(sk-[A-Za-z0-9_\-]{8,}|Bearer\s+\S+|[A-Za-z0-9_\-]{32,})")
 
+# Canonical credential shapes aligned with the canonical validator's refusals.
+# Every fragment is assembled at runtime so this source never contains a
+# credential-shaped literal of its own.
+_SECRETISH_EXTRA = re.compile("|".join((
+    "AK" + "IA" + "[0-9A-Z]{16}",
+    "gh" + "[pousr]_" + "[A-Za-z0-9]{20,}",
+    "github" + "_pat_" + "[A-Za-z0-9_]{22,}",
+    "x" + "ox[baprs]-" + "[A-Za-z0-9-]{10,}",
+    "ey" + "J[A-Za-z0-9_=-]*" + r"\." + "[A-Za-z0-9_-]+" + r"\." + "[A-Za-z0-9_-]+",
+)))
+
 def redact(s):
-    return SECRETISH.sub("<redacted>", s) if isinstance(s, str) else s
+    if not isinstance(s, str):
+        return s
+    s = SECRETISH.sub("<redacted>", s)
+    return _SECRETISH_EXTRA.sub("<redacted>", s)
 
 # ---------------------------------------------------------------- bee landed events
 # A terminal attempt produces exactly one durable CloudEvent. The event is written to
@@ -381,12 +395,15 @@ def _usage_count(value):
 
 
 # Free-text refusal shapes for the usage attribute: a URL (any scheme), a
-# filesystem path, an IPv4 address, a drive path, a host:port or a dotted host
-# must never reach the event as free text. Used for non-enum stop reasons.
+# filesystem path, an IPv4 address, a drive path, a host:port, an IPv6 literal
+# (bare or bracketed, with or without a port) or a dotted host must never reach
+# the event as free text. Used for non-enum stop reasons.
 _USAGE_FREEFORM_RE = re.compile(
     r"(?i)(?:[a-z][a-z0-9+.\-]*://"  # URL scheme
     r"|[/\\]"                        # path separator
     r"|\b\d{1,3}(?:\.\d{1,3}){3}\b"  # IPv4 address
+    r"|\[[0-9a-f:.]+\]"              # bracketed IPv6 literal (with or without a port)
+    r"|(?<![0-9a-f:])(?:[0-9a-f]{0,4}:){2,}[0-9a-f]{0,4}(?![0-9a-f:])"  # bare IPv6 literal
     r"|\b[a-z]:[\\/]"                # drive path
     r"|[a-z0-9_\-]+:\d"              # host:port
     r"|[a-z0-9_\-]+\.[a-z0-9_\-]+)"  # dotted host or domain-ish run
@@ -394,15 +411,25 @@ _USAGE_FREEFORM_RE = re.compile(
 
 # Model refusal shapes: narrower than the free-text rule because model ids
 # legitimately carry dotted version segments (deepseek-v4.1-flash). A URL
-# scheme, a path separator, an IPv4 address, a drive path or a host:port is
-# refused; a dotted version segment is kept.
+# scheme, a path separator, an IPv4 or IPv6 address, a drive path or a
+# host:port is refused; a dotted version segment is kept.
 _USAGE_MODEL_RE = re.compile(
     r"(?i)(?:[a-z][a-z0-9+.\-]*://"
     r"|[/\\]"
     r"|\b\d{1,3}(?:\.\d{1,3}){3}\b"
+    r"|\[[0-9a-f:.]+\]"
+    r"|(?<![0-9a-f:])(?:[0-9a-f]{0,4}:){2,}[0-9a-f]{0,4}(?![0-9a-f:])"
     r"|\b[a-z]:[\\/]"
     r"|[a-z0-9_\-]+:\d"
     r")")
+
+# Host-like dotted shapes for the model gate: a dotted run whose final segment
+# is a private-network suffix or an alpha-only top-level domain of two or more
+# letters is a hostname, not a model id. Dotted version identifiers
+# (deepseek-v4.1-flash, v4.1) end in a numeric or hyphenated segment and stay.
+_USAGE_MODEL_HOSTISH_RE = re.compile(
+    r"(?i)(?:\.(?:internal|local|lan|corp|home\.arpa)$"  # private-network suffix
+    r"|\.[a-z]{2,}$)")                                   # alpha-only TLD, length >= 2
 
 # The launcher's known stop reasons. A receipt stop reason matching one of these
 # (case-insensitively) is emitted lowercased; any other free text must survive
@@ -436,13 +463,16 @@ def _usage_model(value):
     """An identifier-only model name that may cross the event, or None.
 
     The value passes through the redactor first: a secret-shaped run is refused,
-    so the redaction marker never masquerades as a model id. URL, host/IP,
-    host:port and filesystem-path shapes are refused the same way; dotted
-    version segments (deepseek-v4.1-flash) stay fine."""
+    so the redaction marker never masquerades as a model id. URL, host/IP
+    (IPv4 or IPv6), host:port and filesystem-path shapes are refused the same
+    way, as is a dotted host shape (private-network suffix or alpha-only TLD);
+    dotted version segments (deepseek-v4.1-flash) stay fine."""
     text = _bounded_text(value, 128)
     if not text:
         return None
     if redact(text) != text or _USAGE_MODEL_RE.search(text):
+        return None
+    if _USAGE_MODEL_HOSTISH_RE.search(text):
         return None
     return text
 
