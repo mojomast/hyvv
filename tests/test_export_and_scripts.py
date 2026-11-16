@@ -72,8 +72,8 @@ class SourceRev(unittest.TestCase):
             rev2, _ = launcher.export_project(pc, source_rev=new, branch="../evil")
             self.assertEqual(rev2, new)
 
-    def test_cap_is_ten(self):
-        self.assertEqual(launcher.MAX_WORKERS, 10)
+    def test_cap_is_fourteen(self):
+        self.assertEqual(launcher.MAX_WORKERS, 14)
         self.assertNotIn("jev-1.13-free", launcher.FREE_POOL); self.assertEqual(len(launcher.FREE_POOL), 9)
         for m in launcher.FREE_POOL: self.assertLessEqual(launcher.MODELS[m]["max_prompt_chars"], 300_000)
 

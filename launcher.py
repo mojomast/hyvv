@@ -36,7 +36,7 @@ if _landing_export is None:  # pragma: no cover - loaded from a sibling copy
 
 VERSION = "0.1.17"
 HEARTBEAT_S = 60  # controller emits a heartbeat event after this many quiet seconds
-MAX_WORKERS = 10  # hard ceiling for max_concurrent
+MAX_WORKERS = 14  # hard ceiling for max_concurrent (owner directive: final ceiling, supersedes the interim cap-12)
 TERMINAL = {"succeeded", "failed", "cancelled"}
 GO_BASE_URL = "https://opencode.ai/inference/go/openai/v1"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"  # official OpenAI-compatible endpoint
@@ -72,7 +72,7 @@ _DEEPSEEK_FLASH = {"model": "deepseek-flash", "base_url": DEEPSEEK_BASE_URL, "wi
 _GO_FLASH = {"model": "deepseek-v4.1-flash", "base_url": GO_BASE_URL, "wire": "openai-chat", "key": "go"}
 # Zoo gateway, free GLM 5.3 Flash pass. `zoo/glm-5.3-flash` is the free model; `zai/glm-5.3-flash`
 # is the paid one, so the id matters. 16 concurrent runs are clean and 20 is the edge, which the
-# launcher's own MAX_WORKERS=10 ceiling sits well under. Thinking is always on and spends the
+# launcher's MAX_WORKERS=14 ceiling sits well under. Thinking is always on and spends the
 # output budget FIRST, so callers must allow at least 4096 output tokens (8192 for coding); any
 # max_tokens below 1024 is silently raised to 1024 by the gateway. Streaming usage is always
 # zeros, so metrics must come from non-stream usage or an estimate. DeepSeek official flash is the
