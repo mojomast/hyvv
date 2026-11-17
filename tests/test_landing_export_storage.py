@@ -238,6 +238,100 @@ class RetainedFiles(unittest.TestCase):
             self.assertEqual([(r["event_id"], r["cursor"]) for r in rows], [("row-1", 2), ("new-id", 4)])
 
 
+class NotifierRegistration(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        transport = mock.patch.object(L, "notify_landed_event", return_value=True)
+        self.notify = transport.start()
+        self.addCleanup(transport.stop)
+
+    def test_replay_requires_prior_registration_and_rejects_divergence(self):
+        original = store(self.root, "one")
+        index = E.export_index_path(self.root)
+        with self.assertRaises(OSError):
+            L.replay_landed_events(self.root)
+        self.assertFalse(index.exists())
+        E.register_landed_file(self.root)
+        before = index.read_bytes()
+        store(self.root, "alias", event_id="one", label="different")
+        for remove in (False, True):
+            if remove:
+                original.unlink()
+            with self.assertRaises(L.LandedEventConflict):
+                L.replay_landed_events(self.root)
+            self.assertEqual(index.read_bytes(), before)
+        index.write_bytes(b"bad index")
+        with self.assertRaises(OSError):
+            L.replay_landed_events(self.root)
+        self.notify.assert_not_called()
+
+    def test_replay_sends_verified_objects_across_pages_once_per_position(self):
+        first = store(self.root, "one")
+        second = store(self.root, "two", timestamp=2)
+        expected = [json.loads(p.read_bytes()) for p in (first, second)]
+        E.register_landed_file(self.root)
+        first.write_bytes(first.read_bytes() + b"\n")
+        store(self.root, "alias", event_id="one", timestamp=3)
+        cfg = {"launcher_id": "fixture"}
+        with mock.patch.object(E, "DEFAULT_LIMIT", 1):
+            self.assertEqual(L.replay_landed_events(self.root, cfg), (2, 2))
+        self.assertEqual(self.notify.call_args_list, [mock.call(event, cfg, None) for event in expected])
+
+    def test_redelivery_does_not_reopen_verified_files(self):
+        store(self.root, "one")
+        second = store(self.root, "two", timestamp=2)
+        pinned = json.loads(second.read_bytes())
+        E.register_landed_file(self.root)
+
+        def deliver(event, cfg, notifier):
+            if event["id"] == "one":
+                store(self.root, "two", timestamp=2, label="changed after page read")
+            return True
+
+        self.notify.side_effect = deliver
+        self.assertEqual(L.replay_landed_events(self.root), (2, 2))
+        self.assertEqual(self.notify.call_args.args[0], pinned)
+        with self.assertRaises(L.LandedEventConflict):
+            L.replay_landed_events(self.root)
+        self.assertEqual(self.notify.call_count, 2)
+
+    def test_fresh_publication_signals_only_after_matching_registration(self):
+        attempt = {"attempt_id": "att_native", "kind": "check", "state": "succeeded", "updated_at": 100,
+                   "brief": {"source_rev": "a" * 40}}
+        cfg = {"launcher_id": "fixture"}
+        with mock.patch.object(E, "_write_index", side_effect=OSError("unavailable")):
+            path, event, created = L.emit_landed_record(attempt, self.root, cfg)
+        self.assertTrue(created)
+        self.assertEqual(json.loads(path.read_bytes()), event)
+        with self.assertRaises(OSError):
+            L.replay_landed_events(self.root, cfg)
+        self.notify.assert_not_called()
+
+        _, fresh, created = L.emit_landed_record(dict(attempt, attempt_id="att_fresh"), self.root, cfg)
+        self.assertTrue(created)
+        self.notify.assert_called_once_with(fresh, cfg)
+        self.assertEqual(L.replay_landed_events(self.root, cfg), (2, 2))
+        self.assertCountEqual([call.args[0] for call in self.notify.call_args_list[1:]], [event, fresh])
+
+    def test_publication_registration_gap_cannot_signal_an_unpinned_value(self):
+        attempt = {"attempt_id": "att_native", "kind": "check", "state": "succeeded", "updated_at": 100,
+                   "brief": {"source_rev": "a" * 40}}
+        register = E.register_landed_file
+
+        def replace_then_register(outbox, **kwargs):
+            path, = outbox.glob("*.json")
+            changed = dict(json.loads(path.read_bytes()), subject="changed")
+            path.write_text(json.dumps(changed), encoding="utf-8")
+            return register(outbox, **kwargs)
+
+        with mock.patch.object(E, "register_landed_file", replace_then_register), self.assertRaises(L.LandedEventConflict):
+            L.emit_landed_record(attempt, self.root)
+        self.notify.assert_not_called()
+        self.assertFalse(E.export_index_path(self.root).exists())
+
+
 class JournalAck(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()

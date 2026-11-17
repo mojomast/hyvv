@@ -230,6 +230,11 @@ def _normalize_after(after):
     return value
 
 
+def _canonical_digest(event):
+    canonical = json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(canonical + b"\n").hexdigest()
+
+
 def _read_row(path: Path):
     try:
         if not stat.S_ISREG(path.lstat().st_mode):
@@ -255,14 +260,9 @@ def _read_row(path: Path):
     event_id = event_id.strip()
     if not event_id:
         return None
-    canonical = (
-        json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-        .encode("utf-8")
-        + b"\n"
-    )
     return {
         "event_id": event_id,
-        "sha256": hashlib.sha256(canonical).hexdigest(),
+        "sha256": _canonical_digest(event),
         "file_sha256": hashlib.sha256(raw).hexdigest(),
         "event": event,
     }
@@ -440,7 +440,7 @@ def _pin_conflicting_prefix(source, index, position, first_new):
                      head_position=position, next_position=position + 1))
 
 
-def _reconcile(source, index, *, use_hints=True):
+def _reconcile(source, index, *, use_hints=True, registered_only=False):
     """Append discovered IDs and locate retained files. Never open a path from the index."""
     by_id = {entry["event_id"]: entry for entry in index["events"]}
     by_name = {entry["file"][0]: entry for entry in index["events"] if "file" in entry}
@@ -461,6 +461,8 @@ def _reconcile(source, index, *, use_hints=True):
         event_id = row["event_id"]
         entry = by_id.get(event_id)
         if entry is None:
+            if registered_only:
+                raise OSError("notifier replay requires an existing landing registration")
             position = index["next_position"]
             entry = {"event_id": event_id, "position": position, "sha256": row["sha256"]}
             index["events"].append(entry)
@@ -487,7 +489,7 @@ def _reconcile(source, index, *, use_hints=True):
     return retained, changed
 
 
-def register_landed_file(source, path=None):
+def register_landed_file(source, path=None, *, expected_event=None):
     """Register a durable outbox file in append order.
 
     Called by the launcher immediately after an outbox file is persisted.  The
@@ -498,19 +500,29 @@ def register_landed_file(source, path=None):
     index_file = export_index_path(source)
     with _index_lock(source):
         index = _load_index(index_file)
-        _, changed = _reconcile(source, index)
+        retained, changed = _reconcile(source, index)
+        if expected_event is not None:
+            # Do not authorize a fresh signal when discovery observed other
+            # content (or no retained copy) in the publication/registration gap.
+            event_id = expected_event["id"]
+            if event_id not in retained:
+                raise OSError("published landing event missing at registration")
+            entry = next(e for e in index["events"] if e["event_id"] == event_id)
+            if entry["sha256"] != _canonical_digest(expected_event):
+                raise LandingContentConflict(entry["position"])
         if changed:
             _write_index(index_file, index)
 
 
-def export_events(source, after=None, limit=None):
+def export_events(source, after=None, limit=None, *, registered_only=False):
     """Return one bounded, restart-stable page of the durable canonical outbox.
 
     ``after`` is the last scalar export position the caller already consumed.
     Positions are independent of canonical event ids and are compared with a
     strict "greater than" rule.  A cursor beyond the durable head, a malformed
     cursor, and a pre-migration event-id/hash cursor are explicit errors; an
-    unknown cursor is never answered with an empty 200 page.
+    unknown cursor is never answered with an empty 200 page. Notifier replay
+    uses ``registered_only``: redelivery cannot establish a missing commitment.
     """
     after_position = _normalize_after(after)
     page_limit = _normalize_limit(limit)
@@ -521,7 +533,7 @@ def export_events(source, after=None, limit=None):
         for use_hints in (True, False):
             index = _load_index(index_file)
             first_new = index["next_position"]
-            retained, changed = _reconcile(source, index, use_hints=use_hints)
+            retained, changed = _reconcile(source, index, use_hints=use_hints, registered_only=registered_only)
             try:
                 page = _read_page(index, retained, after_position, page_limit)
             except LandingContentConflict as ex:

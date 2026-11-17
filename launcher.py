@@ -704,17 +704,18 @@ def _fsync_dir(path, *, required=False):
         os.close(fd)
 
 
-def _register_landed_file(outbox):
-    """Best-effort index registration after the immutable outbox file is durable."""
+def _register_landed_file(outbox, *, expected_event=None):
+    """A registration failure leaves the file for recovery, but cannot authorize delivery."""
     if _landing_export is None:
-        return
+        return False
     try:
-        _landing_export.register_landed_file(outbox)
+        _landing_export.register_landed_file(outbox, expected_event=expected_event)
+        return True
     except _landing_export.LandingContentConflict as ex:
         raise LandedEventConflict(str(ex)) from ex
     except Exception:
         # The next export scans the outbox and registers an unindexed file.
-        pass
+        return False
 
 
 _WINDOWS_LANDED_NAMES = os.name == "nt"
@@ -893,28 +894,31 @@ def emit_landed_record(a, data_dir, cfg=None, result_path=None):
             break
         else:
             path, stored, created = _persist_landed_event(outbox, event, event["id"])
-    _register_landed_file(outbox)
-    if created:
+    registered = _register_landed_file(outbox, expected_event=stored if created else None)
+    if created and registered:
         notify_landed_event(stored, cfg)
     return path, stored, created
 
 
 def replay_landed_events(data_dir, cfg=None, notifier=None):
-    """Re-signal every durable outbox event (at-least-once). Returns (delivered, total)."""
-    outbox = _landed_outbox(data_dir)
+    """Re-signal retained, pinned events in position order. Returns (delivered, total)."""
+    if _landing_export is None:
+        raise OSError("notifier replay requires the landing index")
+    after = None
     delivered = total = 0
-    try:
-        paths = sorted(outbox.glob("*.json"))
-    except OSError:
-        paths = []
-    for path in paths:
+    while True:
         try:
-            event = json.loads(path.read_text("utf-8"))
-        except (OSError, ValueError):
-            continue
-        total += 1
-        delivered += 1 if notify_landed_event(event, cfg, notifier) else 0
-    return delivered, total
+            page = _landing_export.export_events(data_dir, after=after, registered_only=True)
+        except _landing_export.LandingContentConflict as ex:
+            raise LandedEventConflict(str(ex)) from ex
+        for row in page["events"]:
+            # Send exactly the verified object; never reopen a filename after
+            # the exporter releases the index lock.
+            total += 1
+            delivered += 1 if notify_landed_event(row["event"], cfg, notifier) else 0
+        if not page["has_more"]:
+            return delivered, total
+        after = page["next_cursor"]
 
 
 def load_config(path):
