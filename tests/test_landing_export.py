@@ -68,7 +68,7 @@ class ExportModule(unittest.TestCase):
         return save_event(self.data_dir, aid, **kwargs)
 
     def test_exports_persisted_canonical_events_with_content_and_file_identity(self):
-        paths = [self.add(f"att_export000{i}")[0] for i in range(3)]
+        paths = {event["id"]: path for path, event in (self.add(f"att_export000{i}") for i in range(3))}
         outbox = self.data_dir / "events" / "outbox"
 
         (outbox / "broken.json").write_text("{not json", "utf-8")
@@ -87,7 +87,7 @@ class ExportModule(unittest.TestCase):
 
         self.assertEqual([row["cursor"] for row in body["events"]], [1, 2, 3])
         for row in body["events"]:
-            raw = (outbox / f"{row['event_id']}.json").read_bytes()
+            raw = paths[row["event_id"]].read_bytes()
             canonical = (
                 json.dumps(row["event"], sort_keys=True, separators=(",", ":"), ensure_ascii=True)
                 .encode("utf-8") + b"\n"

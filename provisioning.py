@@ -34,7 +34,7 @@ import re
 import socket
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Iterator, Mapping
 
@@ -526,8 +526,6 @@ class Provisioner:
     git: Callable[..., subprocess.CompletedProcess] = default_git
     credential: Callable[[str], str | None] = lambda repo: None
     url_for: Callable[[str], str] = lambda repo: f"https://github.com/{repo}.git"
-    _remotes: dict[str, str] = field(default_factory=dict)
-    _transport: dict[str, str] = field(default_factory=dict)
     now: Callable[[], float] = time.time
     lock_stale_after: float = 300.0
 
@@ -609,7 +607,7 @@ class Provisioner:
         if target.exists():
             record["state"] = "preparing"
             self.journal.write(key, record)
-            self._verify_checkout(target, identity["repo"], identity["source_rev"])
+            self._verify_checkout(target, identity["repo"], identity["source_rev"], profile)
         else:
             record["state"] = "preparing"
             self.journal.write(key, record)
@@ -659,7 +657,7 @@ class Provisioner:
             reasons.append("the workspace is missing")
         elif workspace and profile is not None:
             try:
-                self._verify_checkout(Path(workspace), repo, source_rev)
+                self._verify_checkout(Path(workspace), repo, source_rev, profile)
             except ProvisionError as exc:
                 reasons.append(exc.message)
 
@@ -671,16 +669,14 @@ class Provisioner:
 
     # -- steps --------------------------------------------------------------
 
-    def _clone(self, target: Path, repo: str, source_rev: str, profile: "Profile | None" = None) -> None:
+    def _clone(self, target: Path, repo: str, source_rev: str, profile: Profile) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         if is_reparse_point(target.parent):
             raise ProvisionError("reparse_point", f"{target.parent} is a reparse point", "Refusing to clone through a link.")
         if self.credential(repo) is None:
             raise ProvisionError("credential_unavailable", f"the host has no credential for {repo}", "Configure a repository-scoped read-only credential on the worker host.")
-        mirror = profile.mirror_for(repo) if profile is not None else None
+        mirror = profile.mirror_for(repo)
         url = mirror or self.url_for(repo)
-        self._remotes[str(target)] = url
-        self._transport[str(target)] = "mirror" if mirror else "origin"
         done = self.git(["clone", "--no-checkout", "--filter=blob:none", url, str(target)], None)
         if done.returncode != 0:
             raise ProvisionError("clone_failed", _tail(done), "Check the repository and host credentials.")
@@ -700,10 +696,10 @@ class Provisioner:
         checkout = self.git(["-C", str(target), "checkout", "--detach", source_rev], None)
         if checkout.returncode != 0:
             raise ProvisionError("checkout_failed", _tail(checkout), "Verify the pinned revision exists in the repository.")
-        self._verify_checkout(target, repo, source_rev)
+        self._verify_checkout(target, repo, source_rev, profile)
 
-    def _verify_checkout(self, target: Path, repo: str, source_rev: str) -> None:
-        ensure_contained(Path(self._root_for(target)), target)
+    def _verify_checkout(self, target: Path, repo: str, source_rev: str, profile: Profile) -> None:
+        ensure_contained(Path(profile.workspace_root), target)
         head = self.git(["-C", str(target), "rev-parse", "HEAD"], None)
         if head.returncode != 0 or head.stdout.strip() != source_rev:
             raise ProvisionError("checkout_mismatch", f"HEAD is {head.stdout.strip()[:12]!r}, expected {source_rev[:12]!r}", "Inspect the workspace; do not retry blindly.")
@@ -711,24 +707,18 @@ class Provisioner:
         if symbolic.returncode == 0:
             raise ProvisionError("checkout_mismatch", "the checkout is on a branch, not a detached HEAD", "Re-checkout the pinned revision.")
         remote = self.git(["-C", str(target), "config", "--get", "remote.origin.url"], None)
-        expected = self._remotes.get(str(target)) or self.url_for(repo)
-        if remote.returncode != 0 or not self._remote_matches(remote.stdout.strip(), repo, expected):
+        # Re-derive the permitted transport from policy on adoption and replay,
+        # including in a new process. An old receipt is not a mirror allowlist.
+        mirror = profile.mirror_for(repo)
+        actual = remote.stdout.strip()
+        matches = actual == mirror if mirror else self._remote_matches(actual, repo)
+        if remote.returncode != 0 or not matches:
             raise ProvisionError("remote_mismatch", f"remote origin is {remote.stdout.strip()!r}, expected {repo!r}", "Re-provision from the correct repository.")
         state = self.git(["-C", str(target), "status", "--porcelain"], None)
         if state.returncode != 0 or state.stdout.strip():
             raise ProvisionError("checkout_dirty", "the checkout has local modifications", "Inspect the workspace; do not retry blindly.")
 
-    def _root_for(self, target: Path) -> Path:
-        for profile in self.policy.values():
-            root = Path(profile.workspace_root)
-            try:
-                if os.path.commonpath([str(root), str(target)]) == str(root):
-                    return root
-            except ValueError:
-                continue
-        raise ProvisionError("path_escape", f"{target} is not inside any enrolled workspace root", "Refusing to touch it.")
-
-    def _remote_matches(self, remote: str, repo: str, expected: str | None = None) -> bool:
+    def _remote_matches(self, remote: str, repo: str) -> bool:
         """The remote must be the repository we were told to fetch, by either
         its canonical identity or the exact URL this host uses for it."""
 
@@ -740,7 +730,7 @@ class Provisioner:
 
         if not remote:
             return False
-        return canon(remote) in {canon(repo), canon(expected or self.url_for(repo))}
+        return canon(remote) in {canon(repo), canon(self.url_for(repo))}
 
     def _registration_matches(self, entry: Mapping[str, Any], identity: Mapping[str, Any], target: Path) -> bool:
         return (
@@ -766,7 +756,7 @@ class Provisioner:
             "ttl_hours": profile.ttl_hours,
             "expires_at": _iso(ready_at + profile.ttl_hours * 3600),
             "verified": {"head": source_rev, "detached": True, "clean": True},
-            "transport": self._transport.get(workspace, "origin"),
+            "transport": "mirror" if profile.mirror_for(repo) else "origin",
             "adopted": adopted,
         }
 

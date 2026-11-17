@@ -51,14 +51,17 @@ import hashlib
 import json
 import os
 import re
+import stat
 import threading
 import uuid
+from bisect import bisect_right
+from operator import itemgetter
 from pathlib import Path
 
-try:  # pragma: no cover - POSIX is the supported deployment platform
+if os.name == "nt":  # pragma: no cover - exercised by the Windows CI job
+    import msvcrt
+else:
     import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None
 
 EXPORT_SCHEMA = "rizzstack.bee-landed-export/1"
 EXPORT_INDEX_SCHEMA = "rizzstack.bee-landed-export-index/1"
@@ -214,7 +217,18 @@ def _normalize_after(after):
     return value
 
 
-def _canonical_row(path: Path, raw: bytes, event: dict, order_key):
+def _read_row(path: Path):
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            return None
+        raw = path.read_bytes()
+        event = json.loads(raw.decode("utf-8"))
+    except (FileNotFoundError, ValueError):
+        # Removed or malformed files are not events. Other I/O failures must
+        # abort the operation before a cursor can pass an unreadable event.
+        return None
+    if not isinstance(event, dict):
+        return None
     event_id = event.get("id")
     if not isinstance(event_id, str) or not event_id.strip():
         # Legacy/canonical-shaped files may omit the envelope id; anything else
@@ -238,21 +252,15 @@ def _canonical_row(path: Path, raw: bytes, event: dict, order_key):
         "sha256": hashlib.sha256(canonical).hexdigest(),
         "file_sha256": hashlib.sha256(raw).hexdigest(),
         "event": event,
-        "_order": order_key,
     }
 
 
-def _scan_outbox(source):
-    """Read every complete canonical outbox file in append order.
-
-    Files are ordered by their durable write timestamp and name.  An event that
-    was written before the index existed (or before a crash prevented its
-    registration) is therefore appended in the same order it became durable.
-    """
+def _outbox_files(source):
+    """Discover local regular files in the pre-index/crash recovery order."""
     outbox = _resolve_outbox(source)
     try:
         paths = list(outbox.iterdir())
-    except (OSError, FileNotFoundError):
+    except FileNotFoundError:
         return []
 
     candidates = []
@@ -261,26 +269,12 @@ def _scan_outbox(source):
         if name.startswith(".") or not name.endswith(".json"):
             continue
         try:
-            if path.is_symlink() or not path.is_file():
-                continue
-            stat = path.stat()
-            raw = path.read_bytes()
-            event = json.loads(raw.decode("utf-8"))
-        except (OSError, UnicodeDecodeError, ValueError):
-            # A torn or non-canonical file is not an exportable event.
+            info = path.lstat()
+        except FileNotFoundError:
             continue
-        if not isinstance(event, dict):
-            continue
-        row = _canonical_row(path, raw, event, (stat.st_mtime_ns, stat.st_ino, name))
-        if row is not None:
-            candidates.append(row)
-
-    candidates.sort(key=lambda row: row["_order"])
-    by_id = {}
-    for row in candidates:
-        # Canonical outbox filenames are unique; keep the first stable path.
-        by_id.setdefault(row["event_id"], row)
-    return list(by_id.values())
+        if stat.S_ISREG(info.st_mode):
+            candidates.append((path, info))
+    return sorted(candidates, key=lambda item: (item[1].st_mtime_ns, item[1].st_ino, item[0].name))
 
 
 def _empty_index():
@@ -295,44 +289,41 @@ def _empty_index():
 def _load_index(path: Path):
     try:
         raw = path.read_bytes()
-    except (OSError, FileNotFoundError):
+    except FileNotFoundError:
+        # First use only: never renumber events because a read failed.
         return _empty_index()
     try:
         index = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as ex:
-        raise LandingExportError("export index is unreadable") from ex
+        raise OSError("export index is unreadable") from ex
     if not isinstance(index, dict):
-        raise LandingExportError("export index is unreadable")
+        raise OSError("export index is unreadable")
     if index.get("schema") != EXPORT_INDEX_SCHEMA:
-        raise LandingExportError(
+        raise OSError(
             f"unsupported export index schema: {index.get('schema')!r}"
         )
     events = index.get("events")
     if not isinstance(events, list):
-        raise LandingExportError("export index is missing its events list")
-    try:
-        next_position = int(index.get("next_position"))
-    except (TypeError, ValueError) as ex:
-        raise LandingExportError("export index has an invalid next_position") from ex
-    if next_position < 1:
-        raise LandingExportError("export index has an invalid next_position")
+        raise OSError("export index is missing its events list")
+    next_position = index.get("next_position")
+    if type(next_position) is not int or next_position < 1:
+        raise OSError("export index has an invalid next_position")
 
     clean = []
     seen_ids = set()
+    seen_positions = set()
     max_position = 0
     for entry in events:
         if not isinstance(entry, dict):
-            continue
+            raise OSError("invalid export index entry")
         event_id = entry.get("event_id")
         if not isinstance(event_id, str) or not event_id or event_id in seen_ids:
-            continue
-        try:
-            position = int(entry.get("position"))
-        except (TypeError, ValueError):
-            continue
-        if position < 1:
-            continue
+            raise OSError("invalid or duplicate export event id")
+        position = entry.get("position")
+        if type(position) is not int or position < 1 or position in seen_positions:
+            raise OSError("invalid or duplicate export position")
         seen_ids.add(event_id)
+        seen_positions.add(position)
         max_position = max(max_position, position)
         clean.append({
             "position": position,
@@ -340,8 +331,14 @@ def _load_index(path: Path):
             "sha256": entry.get("sha256"),
             "file_sha256": entry.get("file_sha256"),
         })
+        # Optional discovery hint. Existing /1 indexes have none; verify
+        # their retained files once without changing any assigned position.
+        hint = entry.get("file")
+        if isinstance(hint, list) and len(hint) == 6 and isinstance(hint[0], str):
+            clean[-1]["file"] = hint
     clean.sort(key=lambda entry: entry["position"])
-    next_position = max(next_position, max_position + 1)
+    if next_position <= max_position or type(index.get("head_position")) is not int or index["head_position"] != max_position:
+        raise OSError("inconsistent export index head")
     return {
         "schema": EXPORT_INDEX_SCHEMA,
         "next_position": next_position,
@@ -392,60 +389,61 @@ def _index_lock(source):
     lock_path = events_dir / "export-index.lock"
     with _THREAD_INDEX_LOCK:
         with open(lock_path, "a+b") as handle:
-            if fcntl is not None:
+            if os.name == "nt":
+                # Windows allows a byte-range lock beyond EOF. Every process
+                # locks byte 0, even for an empty or pre-existing lock file.
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
                 yield
             finally:
-                if fcntl is not None:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _reconcile(index: dict, rows):
-    """Append never-seen outbox rows at the durable head; keep existing order."""
+def _reconcile(source, index, *, use_hints=True):
+    """Append discovered IDs and locate retained files. Never open a path from the index."""
     by_id = {entry["event_id"]: entry for entry in index["events"]}
-    next_position = int(index["next_position"])
+    by_name = {entry["file"][0]: entry for entry in index["events"] if "file" in entry}
+    retained = {}
+    present = set()
     changed = False
-    for row in rows:
-        existing = by_id.get(row["event_id"])
-        if existing is None:
-            entry = {
-                "position": next_position,
-                "event_id": row["event_id"],
-                "sha256": row["sha256"],
-                "file_sha256": row["file_sha256"],
-            }
+    for path, info in _outbox_files(source):
+        present.add(path.name)
+        hint = [path.name, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+        cached = by_name.get(path.name)
+        if use_hints and cached is not None and cached["file"] == hint:
+            retained.setdefault(cached["event_id"], path)
+            continue
+        row = _read_row(path)
+        if row is None or row["event_id"] in retained:
+            continue  # malformed/removed, or an alias after the first stable path
+        event_id = row["event_id"]
+        retained[event_id] = path
+        entry = by_id.get(event_id)
+        if entry is None:
+            position = index["next_position"]
+            entry = {"event_id": event_id, "position": position}
             index["events"].append(entry)
-            by_id[row["event_id"]] = entry
-            next_position += 1
+            by_id[event_id] = entry
+            index["head_position"] = position
+            index["next_position"] = position + 1
+        evidence = {"file": hint, "sha256": row["sha256"], "file_sha256": row["file_sha256"]}
+        if any(entry.get(k) != v for k, v in evidence.items()):
+            entry.update(evidence)
             changed = True
-        else:
-            if (existing.get("sha256") != row["sha256"] or
-                    existing.get("file_sha256") != row["file_sha256"]):
-                existing["sha256"] = row["sha256"]
-                existing["file_sha256"] = row["file_sha256"]
-                changed = True
-    if changed:
-        index["events"].sort(key=lambda entry: entry["position"])
-        index["next_position"] = next_position
-        index["head_position"] = max(
-            (entry["position"] for entry in index["events"]), default=0
-        )
-    return changed
-
-
-def _state(source):
-    """Load+reconcile the durable index and return it with fresh row content."""
-    data_dir = _resolve_data_dir(source)
-    index_file = data_dir / "events" / "export-index.json"
-    with _index_lock(source):
-        index = _load_index(index_file)
-        rows = _scan_outbox(source)
-        changed = _reconcile(index, rows)
-        if changed:
-            _write_index(index_file, index)
-        by_id = {row["event_id"]: row for row in rows}
-        return index, by_id
+    for entry in index["events"]:
+        if entry["event_id"] not in retained and "file" in entry and entry["file"][0] in present:
+            # The name was repurposed. Drop only the hint; mere removal does
+            # not require an index write, and positions are never reclaimed.
+            del entry["file"]
+            changed = True
+    return retained, changed
 
 
 def register_landed_file(source, path=None):
@@ -456,7 +454,12 @@ def register_landed_file(source, path=None):
     original position, and a crash before this call is recovered by the next
     export's outbox scan.
     """
-    _state(source)
+    index_file = export_index_path(source)
+    with _index_lock(source):
+        index = _load_index(index_file)
+        _, changed = _reconcile(source, index)
+        if changed:
+            _write_index(index_file, index)
 
 
 def export_events(source, after=None, limit=None):
@@ -470,46 +473,44 @@ def export_events(source, after=None, limit=None):
     """
     after_position = _normalize_after(after)
     page_limit = _normalize_limit(limit)
-    index, rows = _state(source)
-    head_position = index["head_position"]
-    if after_position is not None and after_position > head_position:
-        raise ExpiredCursorError(
-            f"expired after cursor {after_position}: beyond the durable export head {head_position}"
-        )
+    index_file = export_index_path(source)
+    with _index_lock(source):
+        # On a concurrent removal/replacement (or stale file hint), rediscover
+        # once from bytes. Never serve old evidence or advance past an I/O error.
+        for use_hints in (True, False):
+            index = _load_index(index_file)
+            retained, changed = _reconcile(source, index, use_hints=use_hints)
+            page = _read_page(index, retained, after_position, page_limit)
+            if page is not None:
+                if changed:
+                    _write_index(index_file, index)
+                if after_position is not None and after_position > index["head_position"]:
+                    raise ExpiredCursorError(
+                        f"expired after cursor {after_position}: beyond the durable export head {index['head_position']}"
+                    )
+                return page
+        raise OSError("outbox changed during export; retry with the same cursor")
 
-    if after_position is None:
-        if head_position == 0 and not index["events"]:
-            return {
-                "schema": EXPORT_SCHEMA,
-                "events": [],
-                "next_cursor": None,
-                "has_more": False,
-                "retention": dict(RETENTION),
-            }
-        after_position = 0
 
-    available = []
-    for entry in index["events"]:
-        if entry["position"] <= after_position:
-            continue
-        row = rows.get(entry["event_id"])
-        if row is None:
-            # The file may have been removed by an operator; its position is
-            # still consumed so remaining events keep their durable order.
-            continue
-        available.append((entry, row))
-
-    page_entries = available[:page_limit]
-    has_more = len(available) > len(page_entries)
+def _read_page(index, retained, after_position, page_limit):
     page = []
-    for entry, row in page_entries:
-        page.append({
-            "cursor": entry["position"],
-            "event_id": entry["event_id"],
-            "sha256": row["sha256"],
-            "file_sha256": row["file_sha256"],
-            "event": row["event"],
-        })
+    has_more = False
+    entries = index["events"]
+    start = bisect_right(entries, after_position or 0, key=itemgetter("position"))
+    for i in range(start, len(entries)):
+        entry = entries[i]
+        path = retained.get(entry["event_id"])
+        if path is None:
+            continue
+        row = _read_row(path)
+        if row is None or any(row[k] != entry[k] for k in ("event_id", "sha256", "file_sha256")):
+            return None
+        if len(page) == page_limit:
+            has_more = True
+            break
+        page.append({"cursor": entry["position"], **row})
+    if after_position is None and index["head_position"]:
+        after_position = 0
     next_cursor = page[-1]["cursor"] if page else after_position
     return {
         "schema": EXPORT_SCHEMA,

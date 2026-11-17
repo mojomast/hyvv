@@ -217,10 +217,79 @@ class CursorSequence(unittest.TestCase):
         with self.assertRaises(E.ExpiredCursorError):
             E.export_events(missing, after=1)
 
+    def test_ambiguous_stored_positions_do_not_yield_a_page(self):
+        self.add("att_first")
+        self.add("att_second")
+        path = E.export_index_path(self.data_dir)
+        index = json.loads(path.read_bytes())
+        for position in (1, True, "2", 1.5, None):
+            with self.subTest(position=position):
+                index["events"][1]["position"] = position
+                corrupt = json.dumps(index).encode()
+                path.write_bytes(corrupt)
+                with self.assertRaises(OSError):
+                    E.export_events(self.data_dir, limit=1)
+                self.assertEqual(path.read_bytes(), corrupt)
+
     def test_cursor_zero_starts_at_beginning(self):
         self.add("att_zero00001")
         body = E.export_events(self.data_dir, after=0)
         self.assertEqual([row["cursor"] for row in body["events"]], [1])
+
+    def test_unreadable_index_is_not_rebuilt_from_retained_files(self):
+        old, _ = write_raw_event(self.data_dir, "old", "A")
+        self.assertEqual(E.export_events(self.data_dir)["next_cursor"], 1)
+        old.unlink()  # operator retention: the missing file's position stays consumed
+        write_raw_event(self.data_dir, "new", "B")
+        index = E.export_index_path(self.data_dir)
+        before = index.read_bytes()
+        read_bytes = Path.read_bytes
+
+        def fail_index(path):
+            if path == index:
+                raise PermissionError("index temporarily unreadable")
+            return read_bytes(path)
+
+        with mock.patch.object(Path, "read_bytes", fail_index), self.assertRaises(OSError):
+            E.export_events(self.data_dir, after=1)
+        self.assertEqual(index.read_bytes(), before)
+        rows = E.export_events(self.data_dir, after=1)["events"]
+        self.assertEqual([(r["cursor"], r["event_id"]) for r in rows], [(2, "new")])
+
+    def test_unreadable_event_never_advances_cursor_past_it(self):
+        first, _ = write_raw_event(self.data_dir, "first", "A")
+        self.assertEqual(E.export_events(self.data_dir)["next_cursor"], 1)
+        write_raw_event(self.data_dir, "second", "B")
+        read_bytes = Path.read_bytes
+
+        def fail_first(path):
+            if path == first:
+                raise OSError("temporary read failure")
+            return read_bytes(path)
+
+        with mock.patch.object(Path, "read_bytes", fail_first), self.assertRaises(OSError):
+            E.export_events(self.data_dir, after=0, limit=1)
+        page = E.export_events(self.data_dir, after=0, limit=1)
+        self.assertEqual([(r["cursor"], r["event_id"]) for r in page["events"]], [(1, "first")])
+        tail = E.export_events(self.data_dir, after=page["next_cursor"])
+        self.assertEqual([(r["cursor"], r["event_id"]) for r in tail["events"]], [(2, "second")])
+
+    def test_outbox_listing_failure_returns_retryable_response_without_cursor(self):
+        # Call the handler directly without opening a socket or starting a host.
+        write_raw_event(self.data_dir, "waiting", "A")
+        handler_type = L.make_handler(SimpleNamespace(dir=self.data_dir), TOKEN)
+        handler = handler_type.__new__(handler_type)
+        handler.path = "/v1/landing/events?after=0"
+        handler.headers = {"Authorization": "Bearer " + TOKEN}
+        handler._send = lambda status, body: (status, body)
+        with mock.patch.object(Path, "iterdir", side_effect=OSError("cannot list outbox")):
+            status, body = handler.do_GET()
+        self.assertEqual(status, 503)
+        self.assertEqual(body["code"], "landing_storage_unavailable")
+        self.assertNotIn("next_cursor", body)
+        status, body = handler.do_GET()
+        self.assertEqual(status, 200)
+        self.assertEqual([r["event_id"] for r in body["events"]], ["waiting"])
 
 
 class CursorHttp(unittest.TestCase):

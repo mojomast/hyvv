@@ -38,6 +38,10 @@ include = [
   "launcher.py",
   "provisioning.py",
   "landing_export.py",
+  "rails_emitter.py",
+  "rails_log_source.py",
+  "rails_export.py",
+  "contrib/rizzstack_rails/**",
   "agy_cua_mcp.py",
   "brief.schema.json",
   "result.schema.json",
@@ -57,6 +61,10 @@ packages = ["hyvv"]
 "launcher.py" = "launcher.py"
 "provisioning.py" = "provisioning.py"
 "landing_export.py" = "landing_export.py"
+"rails_emitter.py" = "rails_emitter.py"
+"rails_log_source.py" = "rails_log_source.py"
+"rails_export.py" = "rails_export.py"
+"contrib/rizzstack_rails" = "contrib/rizzstack_rails"
 "agy_cua_mcp.py" = "agy_cua_mcp.py"
 "brief.schema.json" = "brief.schema.json"
 "result.schema.json" = "result.schema.json"

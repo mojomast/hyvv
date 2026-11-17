@@ -1,0 +1,2 @@
+# Vendor pins are over physical bytes, including on Windows auto-CRLF checkouts.
+contrib/rizzstack_rails/* text eol=lf
