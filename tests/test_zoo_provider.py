@@ -101,9 +101,11 @@ class ZooRouting(unittest.TestCase):
         self.assertEqual(spec["backoff_s"], [15, 30])
         self.assertEqual(spec["key"], "zoo")
 
-    def test_standard_tier_is_zoo(self):
-        self.assertEqual(L.TIERS["standard"], ZOO)
-        self.assertEqual(L.model_spec(self._cfg(), "standard")["key"], "zoo")
+    def test_standard_tier_is_the_go_default(self):
+        # Owner routing change (2026-11-17): Zoo's free pass refuses non-IDE API traffic, so the
+        # standard tier maps to the OpenCode Go default; zoo stays reachable by explicit name.
+        self.assertEqual(L.TIERS["standard"], "go:deepseek-v4.1-flash")
+        self.assertEqual(L.model_spec(self._cfg(), "standard")["key"], "go")
 
     def test_an_explicit_zoo_name_beats_priority_high(self):
         # Owner decision (2026-11-15): an explicitly named model is authoritative; priority: high

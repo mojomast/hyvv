@@ -123,19 +123,23 @@ class RoutePreview(unittest.TestCase):
         finally:
             srv.shutdown()
 
-    def test_tier_standard_resolves_to_zoo(self):
+    def test_tier_standard_resolves_to_the_go_default(self):
+        # Owner routing change (2026-11-17): Zoo's free pass refuses non-IDE API traffic, so the
+        # standard tier previews the OpenCode Go default (zoo remains reachable by explicit name).
         la, srv = serve(self.tmp)
         try:
             st, body = post(srv, "/v1/route", {"tier": "standard"})
             self.assertEqual(st, 200)
             self.assertEqual(body["requested"], "standard")
             eff = body["effective"]
-            self.assertEqual(eff["name"], ZOO)
-            self.assertEqual(eff["model"], ZOO_WIRE)
-            expected_source = "zoo"
+            self.assertEqual(eff["name"], "go:deepseek-v4.1-flash")
+            self.assertEqual(eff["model"], "deepseek-v4.1-flash")
+            expected_source = "go"
             self.assertEqual(eff["key"], expected_source)
-            self.assertEqual(body["fallback"], DS_FLASH)
-            self.assertEqual(body["effective_model"], ZOO_WIRE)
+            # The Go default is the host default route: no fallback alias is configured on it
+            # (zoo carried DS_FLASH; the go spec intentionally does not).
+            self.assertIsNone(body["fallback"])
+            self.assertEqual(body["effective_model"], "deepseek-v4.1-flash")
             self.assertIn("tier standard", body["why"])
         finally:
             srv.shutdown()

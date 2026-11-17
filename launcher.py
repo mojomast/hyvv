@@ -97,7 +97,10 @@ MODELS = {
     "longcat-2.5-preview-free": _free("longcat-2.5-preview-free", 1_000_000),
 }
 FREE_POOL = [m for m, v in MODELS.items() if v.get("free")]  # deepseek first: preferred when all are equally fresh
-TIERS = {"simple": "pool:free", "standard": "zoo:glm-5.3-flash"}
+# Owner routing change (2026-11-17, MR.INDIA with the owner's OK): Zoo's free pass refuses
+# non-IDE API traffic, so the "standard" tier must never resolve to it. OpenCode Go's
+# deepseek-v4.1-flash is the host default now; naming it explicitly is the supported route.
+TIERS = {"simple": "pool:free", "standard": "go:deepseek-v4.1-flash"}
 FREE_TIER_DENIED = re.compile(r"FreeTierError|free tier can only be used", re.I)
 RATE_LIMIT = re.compile(r"\b429\b|rate.?limit|too many requests|quota", re.I)
 # Zoo answers 429 "Too many concurrent requests" with a Retry-After of 5-7s, and a 402

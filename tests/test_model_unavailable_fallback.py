@@ -122,5 +122,30 @@ class ModelUnavailableFallback(unittest.TestCase):
                     asyncio.run(be.cleanup(a))
 
 
+class StandardTierNoLongerRoutesToZoo(unittest.TestCase):
+    """Owner routing change 2026-11-17: Zoo's free pass refuses non-IDE API traffic, so the
+    "standard" tier must resolve to the host default (OpenCode Go deepseek-v4.1-flash) and an
+    unnamed/tier-standard attempt must never be handed to zoo/glm-5.3-flash."""
+
+    def test_standard_tier_maps_to_go_deepseek(self):
+        self.assertEqual(launcher.TIERS["standard"], "go:deepseek-v4.1-flash")
+        spec = launcher.model_spec(_cfg(tempfile.mkdtemp(prefix="tier-")), "standard")
+        self.assertEqual(spec["name"], "go:deepseek-v4.1-flash")
+
+    def test_standard_tier_attempt_runs_on_go_not_zoo(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "fixture-value-not-a-real-key"}):
+                be = launcher.FakeBackend(None)
+                L = launcher.Launcher(_cfg(d), be)
+                L.kick = lambda: None
+                a, _ = L.submit("att_tier0000001", {"objective": "x", "tier": "standard"})
+                _run_to_terminal(L, a)
+                try:
+                    self.assertEqual(a["model"], "go:deepseek-v4.1-flash", f"detail={a.get('detail')!r}")
+                    self.assertNotIn("zoo:glm-5.3-flash", getattr(be, "models", []), f"zoo used: {getattr(be, 'models', [])}")
+                finally:
+                    asyncio.run(be.cleanup(a))
+
+
 if __name__ == "__main__":
     unittest.main()
