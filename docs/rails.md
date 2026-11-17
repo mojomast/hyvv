@@ -30,4 +30,11 @@ Pages are SQLite read snapshots opened with `mode=ro` and `query_only`. GET neve
 - Native and startup ingestion use the same parser, worker authority and stable `(attempt, log generation, lseq)` source keys. Rows, checkpoints and the byte cursor commit together. A JSONL trailing fragment waits for its newline; malformed complete rows produce a safe `source.error`. Observed rotation/shrink produces `source.gap` and a new generation. This is an append-only source protocol: a privileged in-place rewrite preserving file identity, size and sampled anchors is not reliably detectable. Keep off-host head checkpoints.
 - Recording refusal leaves the execution/landing path intact. After repairing local storage, restart to replay durable logs and terminal receipt observations. A malformed/missing journal, unsupported attempt identity or retained gap leaves completeness partial; never treat that as complete campaign evidence. Original journal privacy/access rules remain important: the older control API and private source files are not a Rails projection.
 
-The stdlib worker runtime is the four R02 modules from BundleBees, pinned by `contrib/rizzstack_rails/vendor-manifest.json` and included in both wheel and sdist. For an offline vendor comparison, run `python scripts/vendor_rails.py --check <reviewed-bundlebees-checkout>` from the Hyvv root; omit `--check` only to intentionally refresh from that checkout's manifest. No network or manually edited `PYTHONPATH` at runtime. Test with `python -m unittest tests.test_rails_emission tests.test_rails_native -v`; the same targeted command is included in the Windows CI job.
+The stdlib worker runtime is the four R02 modules from BundleBees, pinned by `contrib/rizzstack_rails/vendor-manifest.json` and included in both wheel and sdist. Verify it offline from the Hyvv root (the sibling checkout must contain the pinned Git object):
+
+```sh
+pin=$(python -c 'import json; print(json.load(open("contrib/rizzstack_rails/vendor-manifest.json"))["pin_label"])')
+python scripts/vendor_rails.py ../bundlebees --rev "$pin" --check
+```
+
+Omit `--check` only for a deliberate refresh to a selected full commit. No network or manually edited `PYTHONPATH` is needed at runtime. Test with `python -m unittest tests.test_rails_emission tests.test_rails_native -v`; the same targeted command is included in the Windows CI job.
