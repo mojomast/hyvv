@@ -14,7 +14,7 @@ the current cursor even when its canonical id sorts lower.
 The position is persisted in ``<data_dir>/events/export-index.json``::
 
     {
-      "schema": "rizzstack.bee-landed-export-index/1",
+      "schema": "rizzstack.bee-landed-export-index/2",
       "next_position": 4,
       "head_position": 3,
       "events": [
@@ -64,7 +64,8 @@ else:
     import fcntl
 
 EXPORT_SCHEMA = "rizzstack.bee-landed-export/1"
-EXPORT_INDEX_SCHEMA = "rizzstack.bee-landed-export-index/1"
+_LEGACY_INDEX_SCHEMA = "rizzstack.bee-landed-export-index/1"
+EXPORT_INDEX_SCHEMA = "rizzstack.bee-landed-export-index/2"
 RETENTION_SCHEMA = "rizzstack.bee-landed-retention/1"
 LANDED_EVENT_TYPE = "rizzstack.bee.landed.v1"
 LANDED_DATA_SCHEMA = "rizzstack.bee-landed/1"
@@ -84,6 +85,8 @@ RETENTION = {
     "source": "events/outbox",
     "deletes": False,
     "delete_on_export": False,
+    # Atomic publication/restart replay does not attest host power-loss survival.
+    "power_loss_durability": "unproven",
     "max_events": None,
     "max_age_seconds": None,
     "empty_page": "No stored canonical event is at or after the cursor.",
@@ -121,6 +124,16 @@ class LegacyCursorError(LandingExportError):
     """The cursor is a pre-migration event-id/hash cursor."""
 
     code = "legacy_cursor"
+
+
+class LandingContentConflict(ValueError):
+    """The same export position was observed with different canonical content."""
+
+    code = "landing_content_conflict"
+
+    def __init__(self, position):
+        super().__init__(f"canonical landing content conflicts at position {position}")
+        self.position = position
 
 
 def _resolve_outbox(source) -> Path:
@@ -298,7 +311,8 @@ def _load_index(path: Path):
         raise OSError("export index is unreadable") from ex
     if not isinstance(index, dict):
         raise OSError("export index is unreadable")
-    if index.get("schema") != EXPORT_INDEX_SCHEMA:
+    legacy = index.get("schema") == _LEGACY_INDEX_SCHEMA
+    if not legacy and index.get("schema") != EXPORT_INDEX_SCHEMA:
         raise OSError(
             f"unsupported export index schema: {index.get('schema')!r}"
         )
@@ -322,29 +336,40 @@ def _load_index(path: Path):
         position = entry.get("position")
         if type(position) is not int or position < 1 or position in seen_positions:
             raise OSError("invalid or duplicate export position")
+        digest = entry.get("sha256")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            # All /1 writers stored this commitment. A filename or raw hash
+            # cannot reconstruct what an earlier consumer was served.
+            raise OSError("export position has no valid canonical digest")
         seen_ids.add(event_id)
         seen_positions.add(position)
         max_position = max(max_position, position)
         clean.append({
             "position": position,
             "event_id": event_id,
-            "sha256": entry.get("sha256"),
+            "sha256": digest,
             "file_sha256": entry.get("file_sha256"),
         })
-        # Optional discovery hint. Existing /1 indexes have none; verify
-        # their retained files once without changing any assigned position.
+        # Optional cache only. Recheck files once on upgrade from /1.
         hint = entry.get("file")
-        if isinstance(hint, list) and len(hint) == 6 and isinstance(hint[0], str):
+        if (not legacy and isinstance(hint, list) and len(hint) == 6 and isinstance(hint[0], str)
+                and isinstance(entry.get("file_sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", entry["file_sha256"])):
             clean[-1]["file"] = hint
     clean.sort(key=lambda entry: entry["position"])
     if next_position <= max_position or type(index.get("head_position")) is not int or index["head_position"] != max_position:
         raise OSError("inconsistent export index head")
-    return {
+    validated = {
         "schema": EXPORT_INDEX_SCHEMA,
         "next_position": next_position,
         "head_position": max_position,
         "events": clean,
     }
+    if legacy:
+        # Under the index lock, fence older writers before rediscovery. Keep
+        # their last recorded commitments; superseded history is unknowable.
+        _write_index(path, validated)
+    return validated
 
 
 def _write_index(path: Path, index: dict):
@@ -406,6 +431,15 @@ def _index_lock(source):
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _pin_conflicting_prefix(source, index, position, first_new):
+    if position >= first_new:
+        # First discovery can itself contain divergent aliases. Keep the first
+        # observed commitment, but don't assign later positions or issue a page.
+        prefix = [e for e in index["events"] if e["position"] <= position]
+        _write_index(export_index_path(source), dict(index, events=prefix,
+                     head_position=position, next_position=position + 1))
+
+
 def _reconcile(source, index, *, use_hints=True):
     """Append discovered IDs and locate retained files. Never open a path from the index."""
     by_id = {entry["event_id"]: entry for entry in index["events"]}
@@ -413,6 +447,7 @@ def _reconcile(source, index, *, use_hints=True):
     retained = {}
     present = set()
     changed = False
+    first_new = index["next_position"]
     for path, info in _outbox_files(source):
         present.add(path.name)
         hint = [path.name, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
@@ -421,19 +456,25 @@ def _reconcile(source, index, *, use_hints=True):
             retained.setdefault(cached["event_id"], path)
             continue
         row = _read_row(path)
-        if row is None or row["event_id"] in retained:
-            continue  # malformed/removed, or an alias after the first stable path
+        if row is None:
+            continue
         event_id = row["event_id"]
-        retained[event_id] = path
         entry = by_id.get(event_id)
         if entry is None:
             position = index["next_position"]
-            entry = {"event_id": event_id, "position": position}
+            entry = {"event_id": event_id, "position": position, "sha256": row["sha256"]}
             index["events"].append(entry)
             by_id[event_id] = entry
             index["head_position"] = position
             index["next_position"] = position + 1
-        evidence = {"file": hint, "sha256": row["sha256"], "file_sha256": row["file_sha256"]}
+        elif entry["sha256"] != row["sha256"]:
+            position = entry["position"]
+            _pin_conflicting_prefix(source, index, position, first_new)
+            raise LandingContentConflict(position)
+        if event_id in retained:
+            continue  # Same canonical content in another file.
+        retained[event_id] = path
+        evidence = {"file": hint, "file_sha256": row["file_sha256"]}
         if any(entry.get(k) != v for k, v in evidence.items()):
             entry.update(evidence)
             changed = True
@@ -479,11 +520,16 @@ def export_events(source, after=None, limit=None):
         # once from bytes. Never serve old evidence or advance past an I/O error.
         for use_hints in (True, False):
             index = _load_index(index_file)
+            first_new = index["next_position"]
             retained, changed = _reconcile(source, index, use_hints=use_hints)
-            page = _read_page(index, retained, after_position, page_limit)
+            try:
+                page = _read_page(index, retained, after_position, page_limit)
+            except LandingContentConflict as ex:
+                _pin_conflicting_prefix(source, index, ex.position, first_new)
+                raise
+            if changed:
+                _write_index(index_file, index)
             if page is not None:
-                if changed:
-                    _write_index(index_file, index)
                 if after_position is not None and after_position > index["head_position"]:
                     raise ExpiredCursorError(
                         f"expired after cursor {after_position}: beyond the durable export head {index['head_position']}"
@@ -503,6 +549,8 @@ def _read_page(index, retained, after_position, page_limit):
         if path is None:
             continue
         row = _read_row(path)
+        if row and row["event_id"] == entry["event_id"] and row["sha256"] != entry["sha256"]:
+            raise LandingContentConflict(entry["position"])
         if row is None or any(row[k] != entry[k] for k in ("event_id", "sha256", "file_sha256")):
             return None
         if len(page) == page_limit:

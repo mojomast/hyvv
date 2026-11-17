@@ -688,15 +688,18 @@ def _find_landed_events(outbox, attempt_id):
     return found
 
 
-def _fsync_dir(path):
+def _fsync_dir(path, *, required=False):
     try:
         fd = os.open(str(path), os.O_RDONLY)
     except OSError:
+        if required:
+            raise
         return
     try:
         os.fsync(fd)
     except OSError:
-        pass
+        if required:
+            raise
     finally:
         os.close(fd)
 
@@ -707,6 +710,8 @@ def _register_landed_file(outbox):
         return
     try:
         _landing_export.register_landed_file(outbox)
+    except _landing_export.LandingContentConflict as ex:
+        raise LandedEventConflict(str(ex)) from ex
     except Exception:
         # The next export scans the outbox and registers an unindexed file.
         pass
@@ -884,8 +889,10 @@ def emit_landed_record(a, data_dir, cfg=None, result_path=None):
         for path, existing in _find_landed_events(outbox, event["data"]["attempt_id"]):
             if _landing_conflicts(existing, event):
                 raise LandedEventConflict(f"conflicting terminal evidence for attempt {event['data']['attempt_id']}")
-            return path, existing, False
-        path, stored, created = _persist_landed_event(outbox, event, event["id"])
+            stored, created = existing, False
+            break
+        else:
+            path, stored, created = _persist_landed_event(outbox, event, event["id"])
     _register_landed_file(outbox)
     if created:
         notify_landed_event(stored, cfg)
@@ -1813,8 +1820,20 @@ class Launcher:
         p = self._path(a["attempt_id"]); tmp = p.with_suffix(".tmp")
         tmp.write_text(json.dumps(a, indent=1), "utf-8"); os.replace(tmp, p)
     def _append_events(self, a, evs):
-        with open(self.dir / "attempts" / f"{a['attempt_id']}.events.jsonl", "a", encoding="utf-8") as f:
-            for e in evs: f.write(json.dumps(e) + "\n")
+        path = self.dir / "attempts" / f"{a['attempt_id']}.events.jsonl"
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                for e in evs: f.write(json.dumps(e) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            # Windows has no portable directory fsync. Health explicitly
+            # scopes completeness to the retained bytes, including after restart.
+            if os.name != "nt":
+                _fsync_dir(path.parent, required=True)
+        except OSError:
+            if self.rails:
+                self.rails.journal_write_failed(a['attempt_id'])
+            raise
         if self.rails:
             self.rails.ingest(a['attempt_id'])
     def _load(self):
@@ -2642,6 +2661,8 @@ def make_handler(L, token):
                         after=unquote(q["after"]) if "after" in q else None,
                         limit=q.get("limit"),
                     )
+                except _landing_export.LandingContentConflict as ex:
+                    return self._send(409, {"code": ex.code, "error": str(ex)})
                 except _landing_export.LandingExportError as ex:
                     body = {"error": str(ex)}
                     code = getattr(ex, "code", None)

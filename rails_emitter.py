@@ -45,7 +45,7 @@ class RailsEmitter:
                 if path.name.endswith(".events.jsonl"):
                     aid = path.name.removesuffix(".events.jsonl")
                     seen.add(aid)
-                    self.ingest(aid)
+                    self.ingest(aid, expected_seq=attempts.get(aid, {}).get("lseq"))
         except OSError:
             self._errors["recovery"] = "journal_listing_unavailable"
         expected = {aid for aid, a in attempts.items() if a.get("lseq")}
@@ -69,7 +69,13 @@ class RailsEmitter:
         args["lane"] = {k: args.pop(k) for k in contracts.LANE_FIELDS}
         return args
 
-    def ingest(self, aid):
+    def journal_write_failed(self, aid):
+        # A later successful ingest of surviving bytes cannot resolve a failed
+        # native append/sync. Do not clear this with the transient reader error.
+        with self._lock:
+            self._errors[("write", aid)] = "journal_write_unconfirmed"
+
+    def ingest(self, aid, *, expected_seq=None):
         """Identical entry point for just-flushed native logs and startup replay."""
         with self._lock:
             error_key = ("log", aid)
@@ -117,6 +123,10 @@ class RailsEmitter:
                     self._partial.add(aid)
                 else:
                     self._partial.discard(aid)
+                if type(expected_seq) is int and expected_seq > Cursor.decode(page["next_cursor"]).seq:
+                    # A clean EOF behind a retained native manifest isn't a
+                    # complete replay, even if ingest never saw the lost tail.
+                    self._errors[("write", aid)] = "journal_shorter_than_manifest"
                 self._errors.pop(error_key, None)
             except Exception:
                 self._errors[error_key] = "replay_required"
@@ -165,6 +175,11 @@ class RailsEmitter:
             return {
                 "recording": "degraded" if self._errors or self._partial else "ready",
                 "completeness": "complete" if complete else "partial",
+                # Clean EOF proves coverage of retained journals only. Older
+                # writers, unavailable directory barriers and lost host state
+                # cannot be ruled out by opening the ledger after a restart.
+                "completeness_scope": "retained_journals",
+                "power_loss_durability": "unproven",
                 "warnings": sorted(
                     set(self._errors.values()) | ({"partial_journal"} if self._partial else set())
                 ),

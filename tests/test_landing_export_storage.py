@@ -6,12 +6,16 @@ import hashlib
 import json
 import multiprocessing
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import landing_export as E
+import launcher as L
+from rails_emitter import RailsEmitter
 
 
 def store(root, name, *, event_id=None, timestamp=1, label="landed"):
@@ -94,15 +98,17 @@ class RetainedFiles(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             first = store(root, "alias", event_id="urn:one", timestamp=1)
-            second = store(root, "second", event_id="urn:one", timestamp=2, label="duplicate")
+            second = store(root, "second", event_id="urn:one", timestamp=2)
             initial = E.export_events(root)["events"][0]
             self.assertEqual(initial["event"]["data"]["label"], "landed")
             index_file = E.export_index_path(root)
             index = json.loads(index_file.read_bytes())
             # Previous /1 indexes only have identity, hashes and position.
+            index["schema"] = "rizzstack.bee-landed-export-index/1"
             del index["events"][0]["file"]
             index_file.write_text(json.dumps(index), encoding="utf-8")
             self.assertEqual(E.export_events(root)["events"], [initial])
+            self.assertEqual(json.loads(index_file.read_bytes())["schema"], E.EXPORT_INDEX_SCHEMA)
 
             second.unlink()
             first.write_bytes(first.read_bytes() + b"\n\n")
@@ -112,10 +118,106 @@ class RetainedFiles(unittest.TestCase):
             self.assertEqual(formatted["file_sha256"], hashlib.sha256(first.read_bytes()).hexdigest())
             self.assertEqual(formatted["cursor"], 1)
 
-            store(root, "second", event_id="urn:one", timestamp=2, label="duplicate")
+            store(root, "second", event_id="urn:one", timestamp=2)
             first.unlink()
             remaining = E.export_events(root)["events"]
-            self.assertEqual([(r["cursor"], r["event"]["data"]["label"]) for r in remaining], [(1, "duplicate")])
+            self.assertEqual(remaining, [initial])
+
+    def test_divergence_blocks_even_past_cursor_before_or_after_first_alias_removal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = store(root, "original", event_id="one", timestamp=2)
+            initial = E.export_events(root)["events"]
+            index_file = E.export_index_path(root)
+            before = index_file.read_bytes()
+            store(root, "later", timestamp=1)  # discovered before the conflict
+            alias = store(root, "alias", event_id="one", timestamp=3, label="different")
+            handler_type = L.make_handler(SimpleNamespace(dir=root), "t" * 40)
+            handler = handler_type.__new__(handler_type)
+            handler.path = "/v1/landing/events?after=1"
+            handler.headers = {"Authorization": "Bearer " + "t" * 40}
+            handler._send = lambda status, body: (status, body)
+            for remove_original in (False, True):
+                if remove_original:
+                    first.unlink()
+                status, body = handler.do_GET()
+                self.assertEqual((status, body["code"]), (409, "landing_content_conflict"))
+                self.assertNotIn("next_cursor", body)
+                with self.assertRaises(E.LandingContentConflict):
+                    E.register_landed_file(root)
+                self.assertEqual(index_file.read_bytes(), before)
+            alias.unlink()
+            store(root, "restored", event_id="one")
+            rows = E.export_events(root)["events"]
+            self.assertEqual(rows[0], initial[0])
+            self.assertEqual((rows[1]["event_id"], rows[1]["cursor"]), ("later", 2))
+
+    def test_conflicting_first_scan_preserves_first_observed_commitment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = store(root, "first", event_id="one")
+            expected = E._read_row(first)["sha256"]
+            store(root, "later", timestamp=2)
+            store(root, "second", event_id="one", timestamp=3, label="different")
+            with self.assertRaises(E.LandingContentConflict):
+                E.export_events(root)
+            first.unlink()
+            with self.assertRaises(E.LandingContentConflict):
+                E.export_events(root, after=1)
+            index = json.loads(E.export_index_path(root).read_bytes())
+            self.assertEqual([(e["position"], e["sha256"]) for e in index["events"]], [(1, expected)])
+
+    def test_invalid_legacy_commitment_is_not_replaced_from_current_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store(root, "one")
+            E.register_landed_file(root)
+            path = E.export_index_path(root)
+            index = json.loads(path.read_bytes())
+            index["schema"] = "rizzstack.bee-landed-export-index/1"
+            del index["events"][0]["sha256"]
+            corrupt = json.dumps(index).encode()
+            path.write_bytes(corrupt)
+            with self.assertRaises(OSError):
+                E.export_events(root, after=1)
+            self.assertEqual(path.read_bytes(), corrupt)
+
+    def test_legacy_hint_cannot_conceal_mismatch_behind_cursor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store(root, "one")
+            E.register_landed_file(root)
+            path = E.export_index_path(root)
+            index = json.loads(path.read_bytes())
+            row = index["events"][0]
+            index["schema"] = "rizzstack.bee-landed-export-index/1"
+            row["sha256"] = "0" * 64  # retained bytes no longer match this pin
+            path.write_bytes(json.dumps(index).encode())
+            with self.assertRaises(E.LandingContentConflict):
+                E.export_events(root, after=1)
+            migrated = json.loads(path.read_bytes())
+            self.assertEqual(migrated["schema"], E.EXPORT_INDEX_SCHEMA)
+            self.assertEqual(migrated["events"][0]["sha256"], "0" * 64)
+            self.assertEqual(migrated["next_position"], 2)
+
+    def test_semantic_replacement_during_first_page_read_is_not_repinned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = store(root, "one")
+            digest = E._read_row(first)["sha256"]
+            store(root, "later", timestamp=2)
+            real_page = E._read_page
+
+            def replace(*args):
+                store(root, "one", label="different")
+                return real_page(*args)
+
+            with mock.patch.object(E, "_read_page", replace), self.assertRaises(E.LandingContentConflict):
+                E.export_events(root)
+            with self.assertRaises(E.LandingContentConflict):
+                E.export_events(root, after=1)
+            index = json.loads(E.export_index_path(root).read_bytes())
+            self.assertEqual([(e["position"], e["sha256"]) for e in index["events"]], [(1, digest)])
 
     def test_missing_and_malformed_tail_never_supply_has_more_or_recycle_positions(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -134,6 +236,66 @@ class RetainedFiles(unittest.TestCase):
             store(root, "other-name", event_id="row-1", timestamp=2)
             rows = E.export_events(root, after=1)["events"]
             self.assertEqual([(r["event_id"], r["cursor"]) for r in rows], [("row-1", 2), ("new-id", 4)])
+
+
+class JournalAck(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.aid = "att_1234567890abcdef"
+        self.attempt = {"attempt_id": self.aid, "lseq": 1}
+        self.record = {"kind": "state", "state": "running", "lseq": 1}
+        (self.root / "attempts").mkdir()
+        self.path = self.root / "attempts" / (self.aid + ".events.jsonl")
+        self.rails = RailsEmitter(self.root)
+        self.launcher = SimpleNamespace(dir=self.root, rails=self.rails)
+
+    def test_journal_barriers_precede_observer_and_replay(self):
+        actions = []
+        sync = os.fsync
+
+        def observe(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                actions.append("directory")
+            else:
+                self.assertEqual(json.loads(self.path.read_bytes()), self.record)
+                actions.append("file")
+            sync(fd)
+
+        def unavailable():
+            actions.append("ingest")
+            raise OSError("unavailable")
+
+        with mock.patch.object(os, "fsync", observe), mock.patch.object(self.rails, "_writer", unavailable):
+            L.Launcher._append_events(self.launcher, self.attempt, [self.record])
+        self.assertEqual(actions, ["file", "ingest"] if os.name == "nt" else ["file", "directory", "ingest"])
+        self.assertIn("replay_required", self.rails.health()["warnings"])
+        restarted = RailsEmitter(self.root)
+        restarted.recover({self.aid: self.attempt})
+        health = restarted.health()
+        self.assertEqual((health["completeness"], health["completeness_scope"]), ("complete", "retained_journals"))
+        self.assertEqual(health["power_loss_durability"], "unproven")
+
+    def test_source_sync_failure_is_not_acknowledged_or_ingested(self):
+        for directory in ((False,) if os.name == "nt" else (False, True)):
+            with self.subTest(directory=directory):
+                def fail(fd):
+                    if stat.S_ISDIR(os.fstat(fd).st_mode) == directory:
+                        raise OSError("private")
+
+                with mock.patch.object(os, "fsync", fail), mock.patch.object(self.rails, "ingest") as ingest:
+                    with self.assertRaises(OSError):
+                        L.Launcher._append_events(self.launcher, self.attempt, [self.record])
+                    ingest.assert_not_called()
+                self.assertEqual(self.rails.health()["warnings"], ["journal_write_unconfirmed"])
+
+    def test_clean_eof_before_known_manifest_tail_degrades_after_restart(self):
+        self.path.write_text(json.dumps(self.record) + "\n", "utf-8")
+        self.rails.recover({self.aid: dict(self.attempt, lseq=2)})
+        health = self.rails.health()
+        self.assertEqual((health["recording"], health["completeness"]), ("degraded", "partial"))
+        self.assertIn("journal_shorter_than_manifest", health["warnings"])
 
 
 # All child targets are importable at module scope for Windows spawn.
