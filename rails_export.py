@@ -9,6 +9,7 @@ import re
 import sqlite3
 import uuid
 from pathlib import Path
+from time import time
 from urllib.parse import parse_qsl
 
 from rails_emitter import contracts, privacy
@@ -24,6 +25,7 @@ from rails_log_source import (
 )
 
 _CHAIN = re.compile(r"m-[0-9a-f]{12}-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+_MAX_UNIX_SECONDS = 253_402_300_799  # 9999-12-31T23:59:59Z
 _CODES = {
     "invalid_row",
     "missing_lseq",
@@ -248,6 +250,7 @@ def export_page(path, after=0, limit=100, *, models=()):
 class ReadAccess:
     def __init__(self, cfg, admin):
         self.token, self.peers = b"", frozenset()
+        self.expires_at = None
         if cfg.get("rails_enabled") is not True:
             return
         try:
@@ -259,6 +262,11 @@ class ReadAccess:
                 raise RuntimeError("Rails replication requires a distinct read credential")
             if len(raw) > 513 or not re.fullmatch(rb"[!-~]{32,512}", token):
                 raise ValueError()
+            if "rails_read_expires_at" in cfg:
+                deadline = cfg["rails_read_expires_at"]
+                if type(deadline) is not int or not 0 <= deadline <= _MAX_UNIX_SECONDS:
+                    raise ValueError()
+                self.expires_at = deadline
             peers = cfg["rails_read_peers"]
             if not isinstance(peers, list) or not peers:
                 raise ValueError()
@@ -272,6 +280,7 @@ class ReadAccess:
         values = headers.get_all("Authorization") or []
         if (
             not self.token
+            or (self.expires_at is not None and time() >= self.expires_at)
             or len(values) != 1
             or not values[0].startswith("Bearer ")
             or not hmac.compare_digest(values[0][7:].encode(), self.token)

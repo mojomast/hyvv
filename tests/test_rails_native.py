@@ -4,10 +4,13 @@ import asyncio
 import hashlib
 import http.client
 import json
+import os
 import secrets
+import sqlite3
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +29,7 @@ class Native(unittest.TestCase):
         self.root = Path(t.name)
         self.admin, self.reader = secrets.token_hex(32), secrets.token_hex(32)
         (self.root / "reader").write_text(self.reader, "utf-8")
+        self.enterContext(mock.patch.dict(os.environ, HYVV_RAILS_READ_TOKEN_FILE=""))
         self.cfg = dict(
             data_dir=str(self.root),
             model="deepseek-flash",
@@ -46,15 +50,15 @@ class Native(unittest.TestCase):
         self.addCleanup(self.srv.shutdown)
 
     def req(self, path, token=None, method="GET", **headers):
-        c = http.client.HTTPConnection(*self.srv.server_address, timeout=4)
-        try:
-            if token:
-                headers["Authorization"] = "Bearer " + token
-            c.request(method, path, headers=headers)
-            r = c.getresponse()
-            return r.status, r.read()
-        finally:
-            c.close()
+        with closing(http.client.HTTPConnection(*self.srv.server_address, timeout=4)) as c:
+            return self.send(c, path, token, method, **headers)
+
+    def send(self, c, path, token=None, method="GET", **headers):
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        c.request(method, path, headers=headers)
+        r = c.getresponse()
+        return r.status, r.read()
 
     def test_scopes_query_and_readonly(self):
         head = "/v1/rails/head"
@@ -89,6 +93,55 @@ class Native(unittest.TestCase):
         (self.root / "reader").write_text(self.admin, "utf-8")
         with self.assertRaises(RuntimeError):
             launcher.make_handler(self.L, self.admin)
+
+    def set_read_deadline(self, value):
+        self.L.cfg["rails_read_expires_at"] = value
+        self.srv.RequestHandlerClass = launcher.make_handler(self.L, self.admin)
+
+    def assert_read_refused(self, response):
+        status, raw = response
+        self.assertEqual(status, 401)
+        body = json.loads(raw)
+        self.assertEqual(set(body), {"ok", "error"})
+        self.assertIs(body["ok"], False)
+        self.assertEqual(body["error"]["code"], "auth_required")
+        self.assertIs(body["error"]["retryable"], False)
+
+    def test_read_deadline_refuses_without_advancing_ledger_or_cursor(self):
+        deadline = 2_000_000_000
+        self.L._append_events({"attempt_id": AID}, [dict(kind="state", state="running", lseq=1)])
+        page = "/v1/rails/events?after=0&limit=1"
+        head = "/v1/rails/head"
+        with (
+            mock.patch("rails_export.time", return_value=deadline - 0.25) as clock,
+            closing(http.client.HTTPConnection(*self.srv.server_address, timeout=4)) as conn,
+            closing(sqlite3.connect(self.L.rails.path.as_uri() + "?mode=ro", uri=True)) as db,
+        ):
+            self.set_read_deadline(deadline)
+            self.assertEqual(self.send(conn, head, self.reader)[0], 200)
+            status, raw = self.send(conn, page, self.reader)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(raw)["next_cursor"], 1)
+
+            cursor = db.execute("SELECT cursor FROM hyvv_log_cursor WHERE attempt=?", (AID,)).fetchone()
+            self.assertIsNotNone(cursor)
+            before = list(db.iterdump())  # includes origin identity, rows and durable cursors
+            for now in (deadline, deadline + 1):
+                clock.return_value = now
+                for path in (head, page):
+                    self.assert_read_refused(self.send(conn, path, self.reader))  # same keep-alive connection
+            self.set_read_deadline(deadline)  # rebuilding the handler must not renew the grant
+            self.assert_read_refused(self.req(page, self.reader))
+            self.assertEqual(list(db.iterdump()), before)
+        self.assertEqual(self.req("/v1/version", self.admin)[0], 200)
+
+    def test_explicit_invalid_deadline_fails_closed(self):
+        with mock.patch("rails_export.time", return_value=0):
+            for value in (None, True, False, "2000000000", 2e9, -1, 253_402_300_800, {}):
+                with self.subTest(value=value):
+                    self.set_read_deadline(value)
+                    self.assert_read_refused(self.req("/v1/rails/events", self.reader))
+                    self.assertEqual(self.req("/v1/version", self.admin)[0], 200)
 
     def test_sdk_adapter_keeps_only_structured_fields(self):
         native = SimpleNamespace(

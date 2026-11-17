@@ -11,6 +11,12 @@ Hyvv records worker observations in one `rails.sqlite` under its private local `
 
 Enroll a fixed numeric launcher endpoint with the coordinator using the existing protected launcher transport. This change adds no transport encryption: don't expose a cleartext bearer on an unprotected link. No credential/peer configuration means no export. Turning off `rails_enabled` on restart preserves existing source and ledger files. Do not place SQLite on a shared/network volume.
 
+### Time-limited canary reader
+
+Use an isolated canary launcher: the read credential covers its entire Rails chain. Give the canary coordinator a fresh read token, distinct from the control token, and list only that coordinator in `rails_read_peers`. In the private canary config set `rails_read_expires_at` to the **end of the approved window** as a JSON integer in UTC Unix seconds (0–253402300799 inclusive). Use a synchronized worker clock. For example, an approved cutoff of `2030-01-01T00:00:00Z` would be `"rails_read_expires_at": 1893456000`. This is an absolute timestamp, not a duration or a millisecond count.
+
+Omitting the key keeps the existing reader without an expiry; an explicit invalid value (including `null`, a string, a boolean or a fraction) disables reads. The launcher loads the deadline with the token at setup and checks its clock on each Rails GET. At or after the cutoff, both endpoints return non-retryable `401 auth_required` before accessing the ledger. Preserve the last committed cursor on refusal. Restarting with the same deadline does not extend it; for a new approved window, install a fresh read token and new deadline before starting the canary launcher.
+
 ## Pull protocol
 
 Both endpoints are `GET` on the existing listener. Only the replication reader can use them, and it cannot list attempts, dispatch, change config, read raw events, or use any other control route.
