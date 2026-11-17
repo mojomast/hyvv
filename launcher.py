@@ -97,7 +97,10 @@ MODELS = {
     "longcat-2.5-preview-free": _free("longcat-2.5-preview-free", 1_000_000),
 }
 FREE_POOL = [m for m, v in MODELS.items() if v.get("free")]  # deepseek first: preferred when all are equally fresh
-TIERS = {"simple": "pool:free", "standard": "zoo:glm-5.3-flash"}
+# Owner routing change (2026-11-17, MR.INDIA with the owner's OK): Zoo's free pass refuses
+# non-IDE API traffic, so the "standard" tier must never resolve to it. OpenCode Go's
+# deepseek-v4.1-flash is the host default now; naming it explicitly is the supported route.
+TIERS = {"simple": "pool:free", "standard": "go:deepseek-v4.1-flash"}
 FREE_TIER_DENIED = re.compile(r"FreeTierError|free tier can only be used", re.I)
 RATE_LIMIT = re.compile(r"\b429\b|rate.?limit|too many requests|quota", re.I)
 # Zoo answers 429 "Too many concurrent requests" with a Retry-After of 5-7s, and a 402
@@ -105,6 +108,14 @@ RATE_LIMIT = re.compile(r"\b429\b|rate.?limit|too many requests|quota", re.I)
 # failure. Both are retried; the 402 is matched only for a zoo-keyed model.
 RETRY_AFTER = re.compile(r"retry[\s_-]*after\W{0,3}(\d{1,4})", re.I)
 ZOO_ADMISSION = re.compile(r"\b402\b|insufficient credits", re.I)
+# A provider can stop serving a model to API traffic outright. Zoo's free pass did exactly
+# that mid-campaign ("Zoo Pass Pilot models are available in the Zoo Code IDE only."), which
+# arrives as a bare error event - no 402, no 429 - so it needs its own fallback branch; a
+# retry backoff would just repeat the refusal until the attempt died.
+MODEL_UNAVAILABLE = re.compile(
+    r"available in the .{0,40}IDE only|model[_ ]unavailable|model .{0,60} is not available|no longer available",
+    re.I,
+)
 ZOO_RETRY_AFTER_MAX = 300
 MONTHLY_LIMIT = re.compile(r"GoUsageLimitError|usage limit reached|UsageLimit", re.I)
 MONTHLY_LIMIT_HINT = re.compile(r"monthly|limitName", re.I)
@@ -1621,6 +1632,9 @@ class FakeBackend:
             evs = [{"kind": "error", "text": f.get("rate_limit_text") or "HTTP 429 Too Many Requests"}]
         if a.get("model") in f.get("deny_models", []):
             evs = [{"kind": "error", "text": "FreeTierError: OpenCode's free tier can only be used from within OpenCode."}]
+        if a.get("model") in f.get("unavailable_models", []):
+            evs = [{"kind": "error", "text": f.get("unavailable_text") or
+                    "Internal error: Zoo Pass Pilot models are available in the Zoo Code IDE only."}]
         self.models = getattr(self, "models", []) + [a.get("model")]
         self.runs[rid] = {"events": [dict(e, seq=i + 1) for i, e in enumerate(evs)], "delay": f.get("delay", 0), "t0": time.time(), "cancelled": False}
         return {"sandbox": "fake", "run_id": rid}
@@ -1983,6 +1997,10 @@ class Launcher:
                     if e["kind"] == "error" and a.get("kind") == "agy-cua": continue  # agy has no backoff/fallback path
                     if e["kind"] == "error" and FREE_TIER_DENIED.search(txt):
                         return await self._backoff(a, exhausted=True, reason="free tier refused")
+                    if e["kind"] == "error" and MODEL_UNAVAILABLE.search(txt):
+                        # The provider refuses this model for API traffic entirely: roll the
+                        # configured fallback once instead of finishing the attempt as failed.
+                        return await self._fallback_unavailable(a, reason=redact(txt)[:160])
                     if e["kind"] == "error" and ZOO_ADMISSION.search(txt) and is_zoo_model(self.cfg, a.get("model"), a.get("brief")):
                         # Zoo: 402 "Insufficient credits" is an admission/concurrency refusal, not a
                         # permanent failure -- retry it on the same model, honouring Retry-After if sent.
@@ -2180,6 +2198,29 @@ class Launcher:
             if not cand: return None
             m = min(cand, key=lambda x: (self.model_health[x]["last_limited"], self.model_health[x]["last_used"], FREE_POOL.index(x)))
             self.model_health[m]["last_used"] = time.time(); return m
+
+    async def _fallback_unavailable(self, a, reason="model unavailable"):
+        """Roll to the model spec's fallback after a provider refuses the model outright.
+
+        Unlike a 429/402 this never retries the refused model: one switch, then the queue
+        runs the attempt on the fallback. A second refusal (or a model with no fallback)
+        is terminal - the attempt must not bounce between models forever.
+        """
+        spec = model_spec(self.cfg, a.get("model"), a.get("brief"))
+        fb = spec.get("fallback")
+        await self.backend.cleanup(a)
+        if fb and not a.get("fallback"):
+            a["fallback"] = {"from": spec["name"], "to": fb, "reason": f"{reason} (model unavailable)", "at": time.time()}
+            a["model"] = fb
+            a.setdefault("model_history", []).append(
+                {"model": fb, "fallback": f"{spec['name']}->{fb}", "after": reason, "at": time.time()}
+            )
+            a["rate_limited"], a["cursor"] = 0, 0
+            for k in ("run_id", "sandbox"):
+                a.pop(k, None)
+            self._set(a, "queued", f"{reason}; model {spec['name']} unavailable, falling back to {fb}")
+            return
+        self._set(a, "failed", f"{reason}; model unavailable and no remaining fallback")
 
     async def _fallback_to_deepseek(self, a, reason="go monthly-limit 429"):
         # Retry once on DeepSeek official after a Go monthly-limit 429. Records fallback="deepseek".

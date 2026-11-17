@@ -155,8 +155,10 @@ class ProjectModelRouting(unittest.TestCase):
     def test_a_tier_beats_the_project_model(self):
         # submit() and route_preview() fold brief.tier into the name they pass, so at this layer
         # the tier arrives as `name` and must beat the project override.
+        # Owner routing change (2026-11-17): "standard" maps to the OpenCode Go default now
+        # (Zoo's free pass refuses non-IDE API traffic); the tier still beats the project model.
         spec = L.model_spec(self._cfg(), "standard", {"objective": "x", "project": PIN})
-        self.assertEqual(spec["name"], ZOO)
+        self.assertEqual(spec["name"], GO_NAMED)
 
     def test_the_project_model_beats_the_zoo_preference(self):
         os.environ["ORBIT_WORKER_ZOO_KEY"] = "test-only-not-a-real-key"
@@ -313,7 +315,8 @@ class RoutePreviewProject(unittest.TestCase):
             st, body = post(srv, "/v1/route", {"brief": {"objective": "x", "project": PIN, "tier": "standard"}})
             self.assertEqual(st, 200)
             self.assertEqual(body["requested"], "standard")
-            self.assertEqual(body["effective"]["name"], ZOO)
+            # Owner routing change (2026-11-17): the standard tier previews the Go default.
+            self.assertEqual(body["effective"]["name"], GO_NAMED)
             self.assertNotIn("project default", body["why"])
         finally:
             srv.shutdown()
