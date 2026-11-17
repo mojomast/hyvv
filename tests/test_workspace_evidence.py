@@ -101,7 +101,8 @@ class WorkspaceEvidence(unittest.TestCase):
         (wd / "b.txt").write_text("two\n")
         real_sh = self.be._sh
         for fragment, stage in (("git add -A", "stage"), ("--binary", "diff"),
-                                ("--name-status", "names"), ("sha256sum", "hash")):
+                                ("--name-status", "names"), ("sha256sum", "hash"),
+                                ("ls-files", "untracked")):
             for status in (1, None):
                 with self.subTest(stage=stage, status=status):
                     async def fail(sb, line, timeout_ms=120000):
@@ -112,13 +113,71 @@ class WorkspaceEvidence(unittest.TestCase):
                     self.assert_collection_error(wd, seed, stage)
         self.be._sh = real_sh
 
-    def test_quoted_filename_is_collected_without_shell_interpolation(self):
+    def test_failed_unstage_command_is_reported(self):
         wd, seed = self.seed()
+        (wd / "b.txt").write_text("two\n")
+        (wd / "side.log").write_text("x\n")  # out of lease: the unstage path runs
+        real_sh = self.be._sh
+        async def fail_rm(sb, line, timeout_ms=120000):
+            if "git rm" in line:
+                return "", "fixture unstage denied", 1
+            return await real_sh(sb, line, timeout_ms)
+        self.be._sh = fail_rm
+        self.assert_collection_error(wd, seed, "unstage")
+        self.be._sh = real_sh
+
+    def test_quoted_filename_is_collected_without_shell_interpolation(self):
         name = "quote' and space.txt"
+        (self.src / name).write_text("one\n")
+        self.git(self.src, "add", "-A")
+        self.git(self.src, "commit", "-qm", "quoted name")
+        self.rev = self.git(self.src, "rev-parse", "HEAD")
+        wd, seed = self.seed()
         (wd / name).write_text("two\n")
         patch = self.collect(wd, seed)
         self.assertEqual([row["path"] for row in patch["files"]], [name])
         self.assertFalse(patch["files"][0]["in_assigned_scope"])
+
+    def test_quoted_untracked_artifact_is_excluded_without_shell_interpolation(self):
+        wd, seed = self.seed()
+        name = "quote' and space.txt"
+        (wd / name).write_text("two\n")
+        patch = self.collect(wd, seed)
+        self.assertEqual(patch["files"], [])
+        self.assertEqual(patch["diff"], "")
+        self.assertEqual([row["path"] for row in patch["excluded_artifacts"]], [name])
+
+    def test_untracked_out_of_lease_artifact_is_not_carried_in_the_payload(self):
+        (self.src / "b.txt").write_text("base\n")
+        self.git(self.src, "add", "b.txt")
+        self.git(self.src, "commit", "-qm", "lease file")
+        self.rev = self.git(self.src, "rev-parse", "HEAD")
+        wd, seed = self.seed()
+        (wd / "b.txt").write_text("two\n")  # in-lease tracked modification
+        (wd / "uv.lock").write_text("lockfile created by the bee's own suite run\n")
+        patch = self.collect(wd, seed)
+        self.assertEqual([row["path"] for row in patch["files"]], ["b.txt"])
+        self.assertNotIn("uv.lock", patch["diff"])
+        self.assertEqual(patch["excluded_artifacts"],
+                         [{"path": "uv.lock", "reason": "untracked_outside_assigned_files"}])
+
+    def test_tracked_out_of_lease_change_still_reaches_the_verifier(self):
+        wd, seed = self.seed()
+        (wd / "a.txt").write_text("changed\n")  # tracked at base, outside the lease
+        patch = self.collect(wd, seed)
+        self.assertEqual([row["path"] for row in patch["files"]], ["a.txt"])
+        self.assertFalse(patch["files"][0]["in_assigned_scope"])
+        self.assertIn("a.txt", patch["diff"])
+
+    def test_unscoped_lane_keeps_collecting_untracked_files(self):
+        wd, seed = self.seed()
+        (wd / "uv.lock").write_text("lock\n")
+        attempt = self.attempt(wd, seed)
+        attempt["brief"].pop("assigned_files")
+        patch = asyncio.run(self.be.patch(attempt))
+        self.assertEqual([row["path"] for row in patch["files"]], ["uv.lock"])
+        self.assertFalse(patch["files"][0]["in_assigned_scope"])
+        self.assertEqual(patch["scope_note"], "no assigned_files lease: untracked files collected unfiltered")
 
     def sdk_fixture(self):
         run = SimpleNamespace(run_id=lambda: "fixture-run")

@@ -1208,16 +1208,35 @@ class CuaBackend:
         prefix = f"cd {shlex.quote(wd)} && "
         async def collect(command, stage):
             return await self._checked_sh(sb, prefix + command, stage=stage, code="patch_collection_failed")
+        lease = a["brief"].get("assigned_files")
+        scoped = isinstance(lease, (list, tuple)) and bool(lease)
+        untracked = None
+        if scoped:
+            # Untracked worktree files must be recorded before `git add -A` hides them: a bee's own
+            # tooling (lockfiles, caches) creates them, and they must not ride along in the payload.
+            untracked = {p for p in (await collect("git ls-files --others --exclude-standard -z", "untracked")).split("\0") if p}
         await collect("git add -A", "stage")
-        diff = await collect(f"git diff --cached --binary {base}", "diff")
-        names = await collect(f"git diff --cached --name-status --no-renames -z {base}", "names")
-        parts = names.split("\0") if names else [""]
-        if parts[-1] != "" or (len(parts) - 1) % 2:
-            raise WorkspaceError("patch_collection_failed", "names", "invalid Git name-status output")
+        async def entries():
+            rows = await collect(f"git diff --cached --name-status --no-renames -z {base}", "names")
+            parts = rows.split("\0") if rows else [""]
+            if parts[-1] != "" or (len(parts) - 1) % 2:
+                raise WorkspaceError("patch_collection_failed", "names", "invalid Git name-status output")
+            out = []
+            for st, path in zip(parts[:-1:2], parts[1:-1:2]):
+                if st not in ("A", "M", "D", "T") or not path:
+                    raise WorkspaceError("patch_collection_failed", "names", "invalid Git change entry")
+                out.append((st, path))
+            return out
+        rows = await entries()
+        # Only a brand-new staged file can be an untracked side-effect artifact. A path that exists
+        # in the base tree is a real tracked change (M/D/T) and always reaches the verifier, in
+        # lease or not; without a lease nothing is filtered.
+        dropped = [path for st, path in rows if st == "A" and path in untracked and not in_assigned_scope(path, lease)] if scoped else []
+        if dropped:
+            await collect("git rm -q --cached -f --ignore-unmatch -- " + " ".join(shlex.quote(p) for p in dropped), "unstage")
+            rows = await entries()
         files = []
-        for st, path in zip(parts[:-1:2], parts[1:-1:2]):
-            if st not in ("A", "M", "D", "T") or not path:
-                raise WorkspaceError("patch_collection_failed", "names", "invalid Git change entry")
+        for st, path in rows:
             sha = None
             if st != "D":
                 # No pipeline: a missing/unreadable file must not look like a successful cut(1).
@@ -1226,10 +1245,17 @@ class CuaBackend:
                 if not re.fullmatch(r"[0-9a-f]{64}", sha):
                     raise WorkspaceError("patch_collection_failed", "hash", "invalid file digest")
             files.append({"path": path, "status": st, "sha256": sha, "change": "deleted" if st.startswith("D") else ("added" if st.startswith("A") else "changed"),
-                          "in_assigned_scope": in_assigned_scope(path, a["brief"].get("assigned_files"))})
+                          "in_assigned_scope": in_assigned_scope(path, lease)})
+        diff = await collect(f"git diff --cached --binary {base}", "diff")
         if bool(diff) != bool(files):
             raise WorkspaceError("patch_collection_failed", "diff", "patch and changed-file evidence disagree")
-        return {"diff": diff, "files": files, "base": base}
+        evidence = {"diff": diff, "files": files, "base": base}
+        if dropped:
+            evidence["excluded_artifacts"] = [{"path": p, "reason": "untracked_outside_assigned_files"} for p in dropped]
+        elif not scoped:
+            # No lease to filter against: everything is collected exactly as before, and the evidence says why.
+            evidence["scope_note"] = "no assigned_files lease: untracked files collected unfiltered"
+        return evidence
 
     async def _inject_bbs_token(self, sb, attempt):
         """Mint via bbs-beetest/mint-token.ps1 (DPAPI refresh credential stays on this PC), upload only the access
