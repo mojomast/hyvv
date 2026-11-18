@@ -9,24 +9,68 @@ result references, never briefs, tokens, patches, logs or host paths.
 ## Outbox
 
 ```
-<data_dir>/events/outbox/<event_id>.json
+<data_dir>/events/outbox/<event_id>.json                     # POSIX
+<data_dir>/events/outbox/landed~<sha256-of-event-id>.json    # Windows
 ```
+
+On Windows the publisher hashes the exact, case-sensitive ID for the filename:
+the `:` in a canonical URN cannot be used in an ordinary Windows filename.
+The temporary name is also Windows-safe. The event's `id`, stored JSON bytes,
+notifier payload and export cursor are independent of that spelling. Existing
+ordinary legacy files remain readable; no rename or index migration is needed.
 
 Every event is written with:
 
 1. a temporary file in the same directory,
 2. `flush()` and `fsync()` on the file,
-3. `os.replace()` onto `<event_id>.json`,
-4. `fsync()` on the outbox directory.
+3. `os.replace()` onto the final name,
+4. `fsync()` on the outbox directory where supported.
 
 A crash therefore leaves either no event or one complete event, never a torn
 JSON file. The file is the replayable source of truth. Delivery to a notifier is
 a separate, best-effort signal; a notifier failure never removes or rewrites the
 outbox entry.
 
+Cooperating publishers hold `outbox/.publish.lock` across the conflict check
+and rename, so two overlapping terminal observations cannot replace each
+other's evidence. Index registration and notification happen after release.
+Leave the lock file in place while publishers are running.
+
 `landed_event_id(attempt_id, state, transition)` is deterministic, so replaying
 the same terminal observation addresses the same file. Without an explicit
 `terminal_transition_id`, the transition defaults to the terminal state.
+
+### Landing export index
+
+`GET /v1/landing/events` pages by durable integer position. Removing a file
+doesn't release its position. Both hashes on a returned row are computed from
+the retained file: `file_sha256` from its bytes and `sha256` from its canonical
+JSON. The exporter never changes or reconstructs outbox files.
+
+Page reads and registration still enumerate regular outbox files: a writer may
+die after publishing a file but before updating `events/export-index.json`.
+Without a durable list of pending writes, registering just the latest filename
+could assign it a position ahead of an earlier orphan. Discovery preserves the
+existing `(mtime_ns, inode, name)` ordering, including for legacy files whose
+name differs from their event ID.
+
+The `/1` index now stores an optional filename and stat hint (device, inode,
+size, modification and change times) for each retained event. An older index
+is enriched from disk on first use without renumbering. For unchanged indexed
+files, discovery uses metadata; a page reads only the rows after its cursor
+up to the limit plus one for `has_more`. Registration reads new or changed
+files and doesn't rehash unchanged indexed events. Malformed files and extra
+files with duplicate IDs are rechecked because they aren't indexed as separate
+events. The JSON index is still loaded and validated in full per operation and
+atomically replaced when it changes; the payload-read bound is not a constant
+latency guarantee.
+
+Cooperating local processes serialize index updates via `events/export-index.lock`
+(`flock` on POSIX, an exclusive byte-range lock on Windows). Keep the lock file
+in place while exporters are running. If lock acquisition or a required read
+fails, export returns HTTP 503 without a cursor; retry from the last consumed
+position. This lock covers index publication, not attempt execution or notifier
+delivery.
 
 ## CloudEvents envelope
 
@@ -73,13 +117,13 @@ root, not inside `data`.
 
 Optionally, the envelope carries the attempt receipt's usage block as the
 CloudEvents extension attribute `rizzstackusage` (envelope root, sibling of
-`id`, `source`, `data`; never inside `data`). The launcher emits the attribute
-today, but nothing consumes it yet: no coordinator-side reader exists in the
-current stack. Two consumer changes are explicitly pending — the bundlebees
-envelope allowlist still has to learn `rizzstackusage`, and the orbitdesktop
-outbox source still has to cross to this event type — so until both land the
-attribute rides the event unread, and consumers that ignore unknown envelope
-attributes are unaffected.
+`id`, `source`, `data`; never inside `data`). End-to-end usage accounting
+requires a bundlebees landing validator that accepts this extension and an
+orbitdesktop outbox reader that reads it at the envelope root. Older strict
+validators can refuse the event, while readers looking only for nested
+receipt usage can skip its counts. Verify both consumers before deploying
+these producer events; successful receipt ingestion alone is not evidence
+that the outbox path works.
 
 ```json
 {
@@ -116,7 +160,7 @@ Attributes are optional and scrubbed:
 | --- | --- | --- |
 | `input`, `output`, `cache_read`, `cache_write`, `reasoning`, `thinking`, `total` | the receipt's `observed.usage` (provider usage object or JSON string), normalized onto these canonical counts | numeric, non-negative integers under the magnitude bound: a count at or above 1,000,000,000 is refused (absent, never clamped — no single run consumes a billion tokens or issues a billion tool calls); a count the provider never reported is absent, never zero-filled (a zero the provider actually reported is kept) |
 | `tool_calls` | the receipt's `observed.tool_calls` | non-negative integer under the same magnitude bound, else absent |
-| `stop_reason` | the receipt's `observed.stop_reason` | at most 64 characters. A known launcher stop reason (`end_turn`, `max_tokens`, `stop_sequence`, `tool_use`, `tool_calls`, `content_filter`, `length`, `stop`, `error`, `timeout`, `aborted`, `cancelled`, `canceled`, `interrupted`, `refusal`, `unknown`, `other`) passes lowercased. Any other value must survive strict scrubbing: it is refused — the field stays absent — when the redactor would rewrite it or when it is a URL, a host/IP (IPv4 or IPv6, bare or bracketed), a host:port or a filesystem path |
+| `stop_reason` | the receipt's `observed.stop_reason` | At most 64 characters. Known launcher reasons pass lowercased. A provider-specific code (ASCII letter followed by letters, digits, `_` or `-`) or the legacy `turn ended` label must also pass scrubbing. Other free text stays in the receipt; omitting this optional field does not suppress token counts. |
 | `model` | the attempt model, then the receipt's `source.model` | identifier only. The value passes through the redactor and the same URL/path refusal: a value the redactor would rewrite, or one that looks like a URL, a host/IP (IPv4 or IPv6, bare or bracketed), a host:port or a filesystem path, is refused and the field stays absent, as is a dotted host shape — a run of dot-separated name segments whose final segment is a private-network suffix (`internal`, `local`, `lan`, `corp`, `home.arpa`) or an alpha-only top-level domain of two or more letters (a dotted version segment such as `v4.1` or `deepseek-v4.1-flash` is kept) |
 | `route` | provider path that served the run: `zoo` / `go` / `deepseek` from the model prefix or allow-list entry, `free` for keyless free-pool entries, `agy` for agy-cua | absent when it cannot be derived |
 
@@ -146,9 +190,8 @@ are byte-identical to the pre-usage shape.
 Idempotence is unchanged: the attribute lives outside the conflict evidence, the
 event id stays `(attempt_id, terminal state, transition)`, and a re-observed
 attempt returns the existing durable event whether or not the new observation
-carries usage. The outbox file is written once; the pending coordinator-side
-consumer will deduplicate by the attempt key, so a re-emitted event never
-double-counts.
+carries usage. The outbox file is written once; downstream usage accounting
+must deduplicate by the attempt key so replay never double-counts.
 
 ### Field sources
 
@@ -268,6 +311,8 @@ is built.
 
 ```
 python3 -m unittest tests.test_landing_events -v
+python3 -m unittest tests.test_landing_export_storage -v
+python3 -m unittest tests.test_landing_publication -v
 python3 -m pytest tests/test_bee_landed_usage.py -q
 ```
 

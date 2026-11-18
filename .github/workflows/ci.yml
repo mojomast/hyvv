@@ -19,8 +19,8 @@ permissions: {}
 
 jobs:
   windows-provisioning:
-    # The full Windows matrix stays deferred (Kyle, Nov 12). Provisioning needs
-    # real Windows path/reparse semantics, so this job runs only its tests.
+    # The full Windows matrix stays deferred (Kyle, Nov 12). These focused
+    # tests need native Windows path/reparse and cross-process lock semantics.
     name: provisioning (windows)
     runs-on: windows-latest
     permissions:
@@ -40,6 +40,12 @@ jobs:
         run: |
           uv sync --frozen --no-dev || uv sync --no-dev
           uv run python -m unittest tests.test_provisioning tests.test_provisioning_api tests.test_provisioning_convergence -v
+
+      - name: Landing publication, export storage and cross-process locking
+        run: uv run python -m unittest tests.test_landing_publication tests.test_landing_export_storage -v
+
+      - name: Rails journal, launcher controller and authenticated loopback export
+        run: uv run python -m unittest tests.test_rails_emission tests.test_rails_native -v
 
   test:
     name: test

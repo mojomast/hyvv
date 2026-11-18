@@ -10,6 +10,7 @@ narrow token-scoped HTTP API on loopback or a Tailscale address only.
 """
 from __future__ import annotations
 import argparse, asyncio, bisect, platform, hashlib, hmac, ipaddress, json, os, re, shlex, socket, sys, threading, time, uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 try:
@@ -200,7 +201,7 @@ def redact(s):
 
 # ---------------------------------------------------------------- bee landed events
 # A terminal attempt produces exactly one durable CloudEvent. The event is written to
-# <data_dir>/events/outbox/<event_id>.json with temp-file + fsync + rename, so a crash
+# <data_dir>/events/outbox/*.json with temp-file + fsync + rename, so a crash
 # can leave a complete event or no event, never a torn one. Delivery is a local signal
 # (file or Unix socket); the outbox file itself is the replayable source of truth.
 LANDED_EVENT_TYPE = "rizzstack.bee.landed.v1"
@@ -451,21 +452,28 @@ _USAGE_STOP_REASONS = frozenset((
     "cancelled", "canceled", "interrupted", "refusal", "unknown", "other",
 ))
 
+# Keep optional metadata within the vocabulary accepted by the coordinator.
+# A provider's prose explanation belongs in its receipt; it must not prevent
+# an otherwise valid terminal event (and its usage counts) from being consumed.
+_USAGE_REASON_LABEL = re.compile(r"[A-Za-z][A-Za-z0-9_-]*|turn ended")
+_USAGE_MODEL_LABEL = re.compile(
+    r"(?:(?:zoo|go|deepseek):(?=[A-Za-z]))?[A-Za-z0-9][A-Za-z0-9_+-]*(?:\.[0-9][A-Za-z0-9_+-]*)*"
+)
+
 
 def _usage_stop_reason(value):
     """A stop reason that may cross the event, or None when it must not.
 
-    Known launcher stop reasons pass lowercased. Anything else must survive
-    strict scrubbing: the value is refused when the redactor would rewrite it
-    (a secret-shaped run) or when it looks like a URL, a host/IP, a host:port
-    or a filesystem path - such a value never reaches the event."""
+    Known launcher stop reasons pass lowercased. Other labels must fit the
+    coordinator's code format and pass scrubbing; raw receipt prose stays local."""
     text = _bounded_text(value, 64)
     if not text:
         return None
     low = text.lower()
     if low in _USAGE_STOP_REASONS:
         return low
-    if redact(text) != text or _USAGE_FREEFORM_RE.search(text):
+    if (redact(text) != text or _USAGE_FREEFORM_RE.search(text)
+            or not _USAGE_REASON_LABEL.fullmatch(text) or low == "localhost"):
         return None
     return text
 
@@ -483,7 +491,8 @@ def _usage_model(value):
         return None
     if redact(text) != text or _USAGE_MODEL_RE.search(text):
         return None
-    if _USAGE_MODEL_HOSTISH_RE.search(text):
+    if (_USAGE_MODEL_HOSTISH_RE.search(text) or not _USAGE_MODEL_LABEL.fullmatch(text)
+            or text.rpartition(":")[2].lower() == "localhost"):
         return None
     return text
 
@@ -664,14 +673,14 @@ def _landed_outbox(data_dir):
 
 def _find_landed_events(outbox, attempt_id):
     found = []
-    try:
-        paths = sorted(outbox.glob("*.json"))
-    except OSError:
-        return found
+    # Caller owns the publication lock and has created the directory. A
+    # failed listing/read is not evidence that this attempt has never landed.
+    with os.scandir(outbox) as entries:
+        paths = sorted(Path(e.path) for e in entries if e.name.endswith(".json") and e.is_file(follow_symlinks=False))
     for path in paths:
         try:
             event = json.loads(path.read_text("utf-8"))
-        except (OSError, ValueError):
+        except (FileNotFoundError, ValueError):
             continue
         data = event.get("data") if isinstance(event, dict) else None
         if isinstance(data, dict) and data.get("attempt_id") == attempt_id:
@@ -679,49 +688,92 @@ def _find_landed_events(outbox, attempt_id):
     return found
 
 
-def _fsync_dir(path):
+def _fsync_dir(path, *, required=False):
     try:
         fd = os.open(str(path), os.O_RDONLY)
     except OSError:
+        if required:
+            raise
         return
     try:
         os.fsync(fd)
     except OSError:
-        pass
+        if required:
+            raise
     finally:
         os.close(fd)
 
 
-def _register_landed_file(outbox):
-    """Best-effort index registration after the immutable outbox file is durable."""
+def _register_landed_file(outbox, *, expected_event=None):
+    """A registration failure leaves the file for recovery, but cannot authorize delivery."""
     if _landing_export is None:
-        return
+        return False
     try:
-        _landing_export.register_landed_file(outbox)
+        _landing_export.register_landed_file(outbox, expected_event=expected_event)
+        return True
+    except _landing_export.LandingContentConflict as ex:
+        raise LandedEventConflict(str(ex)) from ex
     except Exception:
         # The next export scans the outbox and registers an unindexed file.
-        pass
+        return False
 
 
-def write_landed_event(outbox, event):
-    """Atomically persist one event as <outbox>/<id>.json; never overwrite conflicting evidence."""
-    outbox = Path(outbox)
-    event_id = str(event.get("id") or "")
-    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", event_id):
-        raise ValueError("invalid landed event id")
-    path = outbox / (event_id + ".json")
-    if path.exists():
+_WINDOWS_LANDED_NAMES = os.name == "nt"
+_LANDED_PUBLISH_LOCK = threading.Lock()
+
+
+@contextmanager
+def _landed_publication(outbox):
+    # Serialize the attempt-level conflict check *and* publication, even when
+    # two terminal states have different IDs. Closing releases the OS lock on
+    # both success and process death. Registration and notification run outside.
+    outbox.mkdir(parents=True, exist_ok=True)
+    with _LANDED_PUBLISH_LOCK, (outbox / ".publish.lock").open("a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+def _landed_names(outbox, event_id):
+    """Preferred basename, followed by any compatible pre-existing spelling."""
+    plain = event_id + ".json"
+    # '~' is outside the accepted ID alphabet. Hash the *case-sensitive* ID,
+    # not a sanitized spelling: e.g. A:B, A_B and a:b must stay distinct.
+    portable = "landed~" + hashlib.sha256(event_id.encode("ascii")).hexdigest() + ".json"
+    if not _WINDOWS_LANDED_NAMES:
+        return (plain, portable)  # also recognize an outbox copied from Windows
+    # An older Windows writer could persist ordinary names. Never open an ADS
+    # or DOS device. Only reuse the exact legacy spelling, not a folded alias.
+    device = re.match(r"(?:con|prn|aux|nul|com[0-9]|lpt[0-9])\.", plain, re.I)
+    if ":" not in plain and not device and any(p.name == plain for p in outbox.iterdir()):
+        return (portable, plain)
+    return (portable,)
+
+
+def _persist_landed_event(outbox, event, event_id):
+    """Called under _landed_publication. Return (path, stored event, created)."""
+    names = _landed_names(outbox, event_id)
+    for candidate in names:
+        path = outbox / candidate
         try:
             existing = json.loads(path.read_text("utf-8"))
+        except FileNotFoundError:
+            continue
         except (OSError, ValueError) as ex:
             raise LandedEventConflict(f"existing landed event {event_id} is unreadable") from ex
-        if _landing_conflicts(existing, event):
-            raise LandedEventConflict(f"conflicting terminal evidence for attempt {event['data'].get('attempt_id')}")
-        _register_landed_file(outbox)
-        return path
-    outbox.mkdir(parents=True, exist_ok=True)
+        if (_landing_conflicts(existing, event) or
+                existing.get("id", path.stem) != event.get("id")):
+            raise LandedEventConflict(f"conflicting landed event at {candidate}")
+        return path, existing, False
+    path = outbox / names[0]
     payload = json.dumps(event, sort_keys=True, indent=1, ensure_ascii=False).encode("utf-8")
-    tmp = outbox / (f".{event_id}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    nonce = uuid.uuid4().hex
+    tmp = outbox / (f".{nonce}.tmp" if _WINDOWS_LANDED_NAMES else f".{event_id}.{os.getpid()}.{nonce}.tmp")
     try:
         with open(tmp, "wb") as f:
             f.write(payload)
@@ -735,6 +787,17 @@ def write_landed_event(outbox, event):
                 tmp.unlink()
         except OSError:
             pass
+    return path, event, True
+
+
+def write_landed_event(outbox, event):
+    """Atomically persist one event; never overwrite conflicting evidence."""
+    outbox = Path(outbox)
+    event_id = str(event.get("id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", event_id):
+        raise ValueError("invalid landed event id")
+    with _landed_publication(outbox):
+        path, _, _ = _persist_landed_event(outbox, event, event_id)
     _register_landed_file(outbox)
     return path
 
@@ -823,31 +886,39 @@ def emit_landed_record(a, data_dir, cfg=None, result_path=None):
     cfg = cfg or {}
     event = build_landed_event(a, cfg, result_path)
     outbox = _landed_outbox(data_dir)
-    for path, existing in _find_landed_events(outbox, event["data"]["attempt_id"]):
-        if _landing_conflicts(existing, event):
-            raise LandedEventConflict(f"conflicting terminal evidence for attempt {event['data']['attempt_id']}")
-        return path, existing, False
-    path = write_landed_event(outbox, event)
-    notify_landed_event(event, cfg)
-    return path, event, True
+    with _landed_publication(outbox):
+        for path, existing in _find_landed_events(outbox, event["data"]["attempt_id"]):
+            if _landing_conflicts(existing, event):
+                raise LandedEventConflict(f"conflicting terminal evidence for attempt {event['data']['attempt_id']}")
+            stored, created = existing, False
+            break
+        else:
+            path, stored, created = _persist_landed_event(outbox, event, event["id"])
+    registered = _register_landed_file(outbox, expected_event=stored if created else None)
+    if created and registered:
+        notify_landed_event(stored, cfg)
+    return path, stored, created
 
 
 def replay_landed_events(data_dir, cfg=None, notifier=None):
-    """Re-signal every durable outbox event (at-least-once). Returns (delivered, total)."""
-    outbox = _landed_outbox(data_dir)
+    """Re-signal retained, pinned events in position order. Returns (delivered, total)."""
+    if _landing_export is None:
+        raise OSError("notifier replay requires the landing index")
+    after = None
     delivered = total = 0
-    try:
-        paths = sorted(outbox.glob("*.json"))
-    except OSError:
-        paths = []
-    for path in paths:
+    while True:
         try:
-            event = json.loads(path.read_text("utf-8"))
-        except (OSError, ValueError):
-            continue
-        total += 1
-        delivered += 1 if notify_landed_event(event, cfg, notifier) else 0
-    return delivered, total
+            page = _landing_export.export_events(data_dir, after=after, registered_only=True)
+        except _landing_export.LandingContentConflict as ex:
+            raise LandedEventConflict(str(ex)) from ex
+        for row in page["events"]:
+            # Send exactly the verified object; never reopen a filename after
+            # the exporter releases the index lock.
+            total += 1
+            delivered += 1 if notify_landed_event(row["event"], cfg, notifier) else 0
+        if not page["has_more"]:
+            return delivered, total
+        after = page["next_cursor"]
 
 
 def load_config(path):
@@ -1337,8 +1408,11 @@ class CuaBackend:
     async def events(self, a, cursor):
         if a.get("kind") == "agy-cua": return await self.agy.events(a, cursor)
         page = await (await self._run(a)).events(cursor, 200)
+        if self.cfg.get('rails_enabled') is True:
+            from rails_log_source import sdk_tool_fields
         return [{"seq": e.seq, "kind": e.kind, "line": redact(e.line or ""), "stop_reason": e.stop_reason,
-                 "text": redact(e.text) if e.kind in ("message", "error", "turn_ended") else None} for e in page.events], page.cursor
+                 "text": redact(e.text) if e.kind in ("message", "error", "turn_ended") else None,
+                 **(sdk_tool_fields(e) if self.cfg.get('rails_enabled') is True else {})} for e in page.events], page.cursor
 
     async def interrupt(self, a):
         if a.get("kind") == "agy-cua": return await self.agy.interrupt(a)
@@ -1737,6 +1811,11 @@ class Launcher:
         self.started_at = time.time(); self.loop_lag_ms = 0.0
         self.landing_conflicts = []
         self._load()
+        self.rails = None
+        if cfg.get('rails_enabled') is True:
+            from rails_emitter import RailsEmitter
+            self.rails = RailsEmitter(self.dir)
+            self.rails.recover(self.attempts)
         self.recover_landed_events()
 
     # journal: one JSON per attempt (atomic replace) + append-only events log
@@ -1745,8 +1824,22 @@ class Launcher:
         p = self._path(a["attempt_id"]); tmp = p.with_suffix(".tmp")
         tmp.write_text(json.dumps(a, indent=1), "utf-8"); os.replace(tmp, p)
     def _append_events(self, a, evs):
-        with open(self.dir / "attempts" / f"{a['attempt_id']}.events.jsonl", "a", encoding="utf-8") as f:
-            for e in evs: f.write(json.dumps(e) + "\n")
+        path = self.dir / "attempts" / f"{a['attempt_id']}.events.jsonl"
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                for e in evs: f.write(json.dumps(e) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            # Windows has no portable directory fsync. Health explicitly
+            # scopes completeness to the retained bytes, including after restart.
+            if os.name != "nt":
+                _fsync_dir(path.parent, required=True)
+        except OSError:
+            if self.rails:
+                self.rails.journal_write_failed(a['attempt_id'])
+            raise
+        if self.rails:
+            self.rails.ingest(a['attempt_id'])
     def _load(self):
         for p in (self.dir / "attempts").glob("*.json"):
             if p.name.count(".") != 1: continue  # skip <id>.result.json (and any other sidecar)
@@ -1879,6 +1972,9 @@ class Launcher:
             result_path = self.landed_result_path(a)
         with self.lock:
             _, event, _ = emit_landed_record(a, self.dir, self.cfg, result_path)
+            if self.rails:
+                self.rails.receipt(a['attempt_id'], event.get(LANDED_USAGE_ATTR), MODELS.keys() | AGY_MODELS,
+                                   agy=a.get('kind') == 'agy-cua')
             return event
 
     def replay_landed_events(self, notifier=None):
@@ -2486,13 +2582,19 @@ def apply_config_patch(L, b):
 
 
 def make_handler(L, token):
+    rails_access = None
+    if getattr(L, 'cfg', {}).get('rails_enabled') is True:
+        from rails_export import ReadAccess, handle_read
+        rails_access = ReadAccess(L.cfg, token)
     class H(BaseHTTPRequestHandler):
         server_version = "orbit-launcher/" + VERSION
         protocol_version = "HTTP/1.1"  # keep-alive (plan C); every reply sets Content-Length
         timeout = 120  # idle keep-alive sockets close after 2 min (the box client drops them after 60 s)
         def log_message(self, *a): pass
-        def _send(self, code, obj):
-            body = json.dumps(obj).encode(); self.send_response(code)
+        def _send(self, code, obj, *, rails=False):
+            body = (json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=True) if rails else json.dumps(obj)).encode()
+            self.send_response(code)
+            if rails: self.send_header('Cache-Control', 'no-store')
             self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body)))
             if self.close_connection: self.send_header("Connection", "close")
             self.end_headers(); self.wfile.write(body)
@@ -2507,6 +2609,9 @@ def make_handler(L, token):
             if n > 256_000: raise ValueError("body too large")
             return json.loads(self.rfile.read(n) or b"{}")
         def do_GET(self):
+            if rails_access is not None and self.path.startswith('/v1/rails/'):
+                code, obj = handle_read(self, L, rails_access, MODELS.keys() | AGY_MODELS)
+                return self._send(code, obj, rails=True)
             if not self._auth(): return
             p = self.path.split("?")[0].strip("/").split("/"); q = dict(x.split("=", 1) for x in self.path.partition("?")[2].split("&") if "=" in x)
             if p == ["v1", "attempts"]:  # list (0.1.11, bundlebees): public fields + lease info only, newest 200
@@ -2560,12 +2665,17 @@ def make_handler(L, token):
                         after=unquote(q["after"]) if "after" in q else None,
                         limit=q.get("limit"),
                     )
+                except _landing_export.LandingContentConflict as ex:
+                    return self._send(409, {"code": ex.code, "error": str(ex)})
                 except _landing_export.LandingExportError as ex:
                     body = {"error": str(ex)}
                     code = getattr(ex, "code", None)
                     if code:
                         body["code"] = code
                     return self._send(400, body)
+                except OSError:
+                    return self._send(503, {"code": "landing_storage_unavailable",
+                                            "error": "landing export storage unavailable; retry with the same cursor"})
                 return self._send(200, page)
             if len(p) >= 3 and p[:2] == ["v1", "attempts"]:
                 a = L.attempts.get(p[2])
@@ -2913,15 +3023,16 @@ def serve(cfg, backend_name="cua"):
     if len(token) < 32: raise SystemExit("api token missing/too short; run scripts/new-token.ps1")
     backend = FakeBackend(cfg) if backend_name == "fake" else CuaBackend(cfg)
     L = Launcher(cfg, backend)
+    handler = make_handler(L, token)  # validate read-vs-control scopes before scheduling attempts
     L.provisioner = build_provisioner(cfg)
     write_pidfile(cfg)
     threading.Thread(target=L.loop.run_forever, daemon=True).start(); L.kick()
     asyncio.run_coroutine_threadsafe(_lag_probe(L), L.loop)
-    srv = ThreadingHTTPServer((cfg["bind"], cfg["port"]), make_handler(L, token))
+    srv = ThreadingHTTPServer((cfg["bind"], cfg["port"]), handler)
     for extra in cfg.get("extra_binds") or []:  # 0.1.11: optional extra listener, loopback only (local coordinator)
         if extra == cfg["bind"]: continue  # already the primary listener
         if not ipaddress.ip_address(extra).is_loopback: raise SystemExit(f"extra_binds allows loopback only, got {extra}")
-        xs = ThreadingHTTPServer((extra, cfg["port"]), make_handler(L, token))
+        xs = ThreadingHTTPServer((extra, cfg["port"]), handler)
         threading.Thread(target=xs.serve_forever, daemon=True).start()
     print(f"orbit-launcher {VERSION} on http://{cfg['bind']}:{cfg['port']} max_concurrent={cfg['max_concurrent']} model={cfg['model']}", flush=True)
     srv.serve_forever()

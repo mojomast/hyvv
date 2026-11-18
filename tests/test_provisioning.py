@@ -6,6 +6,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import provisioning as P
@@ -228,6 +229,35 @@ class ProvisionTests(Harness):
         with self.assertRaises(P.ProvisionError) as caught:
             prov.provision(self.request())
         self.assertEqual(caught.exception.code, "checkout_dirty")
+
+
+class MirrorRegistrationTests(Harness):
+    def setUp(self):
+        super().setUp()
+        mirror = (self.tmp / 'enrolled.git').as_uri()
+        self.make(git=FakeGit(remote=mirror))
+        self.prov.policy = {'smoke': replace(self.prov.policy['smoke'], mirrors=((REPO, mirror),))}
+        self.config_path = self.tmp / 'registry.json'
+        self.prov.registry = P.RegistryStore(self.config_path)
+
+    def restart(self):
+        return P.Provisioner(policy=self.prov.policy, journal=P.Journal(self.tmp / 'journal'),
+                             registry=P.RegistryStore(self.config_path), git=self.git)
+
+    def test_restart_revalidates_enrolled_mirror_without_cloning(self):
+        first = self.prov.provision(self.request())
+        self.git.calls.clear()
+        fresh = self.restart()
+        self.assertEqual(fresh.lookup_receipt('prov_1'), first)
+        self.assertEqual(fresh.provision(self.request()), first)
+        self.assertNotIn('clone', [call[0] for call in self.git.calls])
+
+    def test_changed_mirror_is_not_authorized_by_old_registration(self):
+        self.prov.provision(self.request())
+        self.prov.policy = {'smoke': replace(self.prov.policy['smoke'], mirrors=())}
+        with self.assertRaises(P.ProvisionError) as refused:
+            self.prov.lookup_receipt('prov_1')
+        self.assertEqual(refused.exception.code, 'receipt_stale')
 
 
 class CleanupTests(Harness):

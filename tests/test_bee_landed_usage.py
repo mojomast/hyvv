@@ -245,8 +245,10 @@ class Scrubbing(unittest.TestCase):
         self.assertEqual(L._usage_stop_reason("end_turn"), "end_turn")
         self.assertEqual(L._usage_stop_reason("MAX_TOKENS"), "max_tokens")
         self.assertEqual(L._usage_stop_reason("stop_sequence"), "stop_sequence")
-        # plain non-enum free text survives
+        # Codes and the bounded legacy label cross the coordinator's envelope.
         self.assertEqual(L._usage_stop_reason("turn ended"), "turn ended")
+        self.assertEqual(L._usage_stop_reason("provider_stop"), "provider_stop")
+        self.assertIsNone(L._usage_stop_reason("generation completed normally"))
         # hostile shapes are refused outright
         self.assertIsNone(L._usage_stop_reason(PRIVATE_URL))
         self.assertIsNone(L._usage_stop_reason(PRIVATE_HOST))

@@ -41,6 +41,8 @@ Nothing below the first row ships in the launcher yet. `GET /v1/attempts/{attemp
 
 The generated table covers the attempt, artifact and lease contract. The provisioning and landing-export routes are additive, are documented below, and are not yet listed in `contract/v1/STATUS.json` because they are merged on `main` but not in a released build.
 
+The optional [Rails worker recorder and read-only replication API](docs/rails.md) are available in this working tree. Recording and export are disabled by default; the replication reader has a separate credential from launcher control.
+
 ## Worker provisioning and landing export (merged on main; not released)
 
 Scoped coding attempts also require a verified per-attempt Git workspace and
@@ -77,6 +79,8 @@ A profile may also map a canonical repository to an enrolled mirror (`mirrors`),
 **Deployment status:** the endpoints are merged on `main` but do not exist on the running released launcher. Bundlebees pins the reviewed provisioning revision `8ffaf73000974e0ba273c72fca42e07b79c38106` and sets `REQUIRE_HYVV=1` in CI. Deploying the merged build, enrolling `provisioning-policy.json`, and performing the real-TTY authorization remain separate operator actions; the real-bee canary is **NOT RUN**.
 
 **Canonical landing export.** `GET /v1/landing/events?after=<position>&limit=<n>` is an authenticated, read-only view of the durable outbox. It exports the stored canonical CloudEvents, never a reconstruction from attempt summaries. The cursor is a durable monotonic integer export position independent of the canonical event ID, so an event appended later is returned even when its ID sorts lower. Each row carries `cursor`, `event_id`, the canonical-content `sha256`, `file_sha256` for the exact stored bytes, and `event`; the page carries `next_cursor`, `has_more`, `retention` and the `rizzstack.bee-landed-export/1` schema. Invalid, expired and incompatible cursors return HTTP 400 with an explicit error code; unknown cursors are never a successful empty page. The bundlebees client recovers a legacy hash cursor once from the durable beginning under idempotent local ingestion and then persists the integer position. Cursor persistence occurs only after durable local ingestion, and exporter restart/crash recovery scans the outbox for unindexed files.
+
+If an I/O error prevents reading the outbox or updating its index, landing export returns HTTP 503 (`landing_storage_unavailable`) without a page or cursor. An unreadable or inconsistent index (for example, duplicate positions) is preserved for diagnosis; repair it before retrying. Retry with the last consumed cursor once storage is available.
 
 **Protocol pinning.** A backend must advertise `rizzstack.provisioning/1`; a `404`, or a different schema, is incompatible and dispatch stops. There is no legacy fallback. The receipt carries `status: ready`, `repo`, `resolved_revision`, `project`, `profile`, `host`, `verified` (`head`, `detached`, `clean`) and `transport`; the coordinator checks each field against the authorization and binds the job to the receipt digest. `5xx` means `ProvisionUncertain` — reconcile, never re-POST; `409` is a conflict.
 
