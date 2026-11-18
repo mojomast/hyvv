@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/images/hyvv-hero.jpg" alt="hyvv, part of rizzstack, the worker host: a dark hexagonal hive pod whose sealed glass cells each hold one glowing bee. Tagline: one host, many sealed sandboxes; provider keys stay on the machine; coordinators speak the versioned /v1 contract." width="1280"></p>
+
 # hyvv
 
 Worker-host runtime for local agent sandboxes. A hyvv process runs on a PC or SSH host, owns the sandboxes, holds provider keys without ever returning them, and exposes a narrow token-scoped HTTP API on loopback or a Tailscale address only.
@@ -39,6 +41,10 @@ Nothing below the first row ships in the launcher yet. `GET /v1/attempts/{attemp
 | **Proposed** (`proposed`) | — | coordinator-signed briefs (HMAC over the canonical brief with the per-coordinator key, verified at settle) |
 <!-- status:end -->
 
+![The same status table as rendered output of python -m contract.v1.status, with hyvv version 0.1.17: launcher 0.1.15 endpoints, the reference-only artifact route, the specified lease routes and the proposed signed briefs.](docs/images/status-table.png)
+
+*`uv run python -m contract.v1.status` on this branch, rendered (captured Nov 18 2026).*
+
 The generated table covers the attempt, artifact and lease contract. The provisioning and landing-export routes are additive, are documented below, and are not yet listed in `contract/v1/STATUS.json` because they are merged on `main` but not in a released build.
 
 The optional [Rails worker recorder and read-only replication API](docs/rails.md) are available in this working tree. Recording and export are disabled by default; the replication reader has a separate credential from launcher control.
@@ -53,6 +59,10 @@ for the failure contract and commissioning checks.
 The merged `main` branch adds the launcher-owned operation a coordinator needs before it can dispatch a bee into a repository the host has never seen: create the workspace, check out the exact commit, verify it, and register it as an authorized project without a restart and without the coordinator touching the host filesystem. PR #5 (merged at `fe606b237bb9d447223ca943aeedb899ef527d29`) contains the provisioning work from PR #4 plus canonical landing-event export; PR #4 was closed as superseded. It is governed by a host-enrolled policy, not by the request. The design is recorded in [`docs/adr/0001-worker-provisioning.md`](docs/adr/0001-worker-provisioning.md).
 
 **What works** (171 unit tests and 93 contract tests on 2026-11-14; deterministic, no live host):
+
+![Provisioning and landing-export unit suites: 70 tests OK, including refusal of unlisted repositories, short SHAs, traversal names, dirty checkouts, wrong revisions, mismatched remotes and missing bearer auth, plus canonical event export, explicit cursor errors and crash recovery.](docs/images/provisioning-landing-tests.png)
+
+*A real run of the provisioning and landing-export suites (no network, no live host), filtered to the refusal and recovery cases.*
 
 - `GET /v1/provision/capabilities` — advertises `rizzstack.provisioning/1`, `enabled`, profiles, whether cleanup and receipt lookup are supported, mirrored repositories, and the idempotency rule. A disabled host advertises `enabled: false`; it never pretends.
 - `POST /v1/provision/project` — declarative request: `repo` (`owner/name`), full 40-hex `source_rev`, `profile`, `job_id`, `project`, `idempotency_key`. The host derives the path from the profile's `workspace_root` plus a validated name.
@@ -168,6 +178,10 @@ uv run python -m contract            # or: scripts/contract-test.sh  /  scripts/
 ```
 
 By default this starts an in-process hyvv (`launcher.py` with its scripted fake backend, no sandboxes or keys) on a free loopback port and runs every test in `contract/v1/tests`: the schema checks, the artifact acceptance criteria `AC-001`–`AC-009` against `reference.py`, and the HTTP conformance suite `test_http_v1.py` for the implemented `/v1` endpoints (auth, health, projects, containers, attempt listing against `schemas/attempt.json`, rejected writes, and a create → events → result → review lifecycle).
+
+![The /v1 contract suite against an in-process hyvv on loopback: artifact acceptance criteria AC-001 to AC-009 all ok; 93 tests ran, OK with 3 skipped.](docs/images/contract-tests.png)
+
+*`uv run python -m contract -v` against the in-process host, filtered to the artifact acceptance criteria and the summary (captured Nov 18 2026).*
 
 To check a running host instead, give its base URL and a token file:
 
