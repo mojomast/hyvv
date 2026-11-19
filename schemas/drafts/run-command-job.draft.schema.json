@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hyvv:schema:run-command-job:draft-rev2",
+  "title": "R4 run-command job (draft, rev-2, not frozen)",
+  "description": "Draft, rev-2, not frozen. Design-only request envelope for a future hyvv /v1 run-command job; no launcher.py change exists.",
+  "x-status": "draft",
+  "x-rev": 2,
+  "x-frozen": false,
+  "x-design-only": true,
+  "x-source-rev": "2a3bdd4584ac8d44b0d250ef4de587692748894e",
+  "$comment": "Field refusals named in description fields match section 3 of docs/design/r4-run-command.md. Authorization gate refusals are not schema-testable.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "brief"],
+  "properties": {
+    "kind": {
+      "const": "run-command",
+      "description": "request_kind_invalid: top-level kind is required and must be the exact run-command string."
+    },
+    "attempt_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{8,64}$",
+      "description": "attempt_id_invalid: optional attempt id, otherwise minted by make_handler.do_POST."
+    },
+    "brief": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["objective", "project", "source_rev", "purpose", "command", "budget"],
+      "description": "brief_not_object: the brief must be a JSON object; brief_field_not_allowed covers any unlisted brief property.",
+      "properties": {
+        "objective": {
+          "type": "string",
+          "minLength": 1,
+          "description": "objective_required: a non-empty objective is required."
+        },
+        "project": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "description": "project_invalid: enrolled project slug; project_not_enrolled is checked by gate 3."
+        },
+        "source_rev": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$",
+          "description": "source_rev_invalid: a 40- or 64-hex revision used when seeding the project."
+        },
+        "purpose": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "description": "purpose_invalid: slug-shaped purpose; purpose_not_allowed is checked by gate 4."
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "description": "command_invalid: non-empty command; command_too_long exceeds the provisional 2000-char cap in N4."
+        },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["timeout_s"],
+          "description": "budget_not_object: budget must be an object with only timeout_s.",
+          "properties": {
+            "timeout_s": {
+              "type": "integer",
+              "minimum": 10,
+              "maximum": 7200,
+              "description": "budget_timeout_s_invalid: required integer in 10..7200; budget_exceeds_policy_max is checked by gate 5."
+            }
+          }
+        },
+        "commands": {
+          "not": {},
+          "description": "command_list_not_allowed: use kind=check for command lists."
+        },
+        "security_profile": {
+          "not": {},
+          "description": "security_profile_not_allowed: the matched policy entry supplies the profile."
+        },
+        "model": {
+          "not": {},
+          "description": "model_field_not_allowed: run-command has no model route."
+        },
+        "tier": {
+          "not": {},
+          "description": "model_field_not_allowed: run-command has no model route."
+        },
+        "mode": {
+          "not": {},
+          "description": "model_field_not_allowed: run-command has no model route."
+        },
+        "verify_of": {
+          "not": {},
+          "description": "verify_of_not_allowed: verify_of applies to opencode attempts only."
+        }
+      }
+    },
+    "model": {
+      "not": {},
+      "description": "request_field_not_allowed: no model at top level."
+    },
+    "tier": {
+      "not": {},
+      "description": "request_field_not_allowed: no tier at top level."
+    },
+    "mode": {
+      "not": {},
+      "description": "request_field_not_allowed: no mode at top level."
+    },
+    "project": {
+      "not": {},
+      "description": "request_field_not_allowed: top-level project is a route-preview convenience only."
+    }
+  }
+}
