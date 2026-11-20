@@ -927,7 +927,10 @@ def replay_landed_events(data_dir, cfg=None, notifier=None):
 # evidence instead of a bare version string. No other receipt content and no path is ever exposed.
 DEPLOYMENT_RECEIPT_NAME = "hyvv-deployed.json"
 _RECEIPT_MAX_BYTES = 64 * 1024
-_RECEIPT_AT_KEYS = ("deployed_at", "applied_at")
+_RECEIPT_AT_KEYS = ("deployed_at", "applied_at", "installed_at_utc")
+# The PC apply-update writes its receipt into the launcher's install directory (the folder holding
+# the running launcher.py), with keys repo/sha/version/installed_at_utc/files.
+LAUNCHER_DIR = Path(__file__).resolve().parent
 _RECEIPT_REV_KEYS = ("rev", "revision", "source_rev", "sha", "commit")
 _RECEIPT_VERSION_RE = re.compile(r"\d+(?:\.\d+){1,3}")
 _RECEIPT_REV_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
@@ -942,6 +945,9 @@ def _receipt_paths(cfg):
         paths.append(Path(cfg["_config_path"]).expanduser().parent / DEPLOYMENT_RECEIPT_NAME)
     if cfg.get("data_dir"):
         paths.append(Path(cfg["data_dir"]).expanduser() / DEPLOYMENT_RECEIPT_NAME)
+    install = LAUNCHER_DIR / DEPLOYMENT_RECEIPT_NAME
+    if install not in paths:
+        paths.append(install)
     return paths, False
 
 

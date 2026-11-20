@@ -10,6 +10,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests.test_health_models import L, get, serve
 
@@ -17,22 +18,28 @@ REV = "1fcf1039e67ec5fd07e2111cba1808f793c7b5bd"
 GOOD = {"deployed_at": "2026-11-18T03:13:00Z", "version": L.VERSION, "rev": REV}
 
 
-class ReceiptReader(unittest.TestCase):
+class _ReceiptCase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="lch-receipt-"))
-        self.cfg = {"data_dir": str(self.tmp / "data"), "_config_path": str(self.tmp / "config.json")}
+        self.cfg = {"data_dir": str(self.tmp / "data"), "_config_path": str(self.tmp / "conf" / "config.json")}
+        self.install = self.tmp / "pc-launcher"
+        self.install.mkdir()
+        p = mock.patch.object(L, "LAUNCHER_DIR", self.install)
+        p.start(); self.addCleanup(p.stop)
 
     def write(self, obj, name="hyvv-deployed.json", where=None):
-        p = (where or self.tmp) / name
+        p = (where or self.tmp / "conf") / name
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(obj if isinstance(obj, str) else json.dumps(obj), "utf-8")
         return p
 
+
+class ReceiptReader(_ReceiptCase):
     def test_no_receipt_file_means_no_receipt_key(self):
         self.assertIsNone(L.deployment_receipt(self.cfg))
 
     def test_valid_receipt_beside_the_config_is_published_with_only_the_validated_fields(self):
-        self.write({**GOOD, "token": "x" * 40, "path": "C:/Users/someone/pc-launcher", "note": "extra"})
+        self.write({**GOOD, "token": "x" * 40, "path": "C:/Users/someone/pc-launcher", "note": "extra"}, where=self.tmp / "conf")
         self.assertEqual(L.deployment_receipt(self.cfg), GOOD)
 
     def test_data_dir_location_and_explicit_path_and_aliases(self):
@@ -43,7 +50,8 @@ class ReceiptReader(unittest.TestCase):
         self.assertEqual(L.deployment_receipt({**self.cfg, "deployment_receipt_path": str(other)}), GOOD)
 
     def test_explicit_path_that_is_missing_is_invalid_not_a_fallback(self):
-        self.write(GOOD)  # a default-location receipt must not stand in for the configured one
+        self.write(GOOD, where=self.tmp / "conf")  # a default-location receipt must not stand in
+        self.write(GOOD, where=self.install)  # ... nor the install-dir one
         r = L.deployment_receipt({**self.cfg, "deployment_receipt_path": str(self.tmp / "missing.json")})
         self.assertEqual(r, {"status": "invalid", "reason": "receipt_unreadable"})
 
@@ -73,9 +81,68 @@ class ReceiptReader(unittest.TestCase):
         self.assertEqual(L.deployment_receipt(self.cfg), {"status": "invalid", "reason": "receipt_unreadable"})
 
 
+# Exactly the key set the PC apply-update writes (pc-launcher/hyvv-deployed.json, Nov 18 2026).
+PC_RECEIPT = {
+    "repo": "mojomast/hyvv",
+    "sha": REV,
+    "version": "0.1.17",
+    "installed_at_utc": "2026-11-18T03:11:06Z",
+    "files": {"launcher.py": "0" * 64, "README.md": "1" * 64},
+}
+PC_PUBLISHED = {"deployed_at": "2026-11-18T03:11:06Z", "version": "0.1.17", "rev": REV}
+
+
+class InstallDirReceipt(_ReceiptCase):
+    """The real PC layout: the receipt sits beside launcher.py, not beside config.json."""
+
+    def test_install_dir_receipt_with_the_real_pc_keys(self):
+        self.write(PC_RECEIPT, where=self.install)
+        r = L.deployment_receipt(self.cfg)
+        self.assertEqual(r, PC_PUBLISHED)
+        self.assertNotIn("files", r); self.assertNotIn("repo", r)
+
+    def test_install_dir_is_searched_last(self):
+        self.write(PC_RECEIPT, where=self.install)
+        self.write(GOOD, where=self.tmp / "data")
+        self.assertEqual(L.deployment_receipt(self.cfg), GOOD)
+        self.write({**GOOD, "deployed_at": "2026-11-19T00:00:00Z"}, where=self.tmp / "conf")
+        self.assertEqual(L.deployment_receipt(self.cfg)["deployed_at"], "2026-11-19T00:00:00Z")
+
+    def test_install_dir_is_used_without_any_config_or_data_dir(self):
+        self.write(PC_RECEIPT, where=self.install)
+        self.assertEqual(L.deployment_receipt({}), PC_PUBLISHED)
+
+    def test_install_dir_receipt_stays_fail_closed(self):
+        for bad in ({**PC_RECEIPT, "installed_at_utc": "2026-11-18T03:11:06"},
+                    {**PC_RECEIPT, "installed_at_utc": "yesterday"},
+                    {k: v for k, v in PC_RECEIPT.items() if k != "installed_at_utc"},
+                    {**PC_RECEIPT, "sha": "1fcf103"},
+                    {**PC_RECEIPT, "version": "0.1.17-dirty"}):
+            with self.subTest(bad=bad):
+                self.write(bad, where=self.install)
+                self.assertEqual(L.deployment_receipt(self.cfg), {"status": "invalid", "reason": "receipt_malformed"})
+        self.write("{not json", where=self.install)
+        self.assertEqual(L.deployment_receipt(self.cfg), {"status": "invalid", "reason": "receipt_unreadable"})
+
+
 class HealthReceipt(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="lch-health-receipt-")
+        self.install = Path(tempfile.mkdtemp(prefix="lch-health-install-"))
+        p = mock.patch.object(L, "LAUNCHER_DIR", self.install)
+        p.start(); self.addCleanup(p.stop)
+
+    def test_health_publishes_the_install_dir_receipt_of_the_real_pc_shape(self):
+        (self.install / "hyvv-deployed.json").write_text(json.dumps(PC_RECEIPT), "utf-8")
+        la, srv = serve(self.tmp)
+        try:
+            st, body = get(srv, "/v1/health")
+            self.assertEqual(st, 200)
+            self.assertEqual(body["deployment_receipt"], PC_PUBLISHED)
+            blob = json.dumps(body["deployment_receipt"])
+            self.assertNotIn(str(self.install), blob); self.assertNotIn("launcher.py", blob)
+        finally:
+            srv.shutdown(); la.loop.call_soon_threadsafe(la.loop.stop)
 
     def test_health_includes_the_receipt_the_doctor_can_validate(self):
         (Path(self.tmp) / "hyvv-deployed.json").write_text(json.dumps(GOOD), "utf-8")
