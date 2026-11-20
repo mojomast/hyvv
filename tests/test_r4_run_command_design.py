@@ -20,6 +20,8 @@ TEST_PATH = ROOT / "tests" / "test_r4_run_command_design.py"
 SCAN_PATHS = (DOC_PATH, SCHEMA_PATH, TEST_PATH)
 
 SOURCE_REV = "2a3bdd4584ac8d44b0d250ef4de587692748894e"
+# The commit that landed this deliverable (att_967e3d397d4b436f, #29); its parent is SOURCE_REV.
+DELIVERABLE_REV = "4fc4e6a2bb7b459b428d9fc6651ce1827e1f8d67"
 PRIOR_ART_REV = "1ae4d4eba47a64d0ca62d9b4c9b956f557be13f6"
 LAUNCHER_SHA256 = (
     "7310768c" "501e0d1f" "1feb4e2d" "89545de5"
@@ -213,7 +215,7 @@ HEX_RE = re.compile(
     r"(?<![A-Za-z0-9])[0-9a-fA-F]{64}(?![A-Za-z0-9])"
     r"|(?<![A-Za-z0-9])[0-9a-fA-F]{40}(?![A-Za-z0-9])"
 )
-ALLOWED_HEX = {PRIOR_ART_REV.lower(), SOURCE_REV.lower()}
+ALLOWED_HEX = {PRIOR_ART_REV.lower(), SOURCE_REV.lower(), DELIVERABLE_REV.lower()}
 
 
 class KeyShapedAssignment:
@@ -305,17 +307,20 @@ class DesignDeliverableTests(unittest.TestCase):
                 self.assertFalse(_is_valid(NEGATIVE_REQUESTS[rule]), f"{rule} was not refused")
 
     def test_launcher_unchanged_relative_to_source_rev(self):
-        launcher = ROOT / "launcher.py"
-        digest = hashlib.sha256(launcher.read_bytes()).hexdigest()
+        # The design deliverable (landed as DELIVERABLE_REV, whose parent is SOURCE_REV) must not
+        # have changed launcher.py. That is a property of the deliverable's own commit, not a freeze
+        # on every later launcher change, so compare the two recorded revisions, not the worktree.
         source_blob = _git_bytes(["cat-file", "blob", f"{SOURCE_REV}:launcher.py"])
-        if source_blob is None:
-            self.assertEqual(digest, LAUNCHER_SHA256, "recorded launcher content hash changed")
-        else:
-            self.assertEqual(
-                hashlib.sha256(source_blob).hexdigest(),
-                digest,
-                "launcher.py differs from source_rev",
-            )
+        landed_blob = _git_bytes(["cat-file", "blob", f"{DELIVERABLE_REV}:launcher.py"])
+        if source_blob is None or landed_blob is None:
+            self.skipTest("needs Git history with SOURCE_REV and DELIVERABLE_REV (shallow clone)")
+        self.assertEqual(hashlib.sha256(source_blob).hexdigest(), LAUNCHER_SHA256,
+                         "recorded launcher content hash changed")
+        self.assertEqual(
+            hashlib.sha256(landed_blob).hexdigest(),
+            hashlib.sha256(source_blob).hexdigest(),
+            "the design deliverable changed launcher.py relative to source_rev",
+        )
 
     def test_scanner_rules_scan_all_three_deliverables(self):
         violations = []
