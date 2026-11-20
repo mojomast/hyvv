@@ -188,7 +188,7 @@ class RoutePreview(unittest.TestCase):
 
     def test_unnamed_with_a_zoo_credential_prefers_zoo(self):
         self._add_zoo()
-        la, srv = serve(self.tmp)
+        la, srv = serve(self.tmp, prefer_zoo=True)
         try:
             st, body = post(srv, "/v1/route", {"brief": {"objective": "x"}})
             self.assertEqual(st, 200)
@@ -339,7 +339,7 @@ class HealthConfiguredVsEffective(unittest.TestCase):
 
     def test_effective_model_follows_the_zoo_preference(self):
         (self.tmp / "zoo.key").write_text(ZOO_MATERIAL, "utf-8")
-        la, srv = serve(self.tmp)
+        la, srv = serve(self.tmp, prefer_zoo=True)
         try:
             st, body = get(srv, "/v1/health")
             self.assertEqual(body["configured_model"], GO_FLASH)
@@ -363,7 +363,7 @@ class DispatchMatchesPreview(unittest.TestCase):
     def _run_unnamed(self, aid, brief_extra=None):
         brief = {"objective": "x", "deliverables": ["a"], "acceptance": ["b"]}
         brief.update(brief_extra or {})
-        la, srv = serve(self.tmp)
+        la, srv = serve(self.tmp, prefer_zoo=True)  # this host opts in to the Zoo preference
         try:
             st, preview = post(srv, "/v1/route", {"brief": dict(brief)})
             self.assertEqual(st, 200, preview)

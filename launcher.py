@@ -2784,6 +2784,9 @@ def retry_after_s(text, cap=ZOO_RETRY_AFTER_MAX):
     return max(0, min(int(cap), n))
 
 PREFERRED_MODEL = "zoo:glm-5.3-flash"  # free Zoo pass; DeepSeek official flash is its fallback
+# Opt-in since 2026-11-19: Zoo's free pass refuses programmatic (non-IDE) use and ends ~Nov 29, so a
+# host only prefers it when config.json sets "prefer_zoo": true.
+PREFER_ZOO_DEFAULT = False
 
 
 def project_model(cfg, brief):
@@ -2808,12 +2811,12 @@ def project_model(cfg, brief):
 def default_model(cfg):
     """Model for a bee brief that names none.
 
-    Zoo's free GLM 5.3 Flash pass is preferred while this host can authenticate to it: it costs
-    nothing until ~Nov 29 and routes the same `deepseek-flash`-class work. The host's configured
-    `model` is used when no zoo key is readable, and `"prefer_zoo": false` in config.json opts a
-    host out. A named model, an explicit tier and a `priority: high` brief are never affected.
+    The host's configured `model`, unless config.json opts in with `"prefer_zoo": true` and the host
+    can authenticate to Zoo, in which case Zoo's free GLM 5.3 Flash pass is used. The preference is
+    off by default: the free pass refuses programmatic (non-IDE) use and ends ~Nov 29. A named model,
+    an explicit tier and a `priority: high` brief are never affected.
     """
-    if cfg.get("prefer_zoo", True):
+    if cfg.get("prefer_zoo", PREFER_ZOO_DEFAULT):
         try:
             if provider_key(cfg, "zoo"):
                 return PREFERRED_MODEL
@@ -2926,10 +2929,10 @@ def route_preview(cfg, model=None, brief=None, kind=None):
     elif pm:
         why = ("no model was named and project " + str(brief.get("project") or "")
                + " sets model " + pm + ", so the project default is used")
-    elif creds["zoo"] and cfg.get("prefer_zoo", True):
+    elif creds["zoo"] and cfg.get("prefer_zoo", PREFER_ZOO_DEFAULT):
         why = "no model was named and this host can authenticate to Zoo, so the preferred free pass is used"
-    elif not cfg.get("prefer_zoo", True):
-        why = "no model was named and the Zoo preference is off on this host, so the host default is used"
+    elif not cfg.get("prefer_zoo", PREFER_ZOO_DEFAULT):
+        why = "no model was named and the Zoo preference is off on this host (the default), so the host default is used"
     else:
         why = "no model was named and there is no Zoo credential, so the host default is used"
     out = {}

@@ -382,7 +382,8 @@ class HotConfigApply(unittest.TestCase):
         return a
 
     def test_prefer_zoo_off_is_applied_to_the_next_dispatch(self):
-        la, srv = serve(self.tmp)
+        # The Zoo preference is opt-in (off by default); this host opts in, then turns it off hot.
+        la, srv = serve(self.tmp, base_cfg(self.tmp, prefer_zoo=True))
         try:
             before = self._dispatch_unnamed(srv, la, "att_cfg00000001")
             self.assertEqual(before["model"], ZOO)
@@ -500,17 +501,17 @@ class HotConfigApply(unittest.TestCase):
                     self.assertIn("error", resp)
             st, health = get(srv, "/v1/health")
             self.assertEqual(health["model"], GO_FLASH)
-            self.assertIs(la.cfg.get("prefer_zoo", True), True)
+            self.assertNotIn("prefer_zoo", la.cfg)  # rejected POSTs leave the (default-off) preference unset
         finally:
             srv.shutdown()
 
     def test_an_unwritable_config_json_fails_the_post_without_applying(self):
-        la, srv = serve(self.tmp)
+        la, srv = serve(self.tmp, base_cfg(self.tmp, prefer_zoo=True))
         try:
             (self.tmp / "config.json").write_text("{not json", "utf-8")
             st, body = post(srv, "/v1/config", {"prefer_zoo": False})
             self.assertEqual(st, 400, body)
-            self.assertIs(la.cfg.get("prefer_zoo", True), True)
+            self.assertIs(la.cfg.get("prefer_zoo"), True)
             st, health = get(srv, "/v1/health")
             self.assertEqual(health["effective_model"], "zoo/glm-5.3-flash")
         finally:

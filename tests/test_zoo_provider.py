@@ -150,13 +150,15 @@ class RetryAfterParsing(unittest.TestCase):
         self.assertFalse(L.ZOO_ADMISSION.search("HTTP 429 Too Many Requests"))
 
 
-def mk(tmp, backoff=(0.2,)):
+def mk(tmp, backoff=(0.2,), prefer_zoo=None):
     cfg = {"bind": "127.0.0.1", "port": 0, "max_concurrent": 1, "data_dir": tmp,
            "backoff_s": list(backoff), "projects": {}, "model": "deepseek-v4.1-flash",
            "base_url": L.GO_BASE_URL, "wire": "openai-chat", "image": "fake-image",
            # The zoo spec ships its own schedule ([15, 30, 60]); a config entry overrides it, which is
            # also how the deployed launcher shortens it. Tests keep it sub-second.
            "models": {ZOO: {"backoff_s": list(backoff)}}}
+    if prefer_zoo is not None:  # the Zoo preference is opt-in
+        cfg["prefer_zoo"] = prefer_zoo
     la = L.Launcher(cfg, L.FakeBackend(cfg))
     threading.Thread(target=la.loop.run_forever, daemon=True).start()
     return la
@@ -260,8 +262,9 @@ class ZooPreferredDefault(unittest.TestCase):
         os.environ.update(self._saved)
 
     def _cfg(self, **extra):
+        # This host opts in to the (default-off) Zoo preference.
         cfg = {"model": "deepseek-v4.1-flash", "base_url": L.GO_BASE_URL, "wire": "openai-chat",
-               "models": {}, "data_dir": str(self.tmp)}
+               "models": {}, "data_dir": str(self.tmp), "prefer_zoo": True}
         cfg.update(extra)
         return cfg
 
@@ -304,7 +307,7 @@ class ZooPreferredDefault(unittest.TestCase):
 
     def test_a_dispatched_unnamed_brief_records_the_zoo_model(self):
         self._key()
-        la = mk(self.tmp)
+        la = mk(self.tmp, prefer_zoo=True)
         aid = "att_zoo00000099"
         la.submit(aid, {"objective": "x", "deliverables": ["a"], "acceptance": ["b"]})
         self.assertTrue(wait_for(lambda: getattr(la.backend, "models", [])), "never started")
