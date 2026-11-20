@@ -19,7 +19,7 @@ This repository is the fourth layer: the runtime on each machine where work happ
 
 ## Status
 
-The imported runtime is **v0.1.15**. This branch bumps the package to **v0.1.17** so a deployed build can be told apart; the release is still 0.1.15. A brief that names no model now defaults to `zoo:glm-5.3-flash` whenever the host has a `zoo` key (set `"prefer_zoo": false` in `config.json` to opt out), and Zoo's fallback is DeepSeek official flash. Named models keep the 0.1.15 routing and are authoritative: unprefixed and `go:` go to OpenCode Go, `deepseek:` to the official DeepSeek API, and an explicitly named model always wins over `priority: high` (owner decision 2026-11-15: whatever the brief names is what runs). `priority: high` reroutes only a brief that names no model.
+The imported runtime is **v0.1.15**. This branch bumps the package to **v0.1.17** so a deployed build can be told apart; the release is still 0.1.15. A brief that names no model uses the host's configured `model`; a host can opt in to `zoo:glm-5.3-flash` with `"prefer_zoo": true` in `config.json` when it has a `zoo` key (off by default since 2026-11-19: the free pass refuses programmatic use and ends ~Nov 29), and Zoo's fallback is DeepSeek official flash. Named models keep the 0.1.15 routing and are authoritative: unprefixed and `go:` go to OpenCode Go, `deepseek:` to the official DeepSeek API, and an explicitly named model always wins over `priority: high` (owner decision 2026-11-15: whatever the brief names is what runs). `priority: high` reroutes only a brief that names no model.
 
 The `/v1` contract in `contract/v1` is the source of truth going forward:
 
@@ -147,12 +147,12 @@ The API token is created by `scripts/new-token.ps1` and is not printed.
 
 `zoo:glm-5.3-flash` sends `zoo/glm-5.3-flash` to `https://www.zoocode.dev/api/gateway/v1` over the
 OpenAI-compatible wire, authenticated with the `zoo` key. The id matters: `zai/glm-5.3-flash` is the
-paid model. This is the default for a bee brief that names no model, so the free pass carries normal
-work while it lasts; the `simple` tier (`pool:free`) and any explicitly named model or tier are
+paid model. With `"prefer_zoo": true` it is the default for a bee brief that names no model (opt-in; off by
+default); the `simple` tier (`pool:free`) and any explicitly named model or tier are
 untouched. A brief that names no model and is `priority: high` goes to DeepSeek official - except
 when the host default is the free pool, which is picked before priority is considered. When rate limits persist or the pass ends, the spec falls back to
 `deepseek:deepseek-flash` (DeepSeek official, not Go's metered quota). A host without a readable `zoo`
-key keeps its configured default model, and `"prefer_zoo": false` in `config.json` opts out explicitly.
+key, or a host without `"prefer_zoo": true`, keeps its configured default model.
 A `models` entry in `config.json` overrides or extends the built-in spec (for example a shorter
 `backoff_s`).
 

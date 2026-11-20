@@ -36,10 +36,12 @@ def _pop_env():
     return saved
 
 
-def serve(tmp, model="deepseek:deepseek-flash", models=None, hot=False):
+def serve(tmp, model="deepseek:deepseek-flash", models=None, hot=False, prefer_zoo=None):
     cfg = {"bind": "127.0.0.1", "port": 0, "max_concurrent": 1, "data_dir": tmp, "projects": {},
            "model": model, "base_url": L.DEEPSEEK_BASE_URL, "wire": "openai-chat", "image": "img",
            "models": models or {}}
+    if prefer_zoo is not None:  # the Zoo preference is opt-in
+        cfg["prefer_zoo"] = prefer_zoo
     if hot:  # a real config.json on disk, so POST /v1/config can persist its patch
         (Path(tmp) / "config.json").write_text(json.dumps(cfg), "utf-8")
         cfg["_config_path"] = str(Path(tmp) / "config.json")
@@ -142,7 +144,7 @@ class HotConfigHealth(unittest.TestCase):
 
     def test_health_reflects_a_hot_prefer_zoo_change(self):
         (Path(self.tmp) / "zoo.key").write_text("fake-zoo-credential", "utf-8")
-        la, srv = serve(self.tmp, hot=True)
+        la, srv = serve(self.tmp, hot=True, prefer_zoo=True)
         try:
             st, before = get(srv, "/v1/health")
             self.assertEqual(before["effective_model"], ZOO_WIRE)
