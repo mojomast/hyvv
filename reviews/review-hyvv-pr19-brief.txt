@@ -1,0 +1,16 @@
+You are an independent code reviewer for hyvv PR #19 (branch fix/queue-public-toctou, head 0a50f7844dfc0a8d57ad7d5bf6a4437bca475d08, base main 14650e34). You are working inside a detached worktree checked out at the PR head. Be skeptical; verify by execution, not by reading alone; do not rubber-stamp.
+
+Context you can trust: post-merge main CI at 14650e34 failed on arm/3.13 in test_bundlebees_api.T.test_v011_brief_shape_accepted with ValueError: "att_cafe00002" is not in list raised inside Launcher.public (launcher.py ~1510) because the queued branch called self._queue() twice in one expression (TOCTOU between the membership check and .index()). All other CI failures were cascade gates. The PR fixes it by fetching the queue once into a local snapshot and adds a deterministic regression test.
+
+Do ALL of the following and record actual outputs:
+1. Read the full diff: git log -p 14650e3469f7ba2c1097a2dc2cf9b05951ec7d00..0a50f7844dfc0a8d57ad7d5bf6a4437bca475d08 - confirm it touches exactly launcher.py and tests/test_queue_public_race.py and nothing else.
+2. Run the new test file: /var/tmp/bundlebees-py/bin/python -m unittest tests.test_queue_public_race -v - expect 3 tests OK.
+3. Reproduce RED yourself: git checkout 14650e3469f7ba2c1097a2dc2cf9b05951ec7d00 -- launcher.py then re-run the test file - expect FAILED (failures=1, errors=1) with the ValueError at the public() line and an AssertionError 2 != 1 on the snapshot-count test. Then restore with git checkout HEAD -- launcher.py and confirm the worktree is clean.
+4. Run /var/tmp/bundlebees-py/bin/python -m unittest tests.test_bundlebees_api -v - expect 15 tests OK including test_v011_brief_shape_accepted.
+5. Discrimination check: would the snapshot-count test also fail a wrong fix that still calls _queue() twice (for example index-then-membership on two separate calls)? Reason it through and state the answer.
+6. Honesty check: the PR body claims junit 18/0/0/0 at the verify step and describes a verify-path detour (worker told not to push; coordinator created the branch at the exact base; --commit-local failed once on a missing base object). Judge whether the claims match your own measurements.
+7. Look for any new defect the fix could introduce (behaviour change for non-queued states, None handling, queue_position semantics for attempts not in the queue).
+
+Write your findings to review-hyvv-pr19.md IN THIS WORKTREE (untracked file, do not commit). End the file with exactly two lines:
+BLOCKING: <number of blocking findings>
+VERDICT: approve | approve_with_followups | changes_requested
