@@ -921,6 +921,76 @@ def replay_landed_events(data_dir, cfg=None, notifier=None):
         after = page["next_cursor"]
 
 
+# ---------------------------------------------------------------- deployment receipt (/v1/health)
+# The admin apply-update records what it deployed in hyvv-deployed.json. /v1/health republishes only
+# the validated identity fields so a coordinator can confirm the running build from deployment
+# evidence instead of a bare version string. No other receipt content and no path is ever exposed.
+DEPLOYMENT_RECEIPT_NAME = "hyvv-deployed.json"
+_RECEIPT_MAX_BYTES = 64 * 1024
+_RECEIPT_AT_KEYS = ("deployed_at", "applied_at")
+_RECEIPT_REV_KEYS = ("rev", "revision", "source_rev", "sha", "commit")
+_RECEIPT_VERSION_RE = re.compile(r"\d+(?:\.\d+){1,3}")
+_RECEIPT_REV_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def _receipt_paths(cfg):
+    explicit = cfg.get("deployment_receipt_path")
+    if explicit:  # a configured location never falls back to a default one
+        return [Path(explicit).expanduser()], True
+    paths = []
+    if cfg.get("_config_path"):
+        paths.append(Path(cfg["_config_path"]).expanduser().parent / DEPLOYMENT_RECEIPT_NAME)
+    if cfg.get("data_dir"):
+        paths.append(Path(cfg["data_dir"]).expanduser() / DEPLOYMENT_RECEIPT_NAME)
+    return paths, False
+
+
+def deployment_receipt(cfg):
+    """``{"deployed_at", "version", "rev"}`` from the apply-update receipt, an invalid marker, or None.
+
+    None means no receipt exists at the default locations (the key is then omitted from /v1/health).
+    A configured path that is missing, an unreadable/oversize file, or a receipt without a zoned
+    ``deployed_at`` timestamp and a well-formed identity (dotted version and/or 40/64-hex rev) yields
+    ``{"status": "invalid", "reason": ...}`` -- never a repaired or partial receipt.
+    """
+    paths, explicit = _receipt_paths(cfg)
+    path = next((p for p in paths if p.is_file()), None)
+    if path is None:
+        return {"status": "invalid", "reason": "receipt_unreadable"} if explicit else None
+    invalid = lambda reason: {"status": "invalid", "reason": reason}
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(_RECEIPT_MAX_BYTES + 1)
+        if len(raw) > _RECEIPT_MAX_BYTES:
+            return invalid("receipt_unreadable")
+        data = json.loads(raw.decode("utf-8-sig"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return invalid("receipt_unreadable")
+    if not isinstance(data, dict):
+        return invalid("receipt_malformed")
+    at = next((data[k] for k in _RECEIPT_AT_KEYS if isinstance(data.get(k), str) and data[k].strip()), None)
+    try:
+        when = datetime.fromisoformat(at.strip().replace("Z", "+00:00")) if at else None
+    except ValueError:
+        when = None
+    if when is None or when.tzinfo is None:
+        return invalid("receipt_malformed")
+    out = {"deployed_at": when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    version = data.get("version")
+    if version is not None:
+        if not (isinstance(version, str) and _RECEIPT_VERSION_RE.fullmatch(version.strip())):
+            return invalid("receipt_malformed")
+        out["version"] = version.strip()
+    rev = next((data[k] for k in _RECEIPT_REV_KEYS if data.get(k) is not None), None)
+    if rev is not None:
+        if not (isinstance(rev, str) and _RECEIPT_REV_RE.fullmatch(rev.strip().lower())):
+            return invalid("receipt_malformed")
+        out["rev"] = rev.strip().lower()
+    if "version" not in out and "rev" not in out:
+        return invalid("receipt_malformed")
+    return out
+
+
 def load_config(path):
     cfg = json.loads(Path(path).read_text("utf-8-sig"))
     cfg.setdefault("port", 47821)
@@ -2655,7 +2725,8 @@ def make_handler(L, token):
                 try: eff_model = model_spec(L.cfg, default_model(L.cfg)).get("model") or L.cfg["model"]
                 except ValueError: eff_model = L.cfg["model"]
                 return self._send(200, {"ok": True, "version": VERSION, "max_concurrent": L.cfg["max_concurrent"], "active": len(L._active()), "queued": len(L._queue()), "model": L.cfg["model"],
-                                       "configured_model": L.cfg["model"], "effective_model": eff_model, "models": allow, "uptime_s": round(time.time() - L.started_at), "loop_lag_ms": round(L.loop_lag_ms, 1)})
+                                       "configured_model": L.cfg["model"], "effective_model": eff_model, "models": allow, "uptime_s": round(time.time() - L.started_at), "loop_lag_ms": round(L.loop_lag_ms, 1),
+                                       **({"deployment_receipt": rc} if (rc := deployment_receipt(L.cfg)) is not None else {})})
             if p == ["v1", "landing", "events"]:  # authenticated export of the durable canonical outbox
                 if _landing_export is None:
                     return self._send(501, {"error": "landing export is unavailable"})

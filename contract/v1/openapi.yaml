@@ -73,6 +73,25 @@ paths:
                 properties:
                   ok: {type: boolean}
                   version: {type: string}
+                  deployment_receipt:
+                    description: >-
+                      Present when the admin apply-update wrote hyvv-deployed.json. Either the
+                      validated identity it recorded ({deployed_at, version and/or rev}) or
+                      {status: invalid, reason} -- never other receipt content or a path.
+                    oneOf:
+                      - type: object
+                        required: [deployed_at]
+                        properties:
+                          deployed_at: {type: string, format: date-time}
+                          version: {type: string, pattern: '^[0-9]+(\.[0-9]+){1,3}$'}
+                          rev: {type: string, pattern: '^([0-9a-f]{40}|[0-9a-f]{64})$'}
+                        additionalProperties: false
+                      - type: object
+                        required: [status, reason]
+                        properties:
+                          status: {const: invalid}
+                          reason: {enum: [receipt_unreadable, receipt_malformed]}
+                        additionalProperties: false
                   max_concurrent: {type: integer}
                   active: {type: integer}
                   queued: {type: integer}

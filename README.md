@@ -123,6 +123,8 @@ Windows is first. From a checkout:
 
 `-Update` replaces the old version-specific idle-swap waiters: it waits for zero running or queued attempts, copies the new `launcher.py`, health-checks, and rolls back on failure. It never overwrites `config.json`, `*.token`, or `*.key`, and it never prints those values.
 
+**Deployment receipt.** When the admin apply-update records what it deployed in `hyvv-deployed.json` (beside the launcher's `config.json`, else in the data dir; `deployment_receipt_path` in `config.json` names another file, with no fallback), `GET /v1/health` republishes only its validated identity as `deployment_receipt: {"deployed_at", "version", "rev"}` (`applied_at` and `revision`/`source_rev`/`sha`/`commit` are accepted spellings). It is re-read on every health call, needs no restart, and is never repaired: a missing configured file, an oversize file or a receipt without a zoned timestamp and a well-formed identity is shown as `{"status": "invalid", "reason": ...}`. Coordinators such as the bundlebees doctor use it as deployment evidence; a version string alone is not.
+
 Then edit `%USERPROFILE%\.orbit-launcher\config.json` (seeded from `config.example.json` on a first install), run `.\scripts\new-token.ps1`, and `.\scripts\start.ps1`. The data directory name `.orbit-launcher` is kept so existing hosts keep working.
 
 `config.example.json` binds `127.0.0.1`. To accept coordinators on a tailnet, set `bind` to the host's Tailscale address. Binding `0.0.0.0` is refused.
