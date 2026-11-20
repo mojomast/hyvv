@@ -1,0 +1,17 @@
+Independent review of hyvv PR #18 (launcher budget enforcement). You are in a detached worktree at the exact PR head 04cfbea96bdf40f00301275459c0463b333471e0; base is main at e48328fed1582fc39720dfd7bf8cbfe07bcaf8ae. The diff is exactly launcher.py (+ modified) and tests/test_budget_enforcement.py (new), about +270/-2.
+
+Context: attempt att_641b8119a39a426d ran ~40 minutes with brief.budget.timeout_s=1200 and the launcher never stopped it; a runaway active attempt also blocks admin apply-update. The PR makes budget.timeout_s an authoritative attempt wall clock.
+
+Checks (cite file:line evidence for every specific claim):
+
+1. Diff discipline: git diff e48328fe..HEAD --stat = exactly the two leased files; no schema/config/docs changes.
+2. RED reproduction (the acceptance gate): run the new test file with launcher.py reverted to base - git checkout e48328fe -- launcher.py, then run python3 -m pytest tests/test_budget_enforcement.py -q (or python3 -m unittest tests.test_budget_enforcement); it MUST FAIL (record the failure summary); then restore with git checkout HEAD -- launcher.py and confirm the same tests PASS. If the test passes on the unmodified launcher, that is a BLOCKING finding (the test does not discriminate the fix).
+3. Enforcement semantics: trace in launcher.py that (a) attempt_budget_s resolves budget.timeout_s per kind with AGY_TIMEOUT_S/CHECK_TIMEOUT_S min-default-max clamping preserved and opencode budgets only when the brief carries one; (b) the dispatch/control path anchors the budget and persists budget_started_at so a restarted launcher does not reset the clock; (c) a healthy loop stops at the deadline via a fast-path check; (d) a stuck controller is force-finished by a shielded watchdog: budget_stop prevents _schedule resurrection, the worker is interrupted within BUDGET_STOP_GRACE_S=15, terminal state failed is written with an honest budget-timeout detail BEFORE cleanup, and the slot is freed afterward; (e) the child-level backstop is preserved. Flag any path where a worker could still outlive budget.timeout_s, any place the watchdog could kill a healthy attempt early, and any place the terminal write could be skipped.
+4. No regression: tests/test_agy_cua.py is unchanged and still passes; run it.
+5. Test quality: the new tests must pin behavior, not implementation - flag tests that would still pass if the enforcement were removed; identify the one test that passes on the unmodified tree and judge whether that is legitimate (e.g. a clamping-preservation test).
+6. Security and hygiene: no credentials, hostnames, tokens, or secret-shaped literals in the diff; no new network calls; the scanner-overmatch caveat (keyword-assignment lines) does not excuse real secrets.
+7. Honesty: the PR body's diagnosis and mechanism claims match the code; flag any overclaim (e.g. claiming restart persistence the code does not implement).
+
+Write your full report to review-hyvv-pr18.md in the worktree root (the only file you may create or modify). End with exactly one line:
+VERDICT: approve|approve_with_followups|changes_requested, BLOCKING: <n>
+Judge the code, not the author. Do not modify any tracked file.
