@@ -2352,7 +2352,9 @@ class Launcher:
                 a.update(ids); self._set(a, "running", ("agy" if agy else "opencode") + " run started", {"run_id": ids["run_id"]})
             last_hb = last_ev = time.time()
             while True:
-                if deadline and time.time() >= deadline:  # fast path: a healthy loop stops exactly at the budget
+                if a.get("budget_stop") or (deadline and time.time() >= deadline):
+                    # Watchdog already owns the stop: do not land a racing worker "exited"
+                    # as a normal turn (macOS CI hit "turn ended: exited" instead of timeout).
                     return await asyncio.shield(self._budget_finish(a, budget, started))
                 if a.get("cancel") and not a.get("interrupted"):
                     await self.backend.interrupt(a); a["interrupted"] = True
@@ -2387,6 +2389,8 @@ class Launcher:
                             return await self._fallback_to_deepseek(a, reason="go monthly-limit 429")
                         return await self._backoff(a, retry_after=retry_after_s(txt))
                     if e["kind"] in ("turn_ended", "exited"):
+                        if a.get("budget_stop") or (deadline and time.time() >= deadline):
+                            return await asyncio.shield(self._budget_finish(a, budget, started))
                         return await self._finish(a, e)
                 await asyncio.sleep(1.0)
         except Exception as ex:  # noqa
