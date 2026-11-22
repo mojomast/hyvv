@@ -39,6 +39,10 @@ VERSION = "0.1.17"
 HEARTBEAT_S = 60  # controller emits a heartbeat event after this many quiet seconds
 MAX_WORKERS = 14  # hard ceiling for max_concurrent (owner directive: final ceiling, supersedes the interim cap-12)
 TERMINAL = {"succeeded", "failed", "cancelled"}
+
+JOURNAL_ACTIVE = ("starting", "running", "cancel_requested")
+SAVE_REPLACE_TRIES = 10
+SAVE_REPLACE_BUDGET_S = 2.0  # total backoff across retries of os.replace (about 2 seconds)
 GO_BASE_URL = "https://opencode.ai/inference/go/openai/v1"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"  # official OpenAI-compatible endpoint
 ZOO_BASE_URL = "https://www.zoocode.dev/api/gateway/v1"  # Zoo gateway, OpenAI-compatible
@@ -1873,6 +1877,26 @@ def in_assigned_scope(path, scope):
 
 
 # ---------------------------------------------------------------- launcher core
+
+def replace_retryable(exc):
+    """True for the Windows replace failures that a short retry can clear (WinError 5 or 32)."""
+    if not isinstance(exc, OSError):
+        return False
+    if getattr(exc, "winerror", None) in (5, 32):
+        return True
+    return isinstance(exc, PermissionError)
+
+
+def _save_replace_delays():
+    """n-1 sleeps after the first failure, totalling SAVE_REPLACE_BUDGET_S before the last try."""
+    steps = max(1, SAVE_REPLACE_TRIES - 1)
+    return [SAVE_REPLACE_BUDGET_S / steps] * steps
+
+
+def journal_record_valid(obj):
+    return isinstance(obj, dict) and isinstance(obj.get("attempt_id"), str) and isinstance(obj.get("state"), str)
+
+
 class Launcher:
     def __init__(self, cfg, backend):
         self.cfg, self.backend = cfg, backend
@@ -1886,6 +1910,7 @@ class Launcher:
         self._ev_lock = threading.Lock(); self._ev_idx = {}  # events_since offset index
         self.started_at = time.time(); self.loop_lag_ms = 0.0
         self.landing_conflicts = []
+        self._cleaned_aids = set()
         self._load()
         self.rails = None
         if cfg.get('rails_enabled') is True:
@@ -1893,12 +1918,31 @@ class Launcher:
             self.rails = RailsEmitter(self.dir)
             self.rails.recover(self.attempts)
         self.recover_landed_events()
+        try:
+            self.reconcile()
+        except Exception:
+            pass  # never crash startup; health will still advertise any leftover split-brain
 
     # journal: one JSON per attempt (atomic replace) + append-only events log
     def _path(self, aid): return self.dir / "attempts" / f"{aid}.json"
     def _save(self, a):
         p = self._path(a["attempt_id"]); tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(a, indent=1), "utf-8"); os.replace(tmp, p)
+        tmp.write_text(json.dumps(a, indent=1), "utf-8")
+        last = None
+        delays = _save_replace_delays()
+        for i in range(SAVE_REPLACE_TRIES):
+            try:
+                os.replace(tmp, p)
+                try: self.publish_runtime_status()
+                except Exception: pass
+                return
+            except OSError as ex:
+                if not replace_retryable(ex):
+                    raise
+                last = ex
+                if i < len(delays):
+                    time.sleep(delays[i])
+        raise last
     def _append_events(self, a, evs):
         path = self.dir / "attempts" / f"{a['attempt_id']}.events.jsonl"
         try:
@@ -2088,9 +2132,170 @@ class Launcher:
     def _active(self): return [x for x in self.attempts.values() if x["state"] in ("starting", "running", "cancel_requested")
                                and not x.get("budget_stop")]  # budget_stop: the watchdog owns the teardown
 
+    def _controller_live(self, aid):
+        task = self.controllers.get(aid)
+        if task is None:
+            return False
+        done = getattr(task, "done", None)
+        if callable(done):
+            try:
+                return not done()
+            except Exception:
+                return False
+        return True
+
+    async def _cleanup_once(self, a, timeout=None):
+        """Idempotent teardown of only this attempt's recorded sandbox. Safe to call from finally."""
+        aid = a.get("attempt_id")
+        if not aid or aid in self._cleaned_aids:
+            return
+        self._cleaned_aids.add(aid)
+        try:
+            coro = self.backend.cleanup(a)
+            if timeout is not None:
+                await asyncio.wait_for(coro, timeout)
+            else:
+                await coro
+        except Exception:
+            pass
+
+    def _sync_cleanup(self, a):
+        try:
+            if self.loop.is_running():
+                asyncio.run_coroutine_threadsafe(self._cleanup_once(a), self.loop).result(timeout=60)
+            else:
+                self.loop.run_until_complete(self._cleanup_once(a))
+        except Exception:
+            pass
+
+    def _read_journal_file(self, path):
+        try:
+            obj = json.loads(Path(path).read_text("utf-8"))
+        except Exception:
+            return None
+        return obj if journal_record_valid(obj) else None
+
+    def journal_counts(self):
+        """Disk-journal counters for health and the token-free runtime status file."""
+        d = self.dir / "attempts"
+        active = 0
+        tmp = 0
+        if d.is_dir():
+            for p in d.glob("*.tmp"):
+                if p.is_file():
+                    tmp += 1
+            for p in d.glob("*.json"):
+                if p.name.count(".") != 1:
+                    continue
+                rec = self._read_journal_file(p)
+                if rec and rec.get("state") in JOURNAL_ACTIVE:
+                    active += 1
+        return active, tmp
+
+    def publish_runtime_status(self):
+        live = len(self._active())
+        journal_active, journal_tmp = self.journal_counts()
+        body = {"active": live, "journal_active": journal_active, "journal_tmp": journal_tmp,
+                "split_brain": (live != journal_active) or (journal_tmp > 0),
+                "version": VERSION, "updated_at": time.time()}
+        path = self.dir / "runtime_status.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(body, indent=1), "utf-8")
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            raise
+        return body
+
+    def _repair_tmp_journals(self):
+        d = self.dir / "attempts"
+        if not d.is_dir():
+            return
+        for tmp in list(d.glob("*.tmp")):
+            if not tmp.is_file():
+                continue
+            # _save writes <attempt_id>.tmp next to <attempt_id>.json
+            jp = tmp.with_suffix(".json")
+            rec_tmp, rec_json = self._read_journal_file(tmp), self._read_journal_file(jp) if jp.exists() else None
+            tmp_mtime = tmp.stat().st_mtime if tmp.exists() else 0
+            json_mtime = jp.stat().st_mtime if jp.exists() else 0
+            chosen = None
+            if rec_tmp and rec_json:
+                chosen = rec_tmp if tmp_mtime >= json_mtime else rec_json
+            elif rec_tmp:
+                chosen = rec_tmp
+            elif rec_json:
+                chosen = rec_json
+            if chosen is not None:
+                jp.write_text(json.dumps(chosen, indent=1), "utf-8")
+                self.attempts[chosen["attempt_id"]] = chosen
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+
+    def _reap_stale_and_expired(self):
+        """Land attempts that can no longer have a worker; never touch a healthy in-budget controller."""
+        for a in list(self.attempts.values()):
+            aid = a.get("attempt_id")
+            if not aid:
+                continue
+            live = self._controller_live(aid)
+            # Memory already terminal, disk still active, no live controller: Friday split-brain.
+            disk_path = self._path(aid)
+            disk = self._read_journal_file(disk_path) if disk_path.exists() else None
+            if a.get("state") in TERMINAL and disk and disk.get("state") in JOURNAL_ACTIVE and not live:
+                try:
+                    self._save(a)
+                except OSError:
+                    pass
+                self._sync_cleanup(a)
+                continue
+            if a.get("state") not in JOURNAL_ACTIVE:
+                continue
+            if live:
+                continue
+            # budget_stop: _schedule/_budget_stop_recover owns the crash-window
+            # (may restore an already-collected result). Do not pre-empt it.
+            if a.get("budget_stop"):
+                continue
+            budget = attempt_budget_s(a)
+            started = a.get("budget_started_at")
+            if budget and started and time.time() >= started + budget:
+                try:
+                    self._set(a, "failed",
+                              f"budget timeout: brief.budget.timeout_s={int(budget)}s reached; "
+                              "no live controller (reconcile)")
+                except OSError:
+                    a["state"] = "failed"
+                    a["detail"] = (f"budget timeout: brief.budget.timeout_s={int(budget)}s reached; "
+                                   "no live controller (reconcile)")
+                    a["updated_at"] = time.time()
+                self._sync_cleanup(a)
+
+    def reconcile(self):
+        """Startup and periodic repair of leftover journals, expired attempts, and split-brain."""
+        with self.lock:
+            self._repair_tmp_journals()
+            self._reap_stale_and_expired()
+            try:
+                self.publish_runtime_status()
+            except Exception:
+                pass
+
     def kick(self): asyncio.run_coroutine_threadsafe(self._schedule(), self.loop)
 
     async def _schedule(self):
+        try:
+            self.reconcile()
+        except Exception:
+            pass
         with self.lock:
             # resume controllers for attempts that were live before a restart (reattach, no re-dispatch)
             for a in self._active():
@@ -2151,7 +2356,7 @@ class Launcher:
                     return await asyncio.shield(self._budget_finish(a, budget, started))
                 if a.get("cancel") and not a.get("interrupted"):
                     await self.backend.interrupt(a); a["interrupted"] = True
-                    self._set(a, "cancelled", "interrupt confirmed; run stopped"); await self.backend.cleanup(a); return
+                    self._set(a, "cancelled", "interrupt confirmed; run stopped"); await self._cleanup_once(a); return
                 evs, cur = await self.backend.events(a, a["cursor"])
                 with self.lock:
                     out = []
@@ -2185,13 +2390,21 @@ class Launcher:
                         return await self._finish(a, e)
                 await asyncio.sleep(1.0)
         except Exception as ex:  # noqa
-            if isinstance(ex, WorkspaceError):
-                a["workspace_error"] = ex.to_dict()
-            self._set(a, "failed", f"controller error: {type(ex).__name__}: {redact(str(ex))[:300]}")
-            if not a.get("sandbox") and a.get("model"): a["sandbox"] = sandbox_name(a)  # created but not recorded yet
-            try: await self.backend.cleanup(a)
-            except Exception: pass
+            try:
+                if isinstance(ex, WorkspaceError):
+                    a["workspace_error"] = ex.to_dict()
+                self._set(a, "failed", f"controller error: {type(ex).__name__}: {redact(str(ex))[:300]}")
+                if not a.get("sandbox") and a.get("model"): a["sandbox"] = sandbox_name(a)  # created but not recorded yet
+            except Exception:
+                if not a.get("sandbox") and a.get("model"): a["sandbox"] = sandbox_name(a)
         finally:
+            # Check jobs have their own finally (check_cleanup). Do not also run the
+            # coding-bee sandbox teardown against a check container.
+            if a.get("kind") != "check":
+                try:
+                    await self._cleanup_once(a)
+                except Exception:
+                    pass
             if watchdog is not None and not watchdog.done(): watchdog.cancel()
             self.controllers.pop(aid, None); self.kick()
 
@@ -2256,7 +2469,7 @@ class Launcher:
                 with self.lock:
                     if a["state"] not in TERMINAL:
                         self._set(a, "failed", "budget stop was interrupted by a restart before the outcome was recorded")
-                try: await asyncio.wait_for(self.backend.cleanup(a), 2 * BUDGET_STOP_GRACE_S)
+                try: await self._cleanup_once(a, timeout=2 * BUDGET_STOP_GRACE_S)
                 except Exception: pass
         finally:
             self.controllers.pop(aid, None); self.kick()
@@ -2328,7 +2541,7 @@ class Launcher:
         finally:
             with self.lock: self._budget_finishing.discard(aid)
             if not cleaned:  # the success path already cleaned up inside _finish: exactly one teardown
-                try: await asyncio.wait_for(self.backend.cleanup(a), 2 * BUDGET_STOP_GRACE_S)
+                try: await self._cleanup_once(a, timeout=2 * BUDGET_STOP_GRACE_S)
                 except Exception: pass
             self.kick()
 
@@ -2380,7 +2593,7 @@ class Launcher:
         """
         spec = model_spec(self.cfg, a.get("model"), a.get("brief"))
         fb = spec.get("fallback")
-        await self.backend.cleanup(a)
+        await self._cleanup_once(a)
         if fb and not a.get("fallback"):
             a["fallback"] = {"from": spec["name"], "to": fb, "reason": f"{reason} (model unavailable)", "at": time.time()}
             a["model"] = fb
@@ -2396,7 +2609,7 @@ class Launcher:
 
     async def _fallback_to_deepseek(self, a, reason="go monthly-limit 429"):
         # Retry once on DeepSeek official after a Go monthly-limit 429. Records fallback="deepseek".
-        await self.backend.cleanup(a)
+        await self._cleanup_once(a)
         nxt = "deepseek:deepseek-flash"
         a["fallback"] = "deepseek"
         a["model"] = nxt
@@ -2407,7 +2620,7 @@ class Launcher:
 
     async def _backoff(self, a, exhausted=False, reason="provider rate limit", retry_after=None):
         if a.get("pool") and a.get("model") in FREE_POOL:
-            await self.backend.cleanup(a)
+            await self._cleanup_once(a)
             bad = a["model"]; self.model_health[bad]["last_limited"] = time.time(); a["tried"].append(bad)
             nxt = self._pick_free(a)
             if not nxt:
@@ -2419,7 +2632,7 @@ class Launcher:
             self._set(a, "queued", f"{reason} on {bad}; switching to {nxt}"); return
         spec = model_spec(self.cfg, a.get("model"), a.get("brief"))
         n = a["rate_limited"]; delays = spec.get("backoff_s") or self.cfg["backoff_s"]
-        await self.backend.cleanup(a)
+        await self._cleanup_once(a)
         if exhausted or n >= len(delays):
             fb = spec.get("fallback")
             if fb and not a.get("fallback"):
@@ -2448,7 +2661,7 @@ class Launcher:
         (self.dir / "attempts" / f"{a['attempt_id']}.result.json").write_text(json.dumps(manifest, indent=1), "utf-8")
         ok = e.get("stop_reason") in ("end_turn", None) and not res.get("error") and e["kind"] == "turn_ended"
         self._set(a, "succeeded" if ok else "failed", f"turn ended: {e.get('stop_reason') or e['kind']}")
-        await self.backend.cleanup(a)
+        await self._cleanup_once(a)
 
     async def _manifest(self, a, res):
         b = a["brief"]; files = []
@@ -2730,7 +2943,13 @@ def make_handler(L, token):
                 allow = sorted({L.cfg["model"], *MODELS, *((L.cfg.get("models") or {}).keys())})
                 try: eff_model = model_spec(L.cfg, default_model(L.cfg)).get("model") or L.cfg["model"]
                 except ValueError: eff_model = L.cfg["model"]
-                return self._send(200, {"ok": True, "version": VERSION, "max_concurrent": L.cfg["max_concurrent"], "active": len(L._active()), "queued": len(L._queue()), "model": L.cfg["model"],
+                try:
+                    st = L.publish_runtime_status()
+                except Exception:
+                    live = len(L._active()); jact, jtmp = L.journal_counts()
+                    st = {"active": live, "journal_active": jact, "journal_tmp": jtmp,
+                          "split_brain": (live != jact) or (jtmp > 0)}
+                return self._send(200, {"ok": True, "version": VERSION, "max_concurrent": L.cfg["max_concurrent"], "active": st["active"], "journal_active": st["journal_active"], "journal_tmp": st["journal_tmp"], "split_brain": st["split_brain"], "queued": len(L._queue()), "model": L.cfg["model"],
                                        "configured_model": L.cfg["model"], "effective_model": eff_model, "models": allow, "uptime_s": round(time.time() - L.started_at), "loop_lag_ms": round(L.loop_lag_ms, 1),
                                        **({"deployment_receipt": rc} if (rc := deployment_receipt(L.cfg)) is not None else {})})
             if p == ["v1", "landing", "events"]:  # authenticated export of the durable canonical outbox
