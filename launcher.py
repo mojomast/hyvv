@@ -2404,11 +2404,18 @@ class Launcher:
         finally:
             # Check jobs have their own finally (check_cleanup). Do not also run the
             # coding-bee sandbox teardown against a check container.
+            # When the budget watchdog already owns teardown, skip cleanup here:
+            # killing the child first makes _budget_finish drain an "exited" event
+            # and land "turn ended: exited" instead of the timeout detail.
             if a.get("kind") != "check":
-                try:
-                    await self._cleanup_once(a)
-                except Exception:
-                    pass
+                with self.lock:
+                    budget_owned = aid in self._budget_finishing or (
+                        a.get("budget_stop") and a.get("state") not in TERMINAL)
+                if not budget_owned:
+                    try:
+                        await self._cleanup_once(a)
+                    except Exception:
+                        pass
             if watchdog is not None and not watchdog.done(): watchdog.cancel()
             self.controllers.pop(aid, None); self.kick()
 
