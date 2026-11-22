@@ -94,6 +94,9 @@ paths:
                         additionalProperties: false
                   max_concurrent: {type: integer}
                   active: {type: integer}
+                  journal_active: {type: integer, description: Disk journal entries in starting, running, or cancel_requested.}
+                  journal_tmp: {type: integer, description: Leftover attempts/*.tmp files from a failed journal replace.}
+                  split_brain: {type: boolean, description: True when live active and journal_active differ, or leftover tmp files remain.}
                   queued: {type: integer}
                   model: {type: string}
                   uptime_s: {type: number}
