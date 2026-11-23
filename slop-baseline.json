@@ -1,0 +1,66 @@
+{
+  "agy_cua_mcp.py": {
+    "complexity": 1,
+    "swallowed-exception": 1
+  },
+  "contract/v1/project_state.py": {
+    "complexity": 1
+  },
+  "contract/v1/reference.py": {
+    "complexity": 3
+  },
+  "contract/v1/tests/test_http_v1.py": {
+    "complexity": 1
+  },
+  "contrib/rizzstack_rails/contracts.py": {
+    "complexity": 5
+  },
+  "contrib/rizzstack_rails/ledger.py": {
+    "complexity": 7,
+    "swallowed-exception": 1
+  },
+  "images/acceptance/derive_seccomp.py": {
+    "complexity": 1
+  },
+  "landing_export.py": {
+    "complexity": 4
+  },
+  "launcher.py": {
+    "complexity": 31,
+    "swallowed-exception": 19
+  },
+  "provisioning.py": {
+    "complexity": 4
+  },
+  "rails_export.py": {
+    "complexity": 5
+  },
+  "rails_log_source.py": {
+    "complexity": 2
+  },
+  "scripts/vendor_rails.py": {
+    "complexity": 1
+  },
+  "tests/test_acceptance_class.py": {
+    "complexity": 1
+  },
+  "tests/test_bee_landed_usage.py": {
+    "swallowed-exception": 1
+  },
+  "tests/test_budget_enforcement.py": {
+    "swallowed-exception": 1
+  },
+  "tests/test_landing_events.py": {
+    "complexity": 1,
+    "swallowed-exception": 1
+  },
+  "tests/test_r4_run_command_design.py": {
+    "complexity": 1
+  },
+  "tests/test_version_endpoint.py": {
+    "complexity": 1
+  },
+  "tools/slop-lint/slop_lint/baseline.py": {
+    "complexity": 1
+  }
+}
