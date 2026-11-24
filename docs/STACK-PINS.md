@@ -51,11 +51,11 @@ instead of drifting silently.
 | Field | Value |
 | --- | --- |
 | Package | `hyvv` |
-| Version | `0.1.18` |
-| sdist | `hyvv-0.1.18.tar.gz` |
-| wheel | `hyvv-0.1.18-py3-none-any.whl` |
-| Server header | `orbit-launcher/0.1.18` |
-| Editable lock entry | `hyvv 0.1.18` |
+| Version | `0.1.19` |
+| sdist | `hyvv-0.1.19.tar.gz` |
+| wheel | `hyvv-0.1.19-py3-none-any.whl` |
+| Server header | `orbit-launcher/0.1.19` |
+| Editable lock entry | `hyvv 0.1.19` |
 
 No commit hash is recorded for this build identity: doing so would pin the
 document to its own containing commit.

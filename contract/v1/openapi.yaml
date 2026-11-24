@@ -9,7 +9,7 @@ info:
 
     hyvv is a vocabulary, not a dependency on bundlebees.
 
-    Every operation carries `x-hyvv-status`, one of: `launcher-0.1.18`
+    Every operation carries `x-hyvv-status`, one of: `launcher-0.1.19`
     (implemented in launcher 0.1.18), `reference` (implemented only in the
     /v1 reference, contract/v1/reference.py), `specified` (specified, not
     implemented), or `proposed`. contract/v1/STATUS.json is the source and
@@ -33,7 +33,7 @@ paths:
       tags: [meta]
       operationId: getVersion
       summary: API version and capabilities
-      x-hyvv-status: launcher-0.1.18
+      x-hyvv-status: launcher-0.1.19
       security:
         - bearerAuth: []
       responses:
@@ -59,7 +59,7 @@ paths:
       tags: [meta]
       operationId: getHealth
       summary: Liveness and host counters
-      x-hyvv-status: launcher-0.1.18
+      x-hyvv-status: launcher-0.1.19
       security:
         - bearerAuth: []
       responses:
@@ -110,7 +110,7 @@ paths:
       operationId: listAttempts
       summary: List attempts (public and lease fields only; newest 200)
       description: Responses never include patch text, brief objective text, host names, or runtime paths.
-      x-hyvv-status: launcher-0.1.18
+      x-hyvv-status: launcher-0.1.19
       security:
         - bearerAuth: []
       parameters:
@@ -139,7 +139,7 @@ paths:
       tags: [attempts]
       operationId: createAttempt
       summary: Create an attempt (idempotent if attempt_id already exists)
-      x-hyvv-status: launcher-0.1.18
+      x-hyvv-status: launcher-0.1.19
       security:
         - bearerAuth: []
       requestBody:
@@ -257,7 +257,7 @@ paths:
       tags: [attempts]
       operationId: getAttempt
       summary: Public fields for one attempt (no patch, no host paths)
-      x-hyvv-status: launcher-0.1.18
+      x-hyvv-status: launcher-0.1.19
       security:
         - bearerAuth: []
       parameters:
@@ -279,7 +279,7 @@ paths:
       tags: [attempts]
       operationId: getAttemptEvents
       summary: Events since a cursor (no patch text)
-      x-hyvv-status: launcher-0.1.18
+      x-hyvv-status: launcher-0.1.19
       security:
         - bearerAuth: []
       parameters:
@@ -304,7 +304,7 @@ paths:
         Historical endpoint. The manifest may include host and work-dir fields.
         Coordinators must use `GET /v1/attempts/{attempt_id}/artifact` once
         `artifact_fetch` ships.
-      x-hyvv-status: launcher-0.1.18
+      x-hyvv-status: launcher-0.1.19
       deprecated: true
       security:
         - bearerAuth: []
@@ -371,7 +371,7 @@ paths:
       tags: [attempts]
       operationId: reviewAttempt
       summary: Record a coordinator verdict
-      x-hyvv-status: launcher-0.1.18
+      x-hyvv-status: launcher-0.1.19
       security:
         - bearerAuth: []
       parameters:
@@ -403,7 +403,7 @@ paths:
       tags: [attempts]
       operationId: cancelAttempt
       summary: Cancel an attempt
-      x-hyvv-status: launcher-0.1.18
+      x-hyvv-status: launcher-0.1.19
       security:
         - bearerAuth: []
       parameters:
@@ -421,7 +421,7 @@ paths:
       tags: [host]
       operationId: listProjects
       summary: Authorized project names only (no paths, repos, or branches)
-      x-hyvv-status: launcher-0.1.18
+      x-hyvv-status: launcher-0.1.19
       security:
         - bearerAuth: []
       responses:
@@ -435,7 +435,7 @@ paths:
       tags: [host]
       operationId: getContainerProfile
       summary: Sandbox image profile (not live containers)
-      x-hyvv-status: launcher-0.1.18
+      x-hyvv-status: launcher-0.1.19
       security:
         - bearerAuth: []
       responses:
@@ -449,7 +449,7 @@ paths:
       tags: [host]
       operationId: patchRuntimeConfig
       summary: Runtime-only max_concurrent change (not written to disk)
-      x-hyvv-status: launcher-0.1.18
+      x-hyvv-status: launcher-0.1.19
       security:
         - bearerAuth: []
       requestBody:
@@ -477,7 +477,7 @@ paths:
       description: >
         Resolves the request with the dispatch model selector. The response carries
         credential-presence booleans only, never credential values or provider endpoints.
-      x-hyvv-status: launcher-0.1.18
+      x-hyvv-status: launcher-0.1.19
       security:
         - bearerAuth: []
       requestBody:
@@ -508,7 +508,7 @@ paths:
       operationId: getProvisioningCapabilities
       summary: Advertise host-enrolled provisioning capabilities
       description: A disabled host returns enabled false and never advertises an enrolled profile.
-      x-hyvv-status: launcher-0.1.18
+      x-hyvv-status: launcher-0.1.19
       security:
         - bearerAuth: []
       responses:
@@ -538,7 +538,7 @@ paths:
         memory and CPU, a cached read-only Docker probe and recent provider rate limits per lane.
         Unknown values are null, never guessed, so a caller can fail closed. Never carries tokens,
         paths, hosts or provider URLs.
-      x-hyvv-status: launcher-0.1.18
+      x-hyvv-status: launcher-0.1.19
       security:
         - bearerAuth: []
       responses:
@@ -601,7 +601,7 @@ paths:
       operationId: exportLandingEvents
       summary: Export durable canonical landing events
       description: Read-only, cursor-paginated export of the stored canonical outbox.
-      x-hyvv-status: launcher-0.1.18
+      x-hyvv-status: launcher-0.1.19
       security:
         - bearerAuth: []
       parameters:
