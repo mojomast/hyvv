@@ -14,7 +14,7 @@ ROOT = HERE.parent.parent
 STATUS = json.loads((HERE / "STATUS.json").read_text(encoding="utf-8"))
 BEGIN, END = "<!-- status:begin (generated from contract/v1/STATUS.json; python -m contract.v1.status --write) -->", "<!-- status:end -->"
 DOCS = [ROOT / "README.md", HERE / "README.md"]
-TITLES = {"launcher-0.1.18": "Implemented in launcher 0.1.18", "launcher-main": "Implemented on main, not yet released", "reference": "Implemented in the /v1 reference only",
+TITLES = {"launcher-0.1.18": "Implemented in launcher 0.1.18", "reference": "Implemented in the /v1 reference only",
           "specified": "Specified, not implemented", "proposed": "Proposed"}
 
 

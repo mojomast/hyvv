@@ -538,7 +538,7 @@ paths:
         memory and CPU, a cached read-only Docker probe and recent provider rate limits per lane.
         Unknown values are null, never guessed, so a caller can fail closed. Never carries tokens,
         paths, hosts or provider URLs.
-      x-hyvv-status: launcher-main
+      x-hyvv-status: launcher-0.1.18
       security:
         - bearerAuth: []
       responses:
