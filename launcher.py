@@ -2355,16 +2355,21 @@ class Launcher:
         start_spacing_s). Called under self.lock from _schedule; records the start time when
         the attempt may go. Models without pacing fields are never held."""
         spec = self._spec_of(a)
-        cap, spacing, src = spec.get("max_active"), spec.get("start_spacing_s") or 0, spec.get("key")
-        if not (cap or spacing) or not src:
+        src = spec.get("key")
+        if not src or not (spec.get("max_active") or spec.get("start_spacing_s")):
             return False
-        if cap and sum(1 for x in self._active() if self._spec_of(x).get("key") == src) >= cap:
+        if self._over_cap(src, spec.get("max_active")):
             return True  # a finishing attempt's controller kicks the scheduler again
+        return self._spacing_hold(src, spec.get("start_spacing_s") or 0)
+
+    def _over_cap(self, src, cap):
+        return bool(cap) and sum(1 for x in self._active() if self._spec_of(x).get("key") == src) >= cap
+
+    def _spacing_hold(self, src, spacing):
         last = getattr(self, "_pace_last", {}).get(src, 0.0)
         wait = spacing - (time.time() - last)
         if wait > 0:
-            try: self.loop.call_later(wait + 0.05, self.kick)
-            except Exception: pass
+            self.loop.call_later(wait + 0.05, self.kick)
             return True
         if not hasattr(self, "_pace_last"): self._pace_last = {}
         self._pace_last[src] = time.time()
