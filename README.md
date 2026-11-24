@@ -19,12 +19,12 @@ This repository is the fourth layer: the runtime on each machine where work happ
 
 ## Status
 
-The imported runtime is **v0.1.15**. This branch bumps the package to **v0.1.18** so a deployed build can be told apart; the release is still 0.1.15. A brief that names no model uses the host's configured `model`; a host can opt in to `zoo:glm-5.3-flash` with `"prefer_zoo": true` in `config.json` when it has a `zoo` key (off by default since 2026-11-19: the free pass refuses programmatic use and ends ~Nov 29), and Zoo's fallback is DeepSeek official flash. Named models keep the 0.1.15 routing and are authoritative: unprefixed and `go:` go to OpenCode Go, `deepseek:` to the official DeepSeek API, and an explicitly named model always wins over `priority: high` (owner decision 2026-11-15: whatever the brief names is what runs). `priority: high` reroutes only a brief that names no model.
+The imported runtime is **v0.1.15**. This branch bumps the package to **v0.1.19** so a deployed build can be told apart; the release is still 0.1.15. A brief that names no model uses the host's configured `model`; a host can opt in to `zoo:glm-5.3-flash` with `"prefer_zoo": true` in `config.json` when it has a `zoo` key (off by default since 2026-11-19: the free pass refuses programmatic use and ends ~Nov 29), and Zoo's fallback is DeepSeek official flash. Named models keep the 0.1.15 routing and are authoritative: unprefixed and `go:` go to OpenCode Go, `deepseek:` to the official DeepSeek API, and an explicitly named model always wins over `priority: high` (owner decision 2026-11-15: whatever the brief names is what runs). `priority: high` reroutes only a brief that names no model.
 
 The `/v1` contract in `contract/v1` is the source of truth going forward:
 
 - OpenAPI plus JSON Schemas for attempts, artifacts (`hyvv.worker-artifact/1`), errors, and usage records (`bee.usage/v1`)
-- `GET /v1/version` returns `api_version` (`v1`, the contract version) and `version` (the hyvv / launcher release, `0.1.18` on this branch, `0.1.15` released), plus the capabilities this host supports (`priority_routing`, `go_fallback`). `artifact_fetch` and `leases` are advertised only once those routes ship
+- `GET /v1/version` returns `api_version` (`v1`, the contract version) and `version` (the hyvv / launcher release, `0.1.19` on this branch, `0.1.15` released), plus the capabilities this host supports (`priority_routing`, `go_fallback`). `artifact_fetch` and `leases` are advertised only once those routes ship
 - Semver: `/v1` only ever gets additive changes. A breaking change is `/v2`, served alongside `/v1` for one release
 - Conformance tests, including artifact acceptance criteria `AC-001`–`AC-010`
 
