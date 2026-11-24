@@ -187,3 +187,43 @@ jobs:
         run: |
           test "${{ needs.test.result }}" = "success"
           test "${{ needs.scan.result }}" = "success"
+
+  ci-gate:
+    name: ci-gate
+    # The main ruleset requires this one check. It passes only when every job
+    # in this file succeeded, so new jobs must be added to needs (checked below).
+    if: ${{ always() }}
+    needs:
+      - windows-provisioning
+      - test
+      - scan
+      - bee-ci-unit
+      - bee-ci-contract
+      - bee-ci-release-assets
+      - bee-ci-installer-dry-run
+      - bee-ci-scan
+      - ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: ci-gate needs every job in this file
+        run: python3 .github/scripts/check_ci_gate.py .github/workflows/ci.yml
+      - name: Fail unless every needed job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          results = {job: data["result"] for job, data in json.loads(os.environ["NEEDS"]).items()}
+          for job, result in sorted(results.items()):
+              print(f"{job}: {result}")
+          failed = sorted(job for job, result in results.items() if result != "success")
+          if failed or not results:
+              print("ci-gate FAILED: " + (", ".join(failed) or "no jobs"))
+              sys.exit(1)
+          PY
