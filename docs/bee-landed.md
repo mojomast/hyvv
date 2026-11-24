@@ -83,7 +83,7 @@ delivery.
   "time": "2026-11-14T12:34:56.789012Z",
   "subject": "att_0123456789abcdef",
   "datacontenttype": "application/json",
-  "dataschema": "https://rizstack.dev/schemas/bee-landed/v1",
+  "dataschema": "https://github.com/mojomast/workflow/schemas/bee-landed.schema.json",
   "data": {
     "schema": "rizzstack.bee-landed/1",
     "feature_id": "feat_1",
