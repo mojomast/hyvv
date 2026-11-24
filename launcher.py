@@ -247,7 +247,7 @@ def redact(s):
 # can leave a complete event or no event, never a torn one. Delivery is a local signal
 # (file or Unix socket); the outbox file itself is the replayable source of truth.
 LANDED_EVENT_TYPE = "rizzstack.bee.landed.v1"
-LANDED_EVENT_SCHEMA = "https://rizstack.dev/schemas/bee-landed/v1"
+LANDED_EVENT_SCHEMA = "https://github.com/mojomast/workflow/schemas/bee-landed.schema.json"
 LANDED_DATA_SCHEMA = "rizzstack.bee-landed/1"
 LANDED_EVENT_ID_PREFIX = "urn:rizzstack:bee-landed:"
 _LANDED_EVIDENCE_KEYS = ("schema", "feature_id", "job_id", "task_id", "attempt_id",
@@ -1866,11 +1866,61 @@ class FakeBackend:
                  "stdout_tail": "", "stderr_tail": "", "log_file": None} for i, c in enumerate(a["brief"].get("commands") or [])]
     async def check_cleanup(self, a): pass
 
+def _clip_text(value, limit):
+    text = str(value).strip()
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+def _render_findings(findings):
+    if not isinstance(findings, dict):
+        return None
+    lines = []
+    for key, label in (("failure_id", "failure_id"), ("verdict", "verdict"), ("summary", "summary")):
+        value = findings.get(key)
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            text = _clip_text(value, 2000 if key == "summary" else 200)
+            if text:
+                lines.append(f"- {label}: {text}")
+    sources = findings.get("sources")
+    if isinstance(sources, list):
+        refs = []
+        for source in sources[:20]:
+            if isinstance(source, dict):
+                ref = source.get("ref")
+                kind = source.get("kind")
+                if isinstance(ref, (str, int, float)) and not isinstance(ref, bool):
+                    prefix = f"{kind}: " if isinstance(kind, str) and kind else ""
+                    refs.append(_clip_text(prefix + str(ref), 300))
+        if refs:
+            lines.append("- sources:\n" + "\n".join(f"  - {ref}" for ref in refs))
+    alternatives = findings.get("rejected_alternatives")
+    if isinstance(alternatives, list):
+        rejected = [_clip_text(x, 300) for x in alternatives[:20]
+                    if isinstance(x, (str, int, float)) and not isinstance(x, bool)]
+        rejected = [x for x in rejected if x]
+        if rejected:
+            lines.append("- rejected alternatives:\n" + "\n".join(f"  - {x}" for x in rejected))
+    if not lines:
+        return None
+    return _clip_text("# Research findings\n" + "\n".join(lines), 4000)
+
+def _render_tests(tests):
+    if not isinstance(tests, list):
+        return None
+    names = [_clip_text(x, 500) for x in tests[:50]
+             if isinstance(x, str) and x.strip()]
+    if not names:
+        return None
+    return "# Tests that must pass\n" + "\n".join(f"- {name}" for name in names)
+
 def render_prompt(b):
     parts = [f"# Objective\n{b['objective']}"]
     for k, title in [("deliverables", "Deliverables"), ("acceptance", "Acceptance criteria"), ("assigned_files", "Files you may change"),
                      ("commands", "Tools/commands you may run"), ("deps", "Dependencies/context")]:
         if b.get(k): parts.append(f"# {title}\n" + "\n".join(f"- {x}" for x in b[k]))
+    findings = _render_findings(b.get("findings"))
+    if findings: parts.append(findings)
+    tests = _render_tests(b.get("tests"))
+    if tests: parts.append(tests)
     parts.append("# Rules\n- Work only inside the working directory.\n- Do not start subagents.\n- Do not print secrets or environment variables.")
     parts.append("# Return format\nEnd with a JSON block: {\"summary\":..., \"changed_files\":[...], \"checks\":[{\"name\":...,\"command\":...,\"passed\":bool}], \"open_issues\":[...]}")
     return "\n\n".join(parts)
