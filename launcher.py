@@ -1870,35 +1870,56 @@ def _clip_text(value, limit):
     text = str(value).strip()
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
 
+def _is_scalar(value):
+    return isinstance(value, (str, int, float)) and not isinstance(value, bool)
+
+def _finding_scalar_lines(findings):
+    lines = []
+    for key in ("failure_id", "verdict", "summary"):
+        value = findings.get(key)
+        if not _is_scalar(value):
+            continue
+        text = _clip_text(value, 2000 if key == "summary" else 200)
+        if text:
+            lines.append(f"- {key}: {text}")
+    return lines
+
+def _source_refs(sources):
+    refs = []
+    for source in sources[:20]:
+        if not isinstance(source, dict):
+            continue
+        ref = source.get("ref")
+        if not _is_scalar(ref):
+            continue
+        kind = source.get("kind")
+        prefix = f"{kind}: " if isinstance(kind, str) and kind else ""
+        refs.append(_clip_text(prefix + str(ref), 300))
+    return refs
+
+def _rejected_entries(alternatives):
+    entries = [_clip_text(x, 300) for x in alternatives[:20] if _is_scalar(x)]
+    return [x for x in entries if x]
+
+def _finding_block(label, entries):
+    if not entries:
+        return None
+    return f"- {label}:\n" + "\n".join(f"  - {entry}" for entry in entries)
+
 def _render_findings(findings):
     if not isinstance(findings, dict):
         return None
-    lines = []
-    for key, label in (("failure_id", "failure_id"), ("verdict", "verdict"), ("summary", "summary")):
-        value = findings.get(key)
-        if isinstance(value, (str, int, float)) and not isinstance(value, bool):
-            text = _clip_text(value, 2000 if key == "summary" else 200)
-            if text:
-                lines.append(f"- {label}: {text}")
+    lines = _finding_scalar_lines(findings)
     sources = findings.get("sources")
     if isinstance(sources, list):
-        refs = []
-        for source in sources[:20]:
-            if isinstance(source, dict):
-                ref = source.get("ref")
-                kind = source.get("kind")
-                if isinstance(ref, (str, int, float)) and not isinstance(ref, bool):
-                    prefix = f"{kind}: " if isinstance(kind, str) and kind else ""
-                    refs.append(_clip_text(prefix + str(ref), 300))
-        if refs:
-            lines.append("- sources:\n" + "\n".join(f"  - {ref}" for ref in refs))
+        block = _finding_block("sources", _source_refs(sources))
+        if block:
+            lines.append(block)
     alternatives = findings.get("rejected_alternatives")
     if isinstance(alternatives, list):
-        rejected = [_clip_text(x, 300) for x in alternatives[:20]
-                    if isinstance(x, (str, int, float)) and not isinstance(x, bool)]
-        rejected = [x for x in rejected if x]
-        if rejected:
-            lines.append("- rejected alternatives:\n" + "\n".join(f"  - {x}" for x in rejected))
+        block = _finding_block("rejected alternatives", _rejected_entries(alternatives))
+        if block:
+            lines.append(block)
     if not lines:
         return None
     return _clip_text("# Research findings\n" + "\n".join(lines), 4000)
