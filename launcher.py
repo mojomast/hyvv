@@ -2152,7 +2152,7 @@ class Launcher:
             # A resumable rate-limited attempt still owns its sandbox while it is parked in
             # backoff; cancelling before the retry starts must not leak it.
             try: asyncio.run_coroutine_threadsafe(self._cleanup_once(a), self.loop)
-            except Exception: pass
+            except RuntimeError: pass  # loop closed: same no-op the pre-start cancel had
         self.kick(); return a
 
     def landed_result_path(self, a):
