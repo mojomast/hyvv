@@ -1,2 +1,4 @@
 # Vendor pins are over physical bytes, including on Windows auto-CRLF checkouts.
 contrib/rizzstack_rails/* text eol=lf
+# The slop-lint vendor manifest pins physical bytes too.
+tools/slop-lint/** text eol=lf
