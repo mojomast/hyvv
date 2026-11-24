@@ -1866,8 +1866,10 @@ class FakeBackend:
                  "stdout_tail": "", "stderr_tail": "", "log_file": None} for i, c in enumerate(a["brief"].get("commands") or [])]
     async def check_cleanup(self, a): pass
 
-def _clip_text(value, limit):
+def _clip_text(value, limit, collapse_ws=False):
     text = str(value).strip()
+    if collapse_ws:
+        text = " ".join(text.split())
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
 
 def _is_scalar(value):
@@ -1879,7 +1881,7 @@ def _finding_scalar_lines(findings):
         value = findings.get(key)
         if not _is_scalar(value):
             continue
-        text = _clip_text(value, 2000 if key == "summary" else 200)
+        text = _clip_text(value, 2000 if key == "summary" else 200, collapse_ws=True)
         if text:
             lines.append(f"- {key}: {text}")
     return lines
@@ -1894,11 +1896,11 @@ def _source_refs(sources):
             continue
         kind = source.get("kind")
         prefix = f"{kind}: " if isinstance(kind, str) and kind else ""
-        refs.append(_clip_text(prefix + str(ref), 300))
+        refs.append(_clip_text(prefix + str(ref), 300, collapse_ws=True))
     return refs
 
 def _rejected_entries(alternatives):
-    entries = [_clip_text(x, 300) for x in alternatives[:20] if _is_scalar(x)]
+    entries = [_clip_text(x, 300, collapse_ws=True) for x in alternatives[:20] if _is_scalar(x)]
     return [x for x in entries if x]
 
 def _finding_block(label, entries):
@@ -1931,7 +1933,8 @@ def _render_tests(tests):
              if isinstance(x, str) and x.strip()]
     if not names:
         return None
-    return "# Tests that must pass\n" + "\n".join(f"- {name}" for name in names)
+    section = "# Tests that must pass\n" + "\n".join(f"- {name}" for name in names)
+    return _clip_text(section, 8000)
 
 def render_prompt(b):
     parts = [f"# Objective\n{b['objective']}"]
@@ -1954,8 +1957,12 @@ def normalize_brief(b):
     if isinstance(acc, dict):
         b = dict(b)
         crit = [x for x in acc.get("criteria") or [] if isinstance(x, str)]
+        acc_tests = [x for x in acc.get("tests") or [] if isinstance(x, str)]
         b["acceptance"] = crit + [f"Run: {c}" for c in acc.get("commands") or [] if isinstance(c, str)] + \
-                          [f"Test passes: {t}" for t in acc.get("tests") or [] if isinstance(t, str)]
+                          [f"Test passes: {t}" for t in acc_tests]
+        existing = b.get("tests")
+        if acc_tests and not (isinstance(existing, list) and existing):
+            b["tests"] = list(acc_tests)
     return b
 
 def _budget_requirement_error(cfg, b):
