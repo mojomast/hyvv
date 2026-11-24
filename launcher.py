@@ -1929,7 +1929,7 @@ def _render_findings(findings):
 def _render_tests(tests):
     if not isinstance(tests, list):
         return None
-    names = [_clip_text(x, 500) for x in tests[:50]
+    names = [_clip_text(x, 500, collapse_ws=True) for x in tests[:50]
              if isinstance(x, str) and x.strip()]
     if not names:
         return None

@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mojomast/workflow/observability/schemas/common.schema.json",
+  "title": "Shared observability record definitions",
+  "description": "Join keys align with the Hermes Forge usage record (draft schema_version bee.usage/v1). This file does not define that usage record. Final usage field names come with the Hermes Forge freeze notice. Missing numeric usage is not represented here; consumers of the usage record must treat missing values as null with an unknown or partial status, never as zero.",
+  "$defs": {
+    "utc_timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2})$",
+      "description": "UTC timestamp in RFC 3339 form with second precision."
+    },
+    "id_token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+      "description": "Opaque identifier. Not a URL, path, hostname, or secret."
+    },
+    "nullable_id": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/id_token"
+        }
+      ]
+    },
+    "role": {
+      "enum": [
+        "work",
+        "verify",
+        "coordinator"
+      ]
+    },
+    "nullable_role": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/role"
+        }
+      ]
+    },
+    "scrubbed_text": {
+      "type": "string",
+      "maxLength": 500,
+      "description": "Free text that has already been scrubbed. Must not contain secrets, keys, tokens, environment-file contents, patches, prompts, private URLs, or hostnames."
+    },
+    "join_keys": {
+      "type": "object",
+      "description": "Keys used to join to the Hermes Forge usage record (draft schema_version bee.usage/v1). All five may be null on snapshots that are not about a single attempt.",
+      "properties": {
+        "attempt_id": {
+          "$ref": "#/$defs/nullable_id"
+        },
+        "card_id": {
+          "$ref": "#/$defs/nullable_id"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nullable_id"
+        },
+        "project": {
+          "$ref": "#/$defs/nullable_id"
+        },
+        "role": {
+          "$ref": "#/$defs/nullable_role"
+        }
+      }
+    },
+    "provider_label": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+      "description": "Extension identifier for an open vocabulary (agent source kinds, routes, resource kinds, providers). Lower-case token: not a URL, path, hostname, or secret. Known values are listed next to each field; other providers (for example openrouter) are valid extension labels."
+    },
+    "record_type": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.-]{0,63}/v[0-9]+$",
+      "description": "Common envelope discriminator: <record name>/v<major>. These records carry it in `schema`; the frozen Hermes Forge usage record carries it in `schema_version` (bee.usage/v1). See observability/envelope.py."
+    }
+  }
+}
