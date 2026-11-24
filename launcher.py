@@ -40,6 +40,11 @@ HEARTBEAT_S = 60  # controller emits a heartbeat event after this many quiet sec
 MAX_WORKERS = 14  # hard ceiling for max_concurrent (owner directive: final ceiling, supersedes the interim cap-12)
 TERMINAL = {"succeeded", "failed", "cancelled"}
 
+# A resumable rate-limited attempt keeps its sandbox and run; the retry sends this short
+# continue turn instead of the full brief.
+RESUME_PROMPT = ("Continue the same task from where the previous turn stopped; do not restart "
+                 "from scratch. The prior turn was interrupted by a provider rate limit.")
+
 JOURNAL_ACTIVE = ("starting", "running", "cancel_requested")
 SAVE_REPLACE_TRIES = 10
 SAVE_REPLACE_BUDGET_S = 2.0  # total backoff across retries of os.replace (about 2 seconds)
@@ -1973,6 +1978,7 @@ class Launcher:
         self.started_at = time.time(); self.loop_lag_ms = 0.0
         self.landing_conflicts = []
         self._cleaned_aids = set()
+        self._cleaned_sandboxes = set()
         self._load()
         self.rails = None
         if cfg.get('rails_enabled') is True:
@@ -2133,12 +2139,20 @@ class Launcher:
         self.kick(); return a, True
 
     def cancel(self, aid):
+        prestart_sandbox = False
         with self.lock:
             a = self.attempts.get(aid)
             if not a: return None
             if a["state"] in TERMINAL: return a
-            if a["state"] in ("queued", "backoff"): self._set(a, "cancelled", "cancelled before start")
+            if a["state"] in ("queued", "backoff"):
+                self._set(a, "cancelled", "cancelled before start")
+                prestart_sandbox = bool(a.get("sandbox"))
             else: a["cancel"] = True; self._set(a, "cancel_requested", "interrupt sent")
+        if prestart_sandbox:
+            # A resumable rate-limited attempt still owns its sandbox while it is parked in
+            # backoff; cancelling before the retry starts must not leak it.
+            try: asyncio.run_coroutine_threadsafe(self._cleanup_once(a), self.loop)
+            except Exception: pass
         self.kick(); return a
 
     def landed_result_path(self, a):
@@ -2207,9 +2221,20 @@ class Launcher:
         return True
 
     async def _cleanup_once(self, a, timeout=None):
-        """Idempotent teardown of only this attempt's recorded sandbox. Safe to call from finally."""
+        """Idempotent teardown of only this attempt's recorded sandbox. Safe to call from finally.
+
+        The ledger is keyed by sandbox, not attempt id: a retry keeps the same attempt id but
+        gets a new sandbox, and that second sandbox must also be torn down exactly once.
+        """
         aid = a.get("attempt_id")
-        if not aid or aid in self._cleaned_aids:
+        if not aid:
+            return
+        sandbox = a.get("sandbox")
+        if sandbox:
+            if sandbox in self._cleaned_sandboxes:
+                return
+            self._cleaned_sandboxes.add(sandbox)
+        elif aid in self._cleaned_aids:
             return
         self._cleaned_aids.add(aid)
         try:
@@ -2453,6 +2478,20 @@ class Launcher:
                 deadline = started + budget
                 watchdog = asyncio.ensure_future(self._budget_watchdog(a, asyncio.current_task(), deadline, budget, started))
             if a.get("kind") == "check": return await self._control_check(a)
+            if a.get("run_id") and a.get("resume_pending"):
+                a.pop("resume_pending", None)
+                try:
+                    ids = await self.backend.resume(a, RESUME_PROMPT)
+                    if isinstance(ids, dict):
+                        a.update({k: v for k, v in ids.items() if v is not None})
+                    self._set(a, "running", "run resumed after a rate limit")
+                except Exception:
+                    # Resuming is best-effort: if the backend cannot continue this run, tear the
+                    # old sandbox down and let this controller start a fresh one below.
+                    await self._cleanup_once(a)
+                    for k in ("run_id", "sandbox", "sandbox_id", "workdir", "local_base_rev", "seed_commit"):
+                        a.pop(k, None)
+                    a["cursor"] = 0
             if not a.get("run_id"):
                 agy = a.get("kind") == "agy-cua"
                 if a.get("pool") and not a.get("model"):
@@ -2472,8 +2511,14 @@ class Launcher:
                         a["rate_limited"], a["cursor"] = 0, 0
                         self._set(a, "queued", f"{src} key not configured on this PC; falling back to {fb}"); return
                     self._set(a, "failed", "provider key not configured on this PC"); return
+                # A restarted attempt may reuse the deterministic sandbox name its previous
+                # incarnation was torn down under; a fresh create is a new sandbox to clean.
+                for name in (a.get("sandbox"), sandbox_name(a) if a.get("model") else None):
+                    if name: self._cleaned_sandboxes.discard(name)
                 ids = await self.backend.start(a, key); del key
-                a.update(ids); self._set(a, "running", ("agy" if agy else "opencode") + " run started", {"run_id": ids["run_id"]})
+                a.update(ids)
+                if ids.get("sandbox"): self._cleaned_sandboxes.discard(ids["sandbox"])
+                self._set(a, "running", ("agy" if agy else "opencode") + " run started", {"run_id": ids["run_id"]})
             last_hb = last_ev = time.time()
             while True:
                 if a.get("budget_stop") or (deadline and time.time() >= deadline):
@@ -2537,7 +2582,8 @@ class Launcher:
                 with self.lock:
                     budget_owned = aid in self._budget_finishing or (
                         a.get("budget_stop") and a.get("state") not in TERMINAL)
-                if not budget_owned:
+                    resuming = bool(a.get("resume_pending")) and a.get("state") not in TERMINAL
+                if not budget_owned and not resuming:
                     try:
                         await self._cleanup_once(a)
                     except Exception:
@@ -2770,8 +2816,8 @@ class Launcher:
             self._set(a, "queued", f"{reason} on {bad}; switching to {nxt}"); return
         spec = model_spec(self.cfg, a.get("model"), a.get("brief"))
         n = a["rate_limited"]; delays = spec.get("backoff_s") or self.cfg["backoff_s"]
-        await self._cleanup_once(a)
         if exhausted or n >= len(delays):
+            await self._cleanup_once(a)
             fb = spec.get("fallback")
             if self._may_fallback(a, spec):
                 a["fallback_hops"] = self._fallback_hops(a) + 1
@@ -2780,6 +2826,8 @@ class Launcher:
                 for k in ("run_id", "sandbox"): a.pop(k, None)
                 self._set(a, "queued", f"{reason} on {spec['name']}; falling back to {fb}"); return
             self._set(a, "failed", f"{reason} persisted after retries"); return
+        resumable = bool(a.get("run_id") and a.get("sandbox")
+                         and callable(getattr(self.backend, "resume", None)))
         a["rate_limited"] = n + 1
         delay = delays[n]
         if retry_after is not None:
@@ -2788,8 +2836,15 @@ class Launcher:
             delay = retry_after
         a["retry_at"] = time.time() + delay
         a["retry_after_s"] = retry_after
-        for k in ("run_id", "sandbox"): a.pop(k, None)
-        a["cursor"] = 0
+        if resumable:
+            # Same model, and the backend can continue the run: keep the sandbox, run id and
+            # cursor; the retry sends a short continue turn instead of a fresh full brief.
+            a["resume_pending"] = True
+        else:
+            # A model switch (or a backend without resume) restarts from a fresh sandbox.
+            await self._cleanup_once(a)
+            for k in ("run_id", "sandbox"): a.pop(k, None)
+            a["cursor"] = 0
         hint = " (provider Retry-After)" if retry_after is not None else " (queued)"
         self._set(a, "backoff", f"{reason}; retry {n + 1}/{len(delays)} in {delay:g}s{hint}")
         self.loop.call_later(delay + 0.05, self.kick)
