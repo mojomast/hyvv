@@ -9,8 +9,8 @@ info:
 
     hyvv is a vocabulary, not a dependency on bundlebees.
 
-    Every operation carries `x-hyvv-status`, one of: `launcher-0.1.15`
-    (implemented in launcher 0.1.15), `reference` (implemented only in the
+    Every operation carries `x-hyvv-status`, one of: `launcher-0.1.18`
+    (implemented in launcher 0.1.18), `reference` (implemented only in the
     /v1 reference, contract/v1/reference.py), `specified` (specified, not
     implemented), or `proposed`. contract/v1/STATUS.json is the source and
     tests/test_status_labels.py keeps the labels honest. Items marked
@@ -33,7 +33,7 @@ paths:
       tags: [meta]
       operationId: getVersion
       summary: API version and capabilities
-      x-hyvv-status: launcher-0.1.15
+      x-hyvv-status: launcher-0.1.18
       security:
         - bearerAuth: []
       responses:
@@ -47,7 +47,7 @@ paths:
                 v1:
                   value:
                     api_version: v1
-                    version: "0.1.15"
+                    version: "0.1.18"
                     capabilities:
                       - priority_routing
                       - go_fallback
@@ -59,7 +59,7 @@ paths:
       tags: [meta]
       operationId: getHealth
       summary: Liveness and host counters
-      x-hyvv-status: launcher-0.1.15
+      x-hyvv-status: launcher-0.1.18
       security:
         - bearerAuth: []
       responses:
@@ -110,7 +110,7 @@ paths:
       operationId: listAttempts
       summary: List attempts (public and lease fields only; newest 200)
       description: Responses never include patch text, brief objective text, host names, or runtime paths.
-      x-hyvv-status: launcher-0.1.15
+      x-hyvv-status: launcher-0.1.18
       security:
         - bearerAuth: []
       parameters:
@@ -139,7 +139,7 @@ paths:
       tags: [attempts]
       operationId: createAttempt
       summary: Create an attempt (idempotent if attempt_id already exists)
-      x-hyvv-status: launcher-0.1.15
+      x-hyvv-status: launcher-0.1.18
       security:
         - bearerAuth: []
       requestBody:
@@ -184,7 +184,7 @@ paths:
                   type: integer
                   minimum: 0
                   description: >
-                    Reference only (x-hyvv-status reference; not launcher 0.1.15).
+                    Reference only (x-hyvv-status reference; not launcher 0.1.18).
                     Required with `project`: the `generation` of
                     .workflow/project-state.json the dispatcher gated on (0 when the
                     file is absent). hyvv re-reads the file and refuses with 409
@@ -229,7 +229,7 @@ paths:
           description: Project is not authorized on this host (reference code project_not_authorized)
         "409":
           description: >
-            Reference only (contract/v1/project_state.py; not launcher 0.1.15),
+            Reference only (contract/v1/project_state.py; not launcher 0.1.18),
             per workflow docs/18-parking-projects.md at 2bcf0c5.
             project_parked or project_archived when the project's
             .workflow/project-state.json is parked or archived and no override
@@ -257,7 +257,7 @@ paths:
       tags: [attempts]
       operationId: getAttempt
       summary: Public fields for one attempt (no patch, no host paths)
-      x-hyvv-status: launcher-0.1.15
+      x-hyvv-status: launcher-0.1.18
       security:
         - bearerAuth: []
       parameters:
@@ -279,7 +279,7 @@ paths:
       tags: [attempts]
       operationId: getAttemptEvents
       summary: Events since a cursor (no patch text)
-      x-hyvv-status: launcher-0.1.15
+      x-hyvv-status: launcher-0.1.18
       security:
         - bearerAuth: []
       parameters:
@@ -304,7 +304,7 @@ paths:
         Historical endpoint. The manifest may include host and work-dir fields.
         Coordinators must use `GET /v1/attempts/{attempt_id}/artifact` once
         `artifact_fetch` ships.
-      x-hyvv-status: launcher-0.1.15
+      x-hyvv-status: launcher-0.1.18
       deprecated: true
       security:
         - bearerAuth: []
@@ -371,7 +371,7 @@ paths:
       tags: [attempts]
       operationId: reviewAttempt
       summary: Record a coordinator verdict
-      x-hyvv-status: launcher-0.1.15
+      x-hyvv-status: launcher-0.1.18
       security:
         - bearerAuth: []
       parameters:
@@ -403,7 +403,7 @@ paths:
       tags: [attempts]
       operationId: cancelAttempt
       summary: Cancel an attempt
-      x-hyvv-status: launcher-0.1.15
+      x-hyvv-status: launcher-0.1.18
       security:
         - bearerAuth: []
       parameters:
@@ -421,7 +421,7 @@ paths:
       tags: [host]
       operationId: listProjects
       summary: Authorized project names only (no paths, repos, or branches)
-      x-hyvv-status: launcher-0.1.15
+      x-hyvv-status: launcher-0.1.18
       security:
         - bearerAuth: []
       responses:
@@ -435,7 +435,7 @@ paths:
       tags: [host]
       operationId: getContainerProfile
       summary: Sandbox image profile (not live containers)
-      x-hyvv-status: launcher-0.1.15
+      x-hyvv-status: launcher-0.1.18
       security:
         - bearerAuth: []
       responses:
@@ -449,7 +449,7 @@ paths:
       tags: [host]
       operationId: patchRuntimeConfig
       summary: Runtime-only max_concurrent change (not written to disk)
-      x-hyvv-status: launcher-0.1.15
+      x-hyvv-status: launcher-0.1.18
       security:
         - bearerAuth: []
       requestBody:
@@ -468,6 +468,94 @@ paths:
           description: Invalid max_concurrent
         "401":
           $ref: "#/components/responses/Unauthorized"
+
+  /v1/route:
+    post:
+      tags: [host]
+      operationId: previewRoute
+      summary: Preview model routing without starting an attempt
+      description: >
+        Resolves the request with the dispatch model selector. The response carries
+        credential-presence booleans only, never credential values or provider endpoints.
+      x-hyvv-status: launcher-0.1.18
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                model: {type: string}
+                tier: {type: string}
+                kind: {type: string, enum: [opencode]}
+                project: {type: string}
+                brief:
+                  type: object
+                  additionalProperties: true
+      responses:
+        "200":
+          description: Resolved route and credential-presence booleans
+        "400":
+          description: Unknown model or unsupported attempt kind
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/provision/capabilities:
+    get:
+      tags: [host]
+      operationId: getProvisioningCapabilities
+      summary: Advertise host-enrolled provisioning capabilities
+      description: A disabled host returns enabled false and never advertises an enrolled profile.
+      x-hyvv-status: launcher-0.1.18
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Provisioning schema, enablement, profiles, and supported operations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema, enabled, profiles]
+                properties:
+                  schema: {const: rizzstack.provisioning/1}
+                  enabled: {type: boolean}
+                  profiles:
+                    type: array
+                    items: {type: string}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/landing/events:
+    get:
+      tags: [host]
+      operationId: exportLandingEvents
+      summary: Export durable canonical landing events
+      description: Read-only, cursor-paginated export of the stored canonical outbox.
+      x-hyvv-status: launcher-0.1.18
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: after
+          in: query
+          schema: {type: string}
+          description: Durable export position after which to resume.
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 500}
+      responses:
+        "200":
+          description: Canonical event page and next durable export position
+        "400":
+          description: Invalid, expired, unknown, or incompatible cursor or limit
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: Conflicting stored landing content
+        "503":
+          description: Landing export storage is temporarily unavailable
 
   /v1/leases:
     get:
