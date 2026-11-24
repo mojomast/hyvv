@@ -1,8 +1,6 @@
 # ADR 0002: signed dispatch tickets at the attempt boundary
 
-Status: **proposed** (design only). Wave C of the Nov 24 next-level review
-([rizzstack #17](https://github.com/mojomast/rizzstack/pull/17)); generalizes `NEXT.md` W3-1, the
-Rails worker-assignment binding.
+Status: **accepted** (Kyle, chat t1650u): Ed25519 tickets, rolled out `ticket_mode` off -> report -> enforce. Open for the owner: where the coordinator signing key lives and its rotation rule. Wave C of the Nov 24 next-level review ([rizzstack #17](https://github.com/mojomast/rizzstack/pull/17)); generalizes `NEXT.md` W3-1.
 
 ## Why hyvv owns this ADR
 
