@@ -21,6 +21,33 @@ GiB = 1024 ** 3
 MiB = 1024 ** 2
 
 
+def _type_ok(value, sch):
+    types = sch.get("type")
+    if types is None:
+        return True
+    types = [types] if isinstance(types, str) else types
+    kinds = {"null": value is None, "string": isinstance(value, str), "boolean": isinstance(value, bool),
+             "integer": isinstance(value, int) and not isinstance(value, bool),
+             "number": isinstance(value, (int, float)) and not isinstance(value, bool)}
+    return any(kinds[t] for t in types)
+
+
+def _pattern_ok(value, sch):
+    if not isinstance(value, str) or "pattern" not in sch:
+        return True
+    return bool(re.search(sch["pattern"], value))
+
+
+def _bounds_ok(value, sch):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return True
+    if "minimum" in sch and value < sch["minimum"]:
+        return False
+    if "maximum" in sch and value > sch["maximum"]:
+        return False
+    return True
+
+
 def conforms(value, sch):
     if "$ref" in sch:
         return conforms(value, COMMON_DEFS[sch["$ref"].split("/")[-1]])
@@ -30,22 +57,11 @@ def conforms(value, sch):
         return False
     if "enum" in sch and value not in sch["enum"]:
         return False
-    types = sch.get("type")
-    if types is not None:
-        types = [types] if isinstance(types, str) else types
-        kinds = {"null": value is None, "string": isinstance(value, str), "boolean": isinstance(value, bool),
-                 "integer": isinstance(value, int) and not isinstance(value, bool),
-                 "number": isinstance(value, (int, float)) and not isinstance(value, bool)}
-        if not any(kinds[t] for t in types):
-            return False
-    if isinstance(value, str) and "pattern" in sch and not re.search(sch["pattern"], value):
+    if not _type_ok(value, sch):
         return False
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if "minimum" in sch and value < sch["minimum"]:
-            return False
-        if "maximum" in sch and value > sch["maximum"]:
-            return False
-    return True
+    if not _pattern_ok(value, sch):
+        return False
+    return _bounds_ok(value, sch)
 
 
 def assert_valid(test, row):
