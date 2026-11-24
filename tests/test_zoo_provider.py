@@ -72,7 +72,7 @@ class ZooKeySource(unittest.TestCase):
     def test_worker_env_sends_the_zoo_key_as_openai_api_key(self):
         # The OpenAI-compatible wire reads OPENAI_API_KEY; a zoo spec must be included.
         source = (HERE / "launcher.py").read_text("utf-8")
-        self.assertIn('if spec["key"] in ("go", "deepseek", "zoo"): env["OPENAI_API_KEY"] = key', source)
+        self.assertRegex(source, r'if spec\["key"\] in \("go", "deepseek", "zoo"[^)]*\): env\["OPENAI_API_KEY"\] = key')
 
 
 class ZooRouting(unittest.TestCase):
