@@ -1949,6 +1949,13 @@ def render_prompt(b):
     parts.append("# Return format\nEnd with a JSON block: {\"summary\":..., \"changed_files\":[...], \"checks\":[{\"name\":...,\"command\":...,\"passed\":bool}], \"open_issues\":[...]}")
     return "\n\n".join(parts)
 
+def _string_entries(value):
+    """The string entries of a brief list field; anything else is ignored."""
+    return [x for x in value or [] if isinstance(x, str)]
+
+def _nonempty_list(value):
+    return isinstance(value, list) and bool(value)
+
 def normalize_brief(b):
     """Accept both brief shapes: v0.1.1 (acceptance is a string list) and bundlebees main at c10aa42
     (acceptance may be {criteria, commands, tests}). Flatten a dict to a list of strings. Unknown
@@ -1956,12 +1963,11 @@ def normalize_brief(b):
     acc = b.get("acceptance") if isinstance(b, dict) else None
     if isinstance(acc, dict):
         b = dict(b)
-        crit = [x for x in acc.get("criteria") or [] if isinstance(x, str)]
-        acc_tests = [x for x in acc.get("tests") or [] if isinstance(x, str)]
-        b["acceptance"] = crit + [f"Run: {c}" for c in acc.get("commands") or [] if isinstance(c, str)] + \
+        crit = _string_entries(acc.get("criteria"))
+        acc_tests = _string_entries(acc.get("tests"))
+        b["acceptance"] = crit + [f"Run: {c}" for c in _string_entries(acc.get("commands"))] + \
                           [f"Test passes: {t}" for t in acc_tests]
-        existing = b.get("tests")
-        if acc_tests and not (isinstance(existing, list) and existing):
+        if acc_tests and not _nonempty_list(b.get("tests")):
             b["tests"] = list(acc_tests)
     return b
 
