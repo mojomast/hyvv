@@ -172,6 +172,7 @@ AGY_DEFAULT_MODEL = AGY_TIERS[AGY_DEFAULT_TIER]
 USAGE_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "thinking_tokens", "total_tokens")
 AGY_MCP_NAME = "orbit-cua"  # registered once in ~/.gemini/config/mcp_config.json (scripts/setup-agy-cua.ps1)
 AGY_ALLOW_RULE = f"mcp({AGY_MCP_NAME}/*)"
+DEFAULT_ATTEMPT_TIMEOUT_S = 3600
 AGY_TIMEOUT_S = (60, 600, 3600)  # min, default, max for brief.budget.timeout_s
 # budget.timeout_s is also an ATTEMPT wall clock, not just a value handed to a worker: a controller
 # watchdog force-finishes an attempt this many seconds after the budget expires even when the
@@ -1045,6 +1046,12 @@ def load_config(path):
     cfg.setdefault("memory_mb", 6144)
     cfg.setdefault("cpus", 2)
     cfg.setdefault("backoff_s", [30, 60, 120, 240])
+    try:
+        default_timeout_s = int(cfg.get("default_timeout_s", DEFAULT_ATTEMPT_TIMEOUT_S))
+    except (TypeError, ValueError, OverflowError):
+        default_timeout_s = DEFAULT_ATTEMPT_TIMEOUT_S
+    cfg["default_timeout_s"] = max(60, min(86400, default_timeout_s))
+    cfg.setdefault("require_budget", False)
     cfg.setdefault("data_dir", str(Path.home() / ".orbit-launcher"))
     cfg.setdefault("projects", {})  # name -> {"repo": url} (authorized projects)
     cfg.setdefault("provisioning", {})  # {"policy": path, "journal": path, "enabled": bool}
@@ -1578,15 +1585,24 @@ def agy_timeout(b, mode="ui"):
     t = (b.get("budget") or {}).get("timeout_s") or (1800 if mode == "code" else AGY_TIMEOUT_S[1])
     return max(AGY_TIMEOUT_S[0], min(AGY_TIMEOUT_S[2], int(t)))
 
-def attempt_budget_s(a):
-    """The attempt wall clock in seconds from brief.budget.timeout_s, or None when none applies.
+def _attempt_default_timeout(cfg):
+    """The host's default attempt wall clock: config `default_timeout_s`, a positive whole number
+    of seconds, falling back to DEFAULT_ATTEMPT_TIMEOUT_S when it is missing, malformed or zero."""
+    try:
+        default = int((cfg or {}).get("default_timeout_s", DEFAULT_ATTEMPT_TIMEOUT_S))
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_ATTEMPT_TIMEOUT_S
+    return default if default > 0 else DEFAULT_ATTEMPT_TIMEOUT_S
+
+def attempt_budget_s(a, cfg=None):
+    """The attempt wall clock in seconds from brief.budget.timeout_s or the host default.
 
     budget.timeout_s must bound the whole attempt, not only the child it is handed to: whatever a
     worker does with its own flag, the launcher stops the attempt at this deadline plus
     BUDGET_STOP_GRACE_S. Kind semantics preserved: agy-cua keeps the AGY_TIMEOUT_S min/default/max
     clamp (and the code-mode default), check keeps the CHECK_TIMEOUT_S per-command clamp and gets a
     per-command-derived attempt clock (each command stays individually bounded), opencode enforces
-    exactly the configured value and only when the brief carries one.
+    exactly a positive configured value and otherwise uses default_timeout_s.
     """
     b = a.get("brief") or {}
     kind = a.get("kind") or b.get("kind") or "opencode"
@@ -1594,12 +1610,14 @@ def attempt_budget_s(a):
         return agy_timeout(b, a.get("mode") or "ui")
     if kind == "check":
         return check_timeout_s(b) * (len(b.get("commands") or []) + 1) + CHECK_ATTEMPT_OVERHEAD_S
-    raw = (b.get("budget") or {}).get("timeout_s")
+    default = _attempt_default_timeout(cfg)
+    budget = b.get("budget")
+    raw = budget.get("timeout_s") if isinstance(budget, dict) else None
     try:
         t = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return t if t > 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return t if t > 0 else default
 
 def render_agy_prompt(b):
     parts = [f"# Objective\n{b['objective']}"]
@@ -1864,13 +1882,25 @@ def normalize_brief(b):
                           [f"Test passes: {t}" for t in acc.get("tests") or [] if isinstance(t, str)]
     return b
 
-def validate_brief(b):
+def _budget_requirement_error(cfg, b):
+    """The require_budget refusal for a brief without a positive budget.timeout_s, else None."""
+    if not (cfg or {}).get("require_budget"):
+        return None
+    budget = b.get("budget")
+    raw = budget.get("timeout_s") if isinstance(budget, dict) else None
+    try:
+        timeout_s = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        timeout_s = 0
+    return None if timeout_s > 0 else "brief.budget.timeout_s must be a positive number of seconds when require_budget is set"
+
+def validate_brief(b, cfg=None):
     """v0.1.1 requires only objective; main (c10aa42) also sends source_rev, assigned_files and
     acceptance. Unknown extra fields (contract, evidence, etc.) are ignored, not rejected."""
     if not isinstance(b, dict) or not str(b.get("objective", "")).strip(): return "brief.objective is required"
     for k in ("deliverables", "acceptance", "assigned_files", "commands", "deps"):
         if k in b and not (isinstance(b[k], list) and all(isinstance(x, str) for x in b[k])): return f"brief.{k} must be a list of strings"
-    return None
+    return _budget_requirement_error(cfg, b)
 
 # Same text rule as contract/v1/project_state.py SAFE_PATH: relative, no empty,
 # "." or ".." segment, no backslash, no trailing slash after normalize, <= 244.
@@ -2297,7 +2327,7 @@ class Launcher:
             # (may restore an already-collected result). Do not pre-empt it.
             if a.get("budget_stop"):
                 continue
-            budget = attempt_budget_s(a)
+            budget = attempt_budget_s(a, self.cfg)
             started = a.get("budget_started_at")
             if budget and started and time.time() >= started + budget:
                 try:
@@ -2414,7 +2444,7 @@ class Launcher:
             # budget.timeout_s as an attempt wall clock: anchored at dispatch, kept across a
             # restart-reattach, enforced by the loop's fast path below and by the watchdog even
             # when this controller is itself stuck inside a backend call.
-            budget = attempt_budget_s(a)
+            budget = attempt_budget_s(a, self.cfg)
             if budget:
                 with self.lock:
                     started = a.get("budget_started_at") if a.get("run_id") else None  # resumed: keep the original clock
@@ -2569,7 +2599,7 @@ class Launcher:
         terminal write (started by _schedule when a restart finds the attempt in that state)."""
         aid = a["attempt_id"]
         try:
-            budget = attempt_budget_s(a)
+            budget = attempt_budget_s(a, self.cfg)
             if budget:
                 await self._budget_finish(a, budget, a.get("budget_started_at"), recover=True)
             else:
@@ -3103,7 +3133,7 @@ def make_handler(L, token):
                 elif not re.fullmatch(r"[A-Za-z0-9_\-]{8,64}", aid):
                     return self._send(400, {"error": "attempt_id required"})
                 if isinstance(b.get("brief"), dict): b["brief"] = normalize_brief(b["brief"])
-                err = validate_brief(b.get("brief"))
+                err = validate_brief(b.get("brief"), L.cfg)
                 if err: return self._send(400, {"error": err})
                 if b["brief"].get("project") and b["brief"]["project"] not in L.cfg["projects"]: return self._send(403, {"error": "project not authorized on this PC"})
                 try: a, created = L.submit(aid, b["brief"], b.get("model") or b.get("tier"), b.get("kind"), b.get("mode"))
