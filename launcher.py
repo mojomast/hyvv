@@ -1585,6 +1585,15 @@ def agy_timeout(b, mode="ui"):
     t = (b.get("budget") or {}).get("timeout_s") or (1800 if mode == "code" else AGY_TIMEOUT_S[1])
     return max(AGY_TIMEOUT_S[0], min(AGY_TIMEOUT_S[2], int(t)))
 
+def _attempt_default_timeout(cfg):
+    """The host's default attempt wall clock: config `default_timeout_s`, a positive whole number
+    of seconds, falling back to DEFAULT_ATTEMPT_TIMEOUT_S when it is missing, malformed or zero."""
+    try:
+        default = int((cfg or {}).get("default_timeout_s", DEFAULT_ATTEMPT_TIMEOUT_S))
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_ATTEMPT_TIMEOUT_S
+    return default if default > 0 else DEFAULT_ATTEMPT_TIMEOUT_S
+
 def attempt_budget_s(a, cfg=None):
     """The attempt wall clock in seconds from brief.budget.timeout_s or the host default.
 
@@ -1601,12 +1610,7 @@ def attempt_budget_s(a, cfg=None):
         return agy_timeout(b, a.get("mode") or "ui")
     if kind == "check":
         return check_timeout_s(b) * (len(b.get("commands") or []) + 1) + CHECK_ATTEMPT_OVERHEAD_S
-    try:
-        default = int((cfg or {}).get("default_timeout_s", DEFAULT_ATTEMPT_TIMEOUT_S))
-    except (TypeError, ValueError, OverflowError):
-        default = DEFAULT_ATTEMPT_TIMEOUT_S
-    if default <= 0:
-        default = DEFAULT_ATTEMPT_TIMEOUT_S
+    default = _attempt_default_timeout(cfg)
     budget = b.get("budget")
     raw = budget.get("timeout_s") if isinstance(budget, dict) else None
     try:
@@ -1878,22 +1882,25 @@ def normalize_brief(b):
                           [f"Test passes: {t}" for t in acc.get("tests") or [] if isinstance(t, str)]
     return b
 
+def _budget_requirement_error(cfg, b):
+    """The require_budget refusal for a brief without a positive budget.timeout_s, else None."""
+    if not (cfg or {}).get("require_budget"):
+        return None
+    budget = b.get("budget")
+    raw = budget.get("timeout_s") if isinstance(budget, dict) else None
+    try:
+        timeout_s = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        timeout_s = 0
+    return None if timeout_s > 0 else "brief.budget.timeout_s must be a positive number of seconds when require_budget is set"
+
 def validate_brief(b, cfg=None):
     """v0.1.1 requires only objective; main (c10aa42) also sends source_rev, assigned_files and
     acceptance. Unknown extra fields (contract, evidence, etc.) are ignored, not rejected."""
     if not isinstance(b, dict) or not str(b.get("objective", "")).strip(): return "brief.objective is required"
     for k in ("deliverables", "acceptance", "assigned_files", "commands", "deps"):
         if k in b and not (isinstance(b[k], list) and all(isinstance(x, str) for x in b[k])): return f"brief.{k} must be a list of strings"
-    if (cfg or {}).get("require_budget"):
-        budget = b.get("budget")
-        raw = budget.get("timeout_s") if isinstance(budget, dict) else None
-        try:
-            timeout_s = int(raw)
-        except (TypeError, ValueError, OverflowError):
-            timeout_s = 0
-        if timeout_s <= 0:
-            return "brief.budget.timeout_s must be a positive number of seconds when require_budget is set"
-    return None
+    return _budget_requirement_error(cfg, b)
 
 # Same text rule as contract/v1/project_state.py SAFE_PATH: relative, no empty,
 # "." or ".." segment, no backslash, no trailing slash after normalize, <= 244.
