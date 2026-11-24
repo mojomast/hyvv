@@ -61,9 +61,9 @@ WORKER_OPENCODE_CONFIG = {"$schema": "https://opencode.ai/config.json", "permiss
 def _free(model_id, ctx_tokens):
     # Prompt cap: leave ~80k tokens for OpenCode's own system prompt/tools (a probe used ~43k) and output;
     # ~3 chars per token; never above 300k chars (~100k tokens) for the free tier.
-    # fallback aliases to DeepSeek official deepseek-flash (see MODELS).
+    # fallback aliases to Nous DeepSeek v4.1 Flash 1017 (see MODELS).
     return {"model": f"opencode/{model_id}", "base_url": None, "wire": None, "key": "none", "free": True,
-            "fallback": "deepseek:deepseek-flash", "context_tokens": ctx_tokens,
+            "fallback": "nous:deepseek-v4.1-flash-1017", "context_tokens": ctx_tokens,
             "max_prompt_chars": max(60_000, min(300_000, (ctx_tokens - 80_000) * 3)), "backoff_s": [20, 60]}
 
 def _go_free(model_id, ctx_tokens):
@@ -75,7 +75,7 @@ def _go_free(model_id, ctx_tokens):
 # prefix (including bare `deepseek-v4.1-flash`), goes to OpenCode Go. `deepseek:<model>` (e.g.
 # `deepseek:deepseek-flash`) goes to DeepSeek official. An explicitly named model or tier is
 # authoritative; priority: high reroutes only a brief that names no model.
-# A Go monthly-limit 429 retries once on DeepSeek direct and records fallback="deepseek".
+# A Go monthly-limit 429 retries once on Nous DeepSeek 1017 and records fallback="ds1017n".
 # Free models only work from inside OpenCode, so they use OpenCode's built-in provider (opencode/<id>, no base_url).
 # Every free id below answered `opencode run -m opencode/<id>` on Oct 20, 2026 (jev-1.13-free and space-bunny-free were "Model unavailable").
 # Context sizes from models.dev (input limit where it is lower).
@@ -86,10 +86,10 @@ _GO_FLASH = {"model": "deepseek-v4.1-flash", "base_url": GO_BASE_URL, "wire": "o
 # launcher's MAX_WORKERS=14 ceiling sits well under. Thinking is always on and spends the
 # output budget FIRST, so callers must allow at least 4096 output tokens (8192 for coding); any
 # max_tokens below 1024 is silently raised to 1024 by the gateway. Streaming usage is always
-# zeros, so metrics must come from non-stream usage or an estimate. DeepSeek official flash is the
+# zeros, so metrics must come from non-stream usage or an estimate. Nous DeepSeek 1017 is the
 # fallback once Zoo rate limits persist (or after the free pass ends).
 _ZOO_GLM = {"model": "zoo/glm-5.3-flash", "base_url": ZOO_BASE_URL, "wire": "openai-chat", "key": "zoo",
-            "fallback": "deepseek:deepseek-flash", "backoff_s": [15, 30, 60]}
+            "fallback": "nous:deepseek-v4.1-flash-1017", "backoff_s": [15, 30, 60]}
 # Nous Portal, Tencent Hy4 Flash (owner request 2026-11-24). The key allows 180 requests/min and
 # 7,560/hour shared across every model, so nous attempts are paced: at most `max_active` run at
 # once and starts are spaced by `start_spacing_s` (both overridable per host in cfg.models).
@@ -113,7 +113,7 @@ MODELS = {
     "deepseek-flash": dict(_GO_FLASH),  # unprefixed -> Go (0.1.15)
     "deepseek-v4.1-flash": dict(_GO_FLASH),  # unprefixed / default briefs -> Go
     "go:deepseek-v4.1-flash": dict(_GO_FLASH),
-    "zoo:glm-5.3-flash": dict(_ZOO_GLM),  # free Zoo pass; Go fallback when the pass ends
+    "zoo:glm-5.3-flash": dict(_ZOO_GLM),  # free Zoo pass; Nous 1017 fallback when the pass ends
     "deepseek:deepseek-flash": dict(_DEEPSEEK_FLASH),
     "deepseek:deepseek-v4.1-flash": dict(_DEEPSEEK_FLASH),
     "nous:hy4-flash": dict(_NOUS_HY4),  # Nous Portal; paced, falls back to Go DeepSeek flash
@@ -2876,15 +2876,15 @@ class Launcher:
         self._set(a, "failed", f"{reason}; model unavailable and no remaining fallback")
 
     async def _fallback_to_deepseek(self, a, reason="go monthly-limit 429"):
-        # Retry once on DeepSeek official after a Go monthly-limit 429. Records fallback="deepseek".
+        # Retry once on Nous DeepSeek 1017 after a Go monthly-limit 429. Records fallback="ds1017n".
         await self._cleanup_once(a)
-        nxt = "deepseek:deepseek-flash"
-        a["fallback"] = "deepseek"
+        nxt = "nous:deepseek-v4.1-flash-1017"
+        a["fallback"] = "ds1017n"
         a["model"] = nxt
-        a.setdefault("model_history", []).append({"model": nxt, "fallback": "deepseek", "after": reason, "at": time.time()})
+        a.setdefault("model_history", []).append({"model": nxt, "fallback": "ds1017n", "after": reason, "at": time.time()})
         a["rate_limited"], a["cursor"] = 0, 0
         for k in ("run_id", "sandbox"): a.pop(k, None)
-        self._set(a, "queued", f"{reason}; fallback=deepseek")
+        self._set(a, "queued", f"{reason}; fallback=ds1017n")
 
     async def _backoff(self, a, exhausted=False, reason="provider rate limit", retry_after=None):
         if a.get("pool") and a.get("model") in FREE_POOL:
