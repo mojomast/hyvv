@@ -512,7 +512,7 @@ def _usage_route(kind, model):
     key = (MODELS.get(text) or {}).get("key")
     if key == "none":
         return "free"
-    return key if key in ("go", "deepseek", "zoo") else None
+    return key if key in ("go", "deepseek", "zoo", "kimi") else None
 
 
 def _usage_tokens(value):
@@ -1167,9 +1167,9 @@ def check_bind(host):
     if not (ip.is_loopback or ip in ipaddress.ip_network("100.64.0.0/10") or ip in ipaddress.ip_network("fd7a:115c:a1e0::/48")):
         raise SystemExit(f"refusing to bind {host}: only loopback or a Tailscale address is allowed")
 
-_KEY_ENV = {"go": "ORBIT_WORKER_GO_KEY", "deepseek": "DEEPSEEK_API_KEY", "zoo": "ORBIT_WORKER_ZOO_KEY"}
-_KEY_FILE_CFG = {"go": "go_key_file", "deepseek": "deepseek_key_file", "zoo": "zoo_key_file"}
-_KEY_FILE_NAME = {"go": "go.key", "deepseek": "deepseek.key", "zoo": "zoo.key"}
+_KEY_ENV = {"go": "ORBIT_WORKER_GO_KEY", "deepseek": "DEEPSEEK_API_KEY", "zoo": "ORBIT_WORKER_ZOO_KEY", "kimi": "ORBIT_WORKER_KIMI_KEY"}
+_KEY_FILE_CFG = {"go": "go_key_file", "deepseek": "deepseek_key_file", "zoo": "zoo_key_file", "kimi": "kimi_key_file"}
+_KEY_FILE_NAME = {"go": "go.key", "deepseek": "deepseek.key", "zoo": "zoo.key", "kimi": "kimi.key"}
 
 def provider_key(cfg, source):
     """Provider key for a named source (`go`, `deepseek` or `zoo`): env first, else a user-only file. Never logged."""
@@ -1460,7 +1460,7 @@ class CuaBackend:
             attempt.update(workdir=wd, local_base_rev=base, seed_commit=seed)
         spec = model_spec(cfg, attempt.get("model"), attempt.get("brief"))
         env = {"OPENCODE_CONFIG_CONTENT": json.dumps(dict(WORKER_OPENCODE_CONFIG, **({"model": spec["model"]} if spec["key"] == "none" else {})))}
-        if spec["key"] in ("go", "deepseek", "zoo"): env["OPENAI_API_KEY"] = key  # OpenAI-compatible: DeepSeek official, OpenCode Go or the Zoo gateway
+        if spec["key"] in ("go", "deepseek", "zoo", "kimi"): env["OPENAI_API_KEY"] = key  # OpenAI-compatible: DeepSeek official, OpenCode Go, the Zoo gateway or Kimi direct
         if b.get("verify_of") and wd:  # verify bee: hand it the finished work bee's patch (never a credential)
             vp = Path(cfg["data_dir"]) / "attempts" / f"{b['verify_of']}.result.json"
             diff = ((json.loads(vp.read_text("utf-8")).get("patch") or {}).get("diff") or "") if vp.exists() else ""
