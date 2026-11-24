@@ -257,7 +257,9 @@ class Naming(unittest.TestCase):
         import re
         ps = (ROOT / "scripts" / "cleanup-sandboxes.ps1").read_text()
         pat = re.search(r"\$pat = '([^']+)'", ps).group(1)
-        for name in ("orbit-52c9f44c621f", "ds41-fix-login-bug-6789abcdef", "gf38m-6789abcdef", "ga4-open-settings-abc123def4"):
+        for name in ("orbit-52c9f44c621f", "ds41-fix-login-bug-6789abcdef", "gf38m-6789abcdef", "ga4-open-settings-abc123def4",
+                     "hy4nous-nous-canary-hy4-c517d3306d", "ds1017n-nous-canary-1017-0d6ef69e23", "hy4nfr-6789abcdef",
+                     "lc25nfr-6789abcdef", "k31pro-wa-a9-6789abcdef", "kimiforc-6789abcdef"):
             self.assertIsNotNone(re.search(pat, "local:" + name + "  ready"), name)
         for name in ("ragussy-backend", "orbit-shared-browser-x", "dev"):
             self.assertIsNone(re.search(pat, "local:" + name + "  ready"), name)
