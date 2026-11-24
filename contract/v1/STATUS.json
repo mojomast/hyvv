@@ -39,7 +39,8 @@
     "project-state dispatch gate (409 project_parked / project_archived / project_state_changed, override plus reason, snapshot_path containment)": "reference",
     "GET /v1/version capabilities list": "launcher-0.1.19",
     "bee-slot leases (capability leases, 429 capacity_exhausted)": "specified",
-    "coordinator-signed briefs (HMAC over the canonical brief with the per-coordinator key, verified at settle)": "proposed"
+    "coordinator-signed briefs (HMAC over the canonical brief with the per-coordinator key, verified at settle)": "proposed",
+    "bee.usage/v2 records (open provider labels)": "specified"
   },
   "reference_evidence": {
     "GET /v1/attempts/{attempt_id}/artifact": [
