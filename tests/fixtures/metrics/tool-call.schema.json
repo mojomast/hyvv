@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mojomast/workflow/observability/schemas/tool-call.schema.json",
+  "title": "One tool call (gen_ai.tool_call/v1)",
+  "description": "One row per tool call made by a bee or the coordinator. Tool names come from a bounded vocabulary (harness tool names, mcp:<server>, or other); arguments, results, commands and output never appear, only their byte size.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "attempt_id",
+    "call_seq",
+    "tool_name",
+    "ts_start",
+    "status"
+  ],
+  "properties": {
+    "schema": {
+      "const": "gen_ai.tool_call/v1"
+    },
+    "schema_version": {
+      "const": "v1"
+    },
+    "attempt_id": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "card_id": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "run_id": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "project": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "role": {
+      "$ref": "common.schema.json#/$defs/nullable_role"
+    },
+    "task_id": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "job_id": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "trace_id": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "step_seq": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "call_seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "tool_name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_.:-]{0,63}$"
+    },
+    "tool_type": {
+      "enum": [
+        "function",
+        "extension",
+        "datastore",
+        "unknown"
+      ]
+    },
+    "ts_start": {
+      "$ref": "common.schema.json#/$defs/utc_timestamp"
+    },
+    "ts_end": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "common.schema.json#/$defs/utc_timestamp"
+        }
+      ]
+    },
+    "duration_s": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "error",
+        "denied",
+        "cancelled",
+        "unknown"
+      ]
+    },
+    "error_class": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "output_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    }
+  }
+}
