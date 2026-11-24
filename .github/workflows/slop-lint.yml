@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # GitHub merge queue: the same required checks run on the queued merge commit.
+  merge_group:
 
 permissions:
   contents: read
