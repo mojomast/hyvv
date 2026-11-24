@@ -533,12 +533,13 @@ class BudgetResolution(unittest.TestCase):
         self.assertEqual(launcher.attempt_budget_s({**base, "brief": {"objective": "x", "budget": {"timeout_s": 99999}}}), launcher.AGY_TIMEOUT_S[2])
         self.assertEqual(launcher.attempt_budget_s({**base, "mode": "code", "brief": {"objective": "x"}}), 1800)
 
-    def test_opencode_enforces_only_a_configured_budget(self):
+    def test_opencode_without_a_valid_budget_gets_the_host_default(self):
+        # Wave A slice HY-1 (review Fix now #2): no budget no longer means no wall clock.
         oc = {"kind": "opencode", "brief": {"objective": "x"}}
-        self.assertIsNone(launcher.attempt_budget_s(oc))
+        self.assertEqual(launcher.attempt_budget_s(oc), launcher.DEFAULT_ATTEMPT_TIMEOUT_S)
         self.assertEqual(launcher.attempt_budget_s({**oc, "brief": {"objective": "x", "budget": {"timeout_s": 1200}}}), 1200)
-        self.assertIsNone(launcher.attempt_budget_s({**oc, "brief": {"objective": "x", "budget": {"timeout_s": 0}}}))
-        self.assertIsNone(launcher.attempt_budget_s({**oc, "brief": {"objective": "x", "budget": {"timeout_s": "soon"}}}))
+        self.assertEqual(launcher.attempt_budget_s({**oc, "brief": {"objective": "x", "budget": {"timeout_s": 0}}}), launcher.DEFAULT_ATTEMPT_TIMEOUT_S)
+        self.assertEqual(launcher.attempt_budget_s({**oc, "brief": {"objective": "x", "budget": {"timeout_s": "soon"}}}), launcher.DEFAULT_ATTEMPT_TIMEOUT_S)
 
     def test_check_keeps_per_command_clamp(self):
         self.assertEqual(launcher.check_timeout_s({"budget": {"timeout_s": 5}}), launcher.CHECK_TIMEOUT_S[0])

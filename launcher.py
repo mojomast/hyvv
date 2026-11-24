@@ -35,7 +35,7 @@ if _landing_export is None:  # pragma: no cover - loaded from a sibling copy
     except Exception:
         _landing_export = None
 
-VERSION = "0.1.17"
+VERSION = "0.1.18"
 HEARTBEAT_S = 60  # controller emits a heartbeat event after this many quiet seconds
 MAX_WORKERS = 14  # hard ceiling for max_concurrent (owner directive: final ceiling, supersedes the interim cap-12)
 TERMINAL = {"succeeded", "failed", "cancelled"}
@@ -46,6 +46,7 @@ SAVE_REPLACE_BUDGET_S = 2.0  # total backoff across retries of os.replace (about
 GO_BASE_URL = "https://opencode.ai/inference/go/openai/v1"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"  # official OpenAI-compatible endpoint
 ZOO_BASE_URL = "https://www.zoocode.dev/api/gateway/v1"  # Zoo gateway, OpenAI-compatible
+NOUS_BASE_URL = "https://inference-api.nousresearch.com/v1"  # Nous Portal inference API, OpenAI-compatible
 # Workers must not fan out: deny the OpenCode `task` (subagent) tool.
 WORKER_OPENCODE_CONFIG = {"$schema": "https://opencode.ai/config.json", "permission": {"task": "deny"}}
 # Allow-listed per-run models.
@@ -84,6 +85,25 @@ _GO_FLASH = {"model": "deepseek-v4.1-flash", "base_url": GO_BASE_URL, "wire": "o
 # fallback once Zoo rate limits persist (or after the free pass ends).
 _ZOO_GLM = {"model": "zoo/glm-5.3-flash", "base_url": ZOO_BASE_URL, "wire": "openai-chat", "key": "zoo",
             "fallback": "deepseek:deepseek-flash", "backoff_s": [15, 30, 60]}
+# Nous Portal, Tencent Hy4 Flash (owner request 2026-11-24). The key allows 180 requests/min and
+# 7,560/hour shared across every model, so nous attempts are paced: at most `max_active` run at
+# once and starts are spaced by `start_spacing_s` (both overridable per host in cfg.models).
+# A 429 retries on `backoff_s` then falls back to OpenCode Go DeepSeek flash; an auth or 5xx
+# provider failure, or a missing nous key, falls back once instead of failing the attempt.
+# Benchmarked 2026-11-24: never send temperature 0 (the model loops in its thinking).
+# Owner t1665u: also the discounted DeepSeek flash (1017: 20/20 in the Nov 24 benchmark, about
+# half Hy4's cost and faster) and the $0 Nous models that answer API traffic. Low-risk bees run
+# 1017 first, then Hy4 Flash, then OpenCode Go DeepSeek flash (a chain of MAX_FALLBACK_HOPS).
+# Every nous:* entry carries the same max_active, and pacing counts attempts per key, so the
+# cap holds across all Nous models combined. Never a `:batch` SKU (async, not for agents).
+_NOUS = {"base_url": NOUS_BASE_URL, "wire": "openai-chat", "key": "nous", "backoff_s": [10, 30],
+         "fallback_on_provider_error": True, "fallback_on_missing_key": True, "fallback_chain": True,
+         "max_active": 8, "start_spacing_s": 2}
+_NOUS_HY4 = {**_NOUS, "model": "tencent/hy4-flash", "fallback": "go:deepseek-v4.1-flash"}
+_NOUS_DS1017 = {**_NOUS, "model": "deepseek/deepseek-v4.1-flash-1017", "fallback": "nous:hy4-flash"}
+_NOUS_HY4_FREE = {**_NOUS, "model": "tencent/hy4-flash:free", "fallback": "nous:hy4-flash"}
+_NOUS_LONGCAT_FREE = {**_NOUS, "model": "meituan/longcat-2.5:free", "fallback": "nous:hy4-flash"}
+MAX_FALLBACK_HOPS = 2  # opt-in chains (fallback_chain) hop at most this many times per attempt
 MODELS = {
     "deepseek-flash": dict(_GO_FLASH),  # unprefixed -> Go (0.1.15)
     "deepseek-v4.1-flash": dict(_GO_FLASH),  # unprefixed / default briefs -> Go
@@ -91,6 +111,10 @@ MODELS = {
     "zoo:glm-5.3-flash": dict(_ZOO_GLM),  # free Zoo pass; Go fallback when the pass ends
     "deepseek:deepseek-flash": dict(_DEEPSEEK_FLASH),
     "deepseek:deepseek-v4.1-flash": dict(_DEEPSEEK_FLASH),
+    "nous:hy4-flash": dict(_NOUS_HY4),  # Nous Portal; paced, falls back to Go DeepSeek flash
+    "nous:deepseek-v4.1-flash-1017": dict(_NOUS_DS1017),  # discounted DeepSeek flash -> hy4 -> go
+    "nous:hy4-flash-free": dict(_NOUS_HY4_FREE),
+    "nous:longcat-2.5-free": dict(_NOUS_LONGCAT_FREE),
     "deepseek-v4.1-flash-free": _free("deepseek-v4.1-flash-free", 128_000),
     "beam-free": _go_free("beam-free", 1_048_576),
     "big-pickle": _free("big-pickle", 160_000),
@@ -121,6 +145,13 @@ MODEL_UNAVAILABLE = re.compile(
     r"available in the .{0,40}IDE only|model[_ ]unavailable|model .{0,60} is not available|no longer available",
     re.I,
 )
+# Provider-side failures (auth, forbidden, 5xx). Only models that opt in with
+# "fallback_on_provider_error" roll their fallback on these; every other model keeps its path.
+PROVIDER_FAILURE = re.compile(
+    r"\b(?:401|403|500|502|503|504)\b|unauthori[sz]ed|invalid[ _-]?api[ _-]?key|authentication|"
+    r"forbidden|service unavailable|bad gateway|gateway timeout|overloaded",
+    re.I,
+)
 ZOO_RETRY_AFTER_MAX = 300
 MONTHLY_LIMIT = re.compile(r"GoUsageLimitError|usage limit reached|UsageLimit", re.I)
 MONTHLY_LIMIT_HINT = re.compile(r"monthly|limitName", re.I)
@@ -141,6 +172,7 @@ AGY_DEFAULT_MODEL = AGY_TIERS[AGY_DEFAULT_TIER]
 USAGE_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "thinking_tokens", "total_tokens")
 AGY_MCP_NAME = "orbit-cua"  # registered once in ~/.gemini/config/mcp_config.json (scripts/setup-agy-cua.ps1)
 AGY_ALLOW_RULE = f"mcp({AGY_MCP_NAME}/*)"
+DEFAULT_ATTEMPT_TIMEOUT_S = 3600
 AGY_TIMEOUT_S = (60, 600, 3600)  # min, default, max for brief.budget.timeout_s
 # budget.timeout_s is also an ATTEMPT wall clock, not just a value handed to a worker: a controller
 # watchdog force-finishes an attempt this many seconds after the budget expires even when the
@@ -159,7 +191,8 @@ AGY_CODE_PERMS = "computer:shell,computer:file,computer:screenshot,computer:clic
 MODEL_ABBR = {
     "deepseek-flash": "dsflash", "deepseek-v4.1-flash": "ds41", "go:deepseek-v4.1-flash": "ds41go",
     "deepseek:deepseek-flash": "dsflash", "deepseek:deepseek-v4.1-flash": "dsflash",
-    "zoo:glm-5.3-flash": "zoo53",
+    "zoo:glm-5.3-flash": "zoo53", "nous:hy4-flash": "hy4nous",
+    "nous:deepseek-v4.1-flash-1017": "ds1017n", "nous:hy4-flash-free": "hy4nfr", "nous:longcat-2.5-free": "lc25nfr",
     "deepseek-v4.1-flash-free": "ds41fr", "beam-free": "beamfr", "big-pickle": "bpkl",
     "minimax-m3.1-flash-free": "mm31fr", "nemotron-3.5-super-vl-free": "nm35svfr", "nemotron-3.5-lightning-free": "nm35lfr",
     "glm-5.3-flash-free": "glm53fr", "mimo-v2.6-flash-free": "mimo26fr", "longcat-2.5-preview-free": "lc25fr",
@@ -512,7 +545,7 @@ def _usage_route(kind, model):
     key = (MODELS.get(text) or {}).get("key")
     if key == "none":
         return "free"
-    return key if key in ("go", "deepseek", "zoo") else None
+    return key if key in ("go", "deepseek", "zoo", "kimi", "nous") else None
 
 
 def _usage_tokens(value):
@@ -1013,6 +1046,12 @@ def load_config(path):
     cfg.setdefault("memory_mb", 6144)
     cfg.setdefault("cpus", 2)
     cfg.setdefault("backoff_s", [30, 60, 120, 240])
+    try:
+        default_timeout_s = int(cfg.get("default_timeout_s", DEFAULT_ATTEMPT_TIMEOUT_S))
+    except (TypeError, ValueError, OverflowError):
+        default_timeout_s = DEFAULT_ATTEMPT_TIMEOUT_S
+    cfg["default_timeout_s"] = max(60, min(86400, default_timeout_s))
+    cfg.setdefault("require_budget", False)
     cfg.setdefault("data_dir", str(Path.home() / ".orbit-launcher"))
     cfg.setdefault("projects", {})  # name -> {"repo": url} (authorized projects)
     cfg.setdefault("provisioning", {})  # {"policy": path, "journal": path, "enabled": bool}
@@ -1167,12 +1206,12 @@ def check_bind(host):
     if not (ip.is_loopback or ip in ipaddress.ip_network("100.64.0.0/10") or ip in ipaddress.ip_network("fd7a:115c:a1e0::/48")):
         raise SystemExit(f"refusing to bind {host}: only loopback or a Tailscale address is allowed")
 
-_KEY_ENV = {"go": "ORBIT_WORKER_GO_KEY", "deepseek": "DEEPSEEK_API_KEY", "zoo": "ORBIT_WORKER_ZOO_KEY"}
-_KEY_FILE_CFG = {"go": "go_key_file", "deepseek": "deepseek_key_file", "zoo": "zoo_key_file"}
-_KEY_FILE_NAME = {"go": "go.key", "deepseek": "deepseek.key", "zoo": "zoo.key"}
+_KEY_ENV = {"go": "ORBIT_WORKER_GO_KEY", "deepseek": "DEEPSEEK_API_KEY", "zoo": "ORBIT_WORKER_ZOO_KEY", "kimi": "ORBIT_WORKER_KIMI_KEY", "nous": "ORBIT_WORKER_NOUS_KEY"}
+_KEY_FILE_CFG = {"go": "go_key_file", "deepseek": "deepseek_key_file", "zoo": "zoo_key_file", "kimi": "kimi_key_file", "nous": "nous_key_file"}
+_KEY_FILE_NAME = {"go": "go.key", "deepseek": "deepseek.key", "zoo": "zoo.key", "kimi": "kimi.key", "nous": "nous.key"}
 
 def provider_key(cfg, source):
-    """Provider key for a named source (`go`, `deepseek` or `zoo`): env first, else a user-only file. Never logged."""
+    """Provider key for a named source (`go`, `deepseek`, `zoo`, `kimi` or `nous`): env first, else a user-only file. Never logged."""
     env_name = _KEY_ENV.get(source)
     if env_name:
         v = os.environ.get(env_name)
@@ -1460,7 +1499,7 @@ class CuaBackend:
             attempt.update(workdir=wd, local_base_rev=base, seed_commit=seed)
         spec = model_spec(cfg, attempt.get("model"), attempt.get("brief"))
         env = {"OPENCODE_CONFIG_CONTENT": json.dumps(dict(WORKER_OPENCODE_CONFIG, **({"model": spec["model"]} if spec["key"] == "none" else {})))}
-        if spec["key"] in ("go", "deepseek", "zoo"): env["OPENAI_API_KEY"] = key  # OpenAI-compatible: DeepSeek official, OpenCode Go or the Zoo gateway
+        if spec["key"] in ("go", "deepseek", "zoo", "kimi", "nous"): env["OPENAI_API_KEY"] = key  # OpenAI-compatible: DeepSeek official, OpenCode Go, the Zoo gateway, Kimi direct or Nous Portal
         if b.get("verify_of") and wd:  # verify bee: hand it the finished work bee's patch (never a credential)
             vp = Path(cfg["data_dir"]) / "attempts" / f"{b['verify_of']}.result.json"
             diff = ((json.loads(vp.read_text("utf-8")).get("patch") or {}).get("diff") or "") if vp.exists() else ""
@@ -1546,15 +1585,24 @@ def agy_timeout(b, mode="ui"):
     t = (b.get("budget") or {}).get("timeout_s") or (1800 if mode == "code" else AGY_TIMEOUT_S[1])
     return max(AGY_TIMEOUT_S[0], min(AGY_TIMEOUT_S[2], int(t)))
 
-def attempt_budget_s(a):
-    """The attempt wall clock in seconds from brief.budget.timeout_s, or None when none applies.
+def _attempt_default_timeout(cfg):
+    """The host's default attempt wall clock: config `default_timeout_s`, a positive whole number
+    of seconds, falling back to DEFAULT_ATTEMPT_TIMEOUT_S when it is missing, malformed or zero."""
+    try:
+        default = int((cfg or {}).get("default_timeout_s", DEFAULT_ATTEMPT_TIMEOUT_S))
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_ATTEMPT_TIMEOUT_S
+    return default if default > 0 else DEFAULT_ATTEMPT_TIMEOUT_S
+
+def attempt_budget_s(a, cfg=None):
+    """The attempt wall clock in seconds from brief.budget.timeout_s or the host default.
 
     budget.timeout_s must bound the whole attempt, not only the child it is handed to: whatever a
     worker does with its own flag, the launcher stops the attempt at this deadline plus
     BUDGET_STOP_GRACE_S. Kind semantics preserved: agy-cua keeps the AGY_TIMEOUT_S min/default/max
     clamp (and the code-mode default), check keeps the CHECK_TIMEOUT_S per-command clamp and gets a
     per-command-derived attempt clock (each command stays individually bounded), opencode enforces
-    exactly the configured value and only when the brief carries one.
+    exactly a positive configured value and otherwise uses default_timeout_s.
     """
     b = a.get("brief") or {}
     kind = a.get("kind") or b.get("kind") or "opencode"
@@ -1562,12 +1610,14 @@ def attempt_budget_s(a):
         return agy_timeout(b, a.get("mode") or "ui")
     if kind == "check":
         return check_timeout_s(b) * (len(b.get("commands") or []) + 1) + CHECK_ATTEMPT_OVERHEAD_S
-    raw = (b.get("budget") or {}).get("timeout_s")
+    default = _attempt_default_timeout(cfg)
+    budget = b.get("budget")
+    raw = budget.get("timeout_s") if isinstance(budget, dict) else None
     try:
         t = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return t if t > 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return t if t > 0 else default
 
 def render_agy_prompt(b):
     parts = [f"# Objective\n{b['objective']}"]
@@ -1832,13 +1882,25 @@ def normalize_brief(b):
                           [f"Test passes: {t}" for t in acc.get("tests") or [] if isinstance(t, str)]
     return b
 
-def validate_brief(b):
+def _budget_requirement_error(cfg, b):
+    """The require_budget refusal for a brief without a positive budget.timeout_s, else None."""
+    if not (cfg or {}).get("require_budget"):
+        return None
+    budget = b.get("budget")
+    raw = budget.get("timeout_s") if isinstance(budget, dict) else None
+    try:
+        timeout_s = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        timeout_s = 0
+    return None if timeout_s > 0 else "brief.budget.timeout_s must be a positive number of seconds when require_budget is set"
+
+def validate_brief(b, cfg=None):
     """v0.1.1 requires only objective; main (c10aa42) also sends source_rev, assigned_files and
     acceptance. Unknown extra fields (contract, evidence, etc.) are ignored, not rejected."""
     if not isinstance(b, dict) or not str(b.get("objective", "")).strip(): return "brief.objective is required"
     for k in ("deliverables", "acceptance", "assigned_files", "commands", "deps"):
         if k in b and not (isinstance(b[k], list) and all(isinstance(x, str) for x in b[k])): return f"brief.{k} must be a list of strings"
-    return None
+    return _budget_requirement_error(cfg, b)
 
 # Same text rule as contract/v1/project_state.py SAFE_PATH: relative, no empty,
 # "." or ".." segment, no backslash, no trailing slash after normalize, <= 244.
@@ -2265,7 +2327,7 @@ class Launcher:
             # (may restore an already-collected result). Do not pre-empt it.
             if a.get("budget_stop"):
                 continue
-            budget = attempt_budget_s(a)
+            budget = attempt_budget_s(a, self.cfg)
             started = a.get("budget_started_at")
             if budget and started and time.time() >= started + budget:
                 try:
@@ -2290,6 +2352,58 @@ class Launcher:
                 pass
 
     def kick(self): asyncio.run_coroutine_threadsafe(self._schedule(), self.loop)
+
+    def _spec_of(self, a):
+        if a.get("kind") not in (None, "opencode") or (a.get("pool") and not a.get("model")):
+            return {}
+        try:
+            return model_spec(self.cfg, a.get("model"), a.get("brief"))
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _fallback_hops(a):
+        return a.get("fallback_hops") or (1 if a.get("fallback") else 0)
+
+    def _may_fallback(self, a, spec):
+        """One fallback per attempt, or up to MAX_FALLBACK_HOPS along an opt-in chain
+        (spec fallback_chain); never back to a model the attempt already ran on."""
+        fb = spec.get("fallback")
+        if not fb:
+            return False
+        hops = self._fallback_hops(a)
+        if hops == 0:
+            return True
+        tried = {h.get("model") for h in a.get("model_history") or []} | {a.get("model")}
+        return bool(spec.get("fallback_chain")) and hops < MAX_FALLBACK_HOPS and fb not in tried
+
+    def _fallback_on_provider_error(self, a):
+        return bool(self._spec_of(a).get("fallback_on_provider_error"))
+
+    def _paced(self, a):
+        """True when starting `a` now would break its provider's pacing (spec max_active /
+        start_spacing_s). Called under self.lock from _schedule; records the start time when
+        the attempt may go. Models without pacing fields are never held."""
+        spec = self._spec_of(a)
+        src = spec.get("key")
+        if not src or not (spec.get("max_active") or spec.get("start_spacing_s")):
+            return False
+        if self._over_cap(src, spec.get("max_active")):
+            return True  # a finishing attempt's controller kicks the scheduler again
+        return self._spacing_hold(src, spec.get("start_spacing_s") or 0)
+
+    def _over_cap(self, src, cap):
+        return bool(cap) and sum(1 for x in self._active() if self._spec_of(x).get("key") == src) >= cap
+
+    def _spacing_hold(self, src, spacing):
+        last = getattr(self, "_pace_last", {}).get(src, 0.0)
+        wait = spacing - (time.time() - last)
+        if wait > 0:
+            self.loop.call_later(wait + 0.05, self.kick)
+            return True
+        if not hasattr(self, "_pace_last"): self._pace_last = {}
+        self._pace_last[src] = time.time()
+        return False
 
     async def _schedule(self):
         try:
@@ -2318,6 +2432,7 @@ class Launcher:
                 if free <= 0: break
                 a = self.attempts[aid]
                 if a["state"] == "backoff" and time.time() < a.get("retry_at", 0): continue
+                if self._paced(a): continue  # provider pacing (nous): skip, later queued attempts may still start
                 free -= 1; self._set(a, "starting", "creating sandbox")
                 self.controllers[aid] = asyncio.ensure_future(self._control(a))
 
@@ -2329,7 +2444,7 @@ class Launcher:
             # budget.timeout_s as an attempt wall clock: anchored at dispatch, kept across a
             # restart-reattach, enforced by the loop's fast path below and by the watchdog even
             # when this controller is itself stuck inside a backend call.
-            budget = attempt_budget_s(a)
+            budget = attempt_budget_s(a, self.cfg)
             if budget:
                 with self.lock:
                     started = a.get("budget_started_at") if a.get("run_id") else None  # resumed: keep the original clock
@@ -2347,6 +2462,15 @@ class Launcher:
                 src = spec.get("key") or "none"
                 key = "" if agy or src == "none" else provider_key(self.cfg, src)  # agy uses the host's own agy sign-in; no key passed
                 if not agy and src != "none" and not key:
+                    fb = spec.get("fallback")
+                    if spec.get("fallback_on_missing_key") and self._may_fallback(a, spec):
+                        # Opt-in models (nous) roll their fallback instead of failing before start.
+                        a["fallback_hops"] = self._fallback_hops(a) + 1
+                        a["fallback"] = {"from": spec["name"], "to": fb, "reason": f"{src} key not configured on this PC", "at": time.time()}
+                        a["model"] = fb
+                        a.setdefault("model_history", []).append({"model": fb, "fallback": f"{spec['name']}->{fb}", "after": "provider key not configured", "at": time.time()})
+                        a["rate_limited"], a["cursor"] = 0, 0
+                        self._set(a, "queued", f"{src} key not configured on this PC; falling back to {fb}"); return
                     self._set(a, "failed", "provider key not configured on this PC"); return
                 ids = await self.backend.start(a, key); del key
                 a.update(ids); self._set(a, "running", ("agy" if agy else "opencode") + " run started", {"run_id": ids["run_id"]})
@@ -2388,6 +2512,8 @@ class Launcher:
                         if is_monthly_limit(txt) and is_go_model(self.cfg, a.get("model"), a.get("brief")) and not a.get("fallback"):
                             return await self._fallback_to_deepseek(a, reason="go monthly-limit 429")
                         return await self._backoff(a, retry_after=retry_after_s(txt))
+                    if e["kind"] == "error" and PROVIDER_FAILURE.search(txt) and self._fallback_on_provider_error(a):
+                        return await self._fallback_unavailable(a, reason="provider failure: " + redact(txt)[:120])
                     if e["kind"] in ("turn_ended", "exited"):
                         if a.get("budget_stop") or (deadline and time.time() >= deadline):
                             return await asyncio.shield(self._budget_finish(a, budget, started))
@@ -2473,7 +2599,7 @@ class Launcher:
         terminal write (started by _schedule when a restart finds the attempt in that state)."""
         aid = a["attempt_id"]
         try:
-            budget = attempt_budget_s(a)
+            budget = attempt_budget_s(a, self.cfg)
             if budget:
                 await self._budget_finish(a, budget, a.get("budget_started_at"), recover=True)
             else:
@@ -2605,7 +2731,8 @@ class Launcher:
         spec = model_spec(self.cfg, a.get("model"), a.get("brief"))
         fb = spec.get("fallback")
         await self._cleanup_once(a)
-        if fb and not a.get("fallback"):
+        if self._may_fallback(a, spec):
+            a["fallback_hops"] = self._fallback_hops(a) + 1
             a["fallback"] = {"from": spec["name"], "to": fb, "reason": f"{reason} (model unavailable)", "at": time.time()}
             a["model"] = fb
             a.setdefault("model_history", []).append(
@@ -2646,7 +2773,8 @@ class Launcher:
         await self._cleanup_once(a)
         if exhausted or n >= len(delays):
             fb = spec.get("fallback")
-            if fb and not a.get("fallback"):
+            if self._may_fallback(a, spec):
+                a["fallback_hops"] = self._fallback_hops(a) + 1
                 a["fallback"] = {"from": spec["name"], "to": fb, "reason": f"{reason} after {n} retr{'y' if n == 1 else 'ies'}", "at": time.time()}
                 a["model"], a["rate_limited"], a["cursor"] = fb, 0, 0
                 for k in ("run_id", "sandbox"): a.pop(k, None)
@@ -3005,7 +3133,7 @@ def make_handler(L, token):
                 elif not re.fullmatch(r"[A-Za-z0-9_\-]{8,64}", aid):
                     return self._send(400, {"error": "attempt_id required"})
                 if isinstance(b.get("brief"), dict): b["brief"] = normalize_brief(b["brief"])
-                err = validate_brief(b.get("brief"))
+                err = validate_brief(b.get("brief"), L.cfg)
                 if err: return self._send(400, {"error": err})
                 if b["brief"].get("project") and b["brief"]["project"] not in L.cfg["projects"]: return self._send(403, {"error": "project not authorized on this PC"})
                 try: a, created = L.submit(aid, b["brief"], b.get("model") or b.get("tier"), b.get("kind"), b.get("mode"))

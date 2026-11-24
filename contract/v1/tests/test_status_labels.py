@@ -1,7 +1,7 @@
 """Keep the four status labels honest.
 
 * openapi.yaml operations, STATUS.json and the README tables agree.
-* `launcher-0.1.15` routes answer on an in-process launcher; every other route
+* `launcher-<VERSION>` routes (the launcher.py VERSION at this checkout) answer on an in-process launcher; every other route
   is absent from it (so nothing unshipped is presented as shipped, and nothing
   shipped is left labelled unshipped).
 * `reference` items name reference code and a test class that exist.
@@ -26,6 +26,9 @@ sys.path.insert(0, str(ROOT))
 from contract.v1 import status as S  # noqa: E402
 
 LABELS = set(S.STATUS["labels"])
+# The implemented label names the launcher VERSION at this checkout (T3-HYVVSTATUS r2), so a version bump
+# cannot leave STATUS.json, openapi.yaml, the TITLES and the README tables on an older label.
+LAUNCHER = "launcher-" + re.search(r'^VERSION = "([0-9.]+)"', (ROOT / "launcher.py").read_text(encoding="utf-8"), re.M).group(1)
 
 
 def openapi_ops() -> dict[str, str]:
@@ -48,13 +51,13 @@ def openapi_ops() -> dict[str, str]:
 
 class Labels(unittest.TestCase):
     def test_every_label_is_one_of_four(self):
-        self.assertEqual(LABELS, {"launcher-0.1.15", "reference", "specified", "proposed"})
+        self.assertEqual(LABELS, {LAUNCHER, "reference", "specified", "proposed"})
         for k, v in {**S.STATUS["endpoints"], **S.STATUS["features"]}.items():
             self.assertIn(v, LABELS, k)
 
     def test_version_is_labelled_implemented_in_the_launcher(self):
-        self.assertEqual(S.STATUS["endpoints"]["GET /v1/version"], "launcher-0.1.15")
-        self.assertEqual(S.STATUS["features"]["GET /v1/version capabilities list"], "launcher-0.1.15")
+        self.assertEqual(S.STATUS["endpoints"]["GET /v1/version"], LAUNCHER)
+        self.assertEqual(S.STATUS["features"]["GET /v1/version capabilities list"], LAUNCHER)
 
     def test_openapi_matches_status_json(self):
         ops = openapi_ops()
@@ -144,10 +147,10 @@ class LauncherRoutes(unittest.TestCase):
         for key, label in S.STATUS["endpoints"].items():
             with self.subTest(endpoint=key, label=label):
                 exists = self._route_exists(key)
-                if label == "launcher-0.1.15":
-                    self.assertTrue(exists, f"{key} is labelled launcher-0.1.15 but the launcher has no such route")
+                if label == LAUNCHER:
+                    self.assertTrue(exists, f"{key} is labelled {LAUNCHER} but the launcher has no such route")
                 else:
-                    self.assertFalse(exists, f"{key} is served by the launcher; relabel it launcher-0.1.15")
+                    self.assertFalse(exists, f"{key} is served by the launcher; relabel it {LAUNCHER}")
 
 
 if __name__ == "__main__":
