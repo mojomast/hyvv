@@ -1,0 +1,244 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mojomast/workflow/observability/schemas/inference.schema.json",
+  "title": "One model call (gen_ai.inference/v1)",
+  "description": "One row per model call (one OpenCode step) inside a bee attempt, harvested from the harness's own session storage in the sandbox at attempt end. Counts and timings only: no prompt, completion, reasoning text, tool arguments or results ever appear. Unknown counts are null with usage_status partial or unknown, never zero. Metric names follow the OpenTelemetry GenAI client inference conventions (see METRICS.md).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "attempt_id",
+    "seq",
+    "ts_start",
+    "provider",
+    "usage_status",
+    "ttft_source",
+    "cost_status"
+  ],
+  "properties": {
+    "schema": {
+      "const": "gen_ai.inference/v1"
+    },
+    "schema_version": {
+      "const": "v1"
+    },
+    "attempt_id": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "card_id": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "run_id": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "project": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "role": {
+      "$ref": "common.schema.json#/$defs/nullable_role"
+    },
+    "task_id": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "job_id": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "trace_id": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "ts_start": {
+      "$ref": "common.schema.json#/$defs/utc_timestamp"
+    },
+    "ts_first_chunk": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "common.schema.json#/$defs/utc_timestamp"
+        }
+      ]
+    },
+    "ts_end": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "common.schema.json#/$defs/utc_timestamp"
+        }
+      ]
+    },
+    "duration_s": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "ttft_s": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "ttft_source": {
+      "enum": [
+        "harness_part_timing",
+        "unknown"
+      ]
+    },
+    "output_tps": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "requested_model": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^(?!.*//)[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$",
+      "description": "Model id as the router names it (for example nous:hy4-flash or zoo/glm-5.3-flash). Never a URL."
+    },
+    "served_model": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^(?!.*//)[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$",
+      "description": "Model id as the router names it (for example nous:hy4-flash or zoo/glm-5.3-flash). Never a URL."
+    },
+    "provider": {
+      "$ref": "common.schema.json#/$defs/provider_label"
+    },
+    "route": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "common.schema.json#/$defs/provider_label"
+        }
+      ]
+    },
+    "harness": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "common.schema.json#/$defs/provider_label"
+        }
+      ]
+    },
+    "fallback_hop": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 8
+    },
+    "input_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "cache_read_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "cache_write_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "output_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "reasoning_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "usage_status": {
+      "enum": [
+        "known",
+        "partial",
+        "unknown"
+      ]
+    },
+    "finish_reason": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "common.schema.json#/$defs/provider_label"
+        }
+      ]
+    },
+    "error_type": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "http_status": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 100,
+      "maximum": 599
+    },
+    "cost_usd_list": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "cost_status": {
+      "enum": [
+        "estimated",
+        "actual",
+        "unknown"
+      ]
+    },
+    "price_table_version": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "context_limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "context_fill_ratio": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 2
+    }
+  }
+}
