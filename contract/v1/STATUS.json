@@ -1,6 +1,7 @@
 {
   "labels": {
     "launcher-0.1.18": "Implemented in launcher 0.1.18 (launcher.py) and covered by tests",
+    "launcher-main": "Implemented in launcher.py on main and covered by tests; not in a tagged release yet",
     "reference": "Implemented in the /v1 reference (contract/v1/reference.py) and its tests only; not in the launcher yet",
     "specified": "Specified in this contract; not implemented anywhere yet",
     "proposed": "Proposed addition; not yet planned work"
@@ -22,6 +23,7 @@
     "POST /v1/route": "launcher-0.1.18",
     "GET /v1/provision/capabilities": "launcher-0.1.18",
     "GET /v1/landing/events": "launcher-0.1.18",
+    "GET /v1/capacity": "launcher-main",
     "GET /v1/leases": "specified",
     "POST /v1/leases": "specified",
     "DELETE /v1/leases/{lease_id}": "specified",
