@@ -95,7 +95,8 @@ Rehearses steps 1, 2 and 5 against test.pypi.org: it gives the build a unique
 `<version>.dev<run id>` version (TestPyPI never accepts a version twice), runs
 `uv build` and the same `build_release_assets.py` dist check, then publishes
 with trusted publishing (`repository-url: https://test.pypi.org/legacy/`,
-attestations on) from the `testpypi` environment. It runs only by
+attestations on) from the `testpypi` environment, which only accepts runs
+from `main`. It runs only by
 `workflow_dispatch`, never on a tag, and never creates a tag, a GitHub Release
 or a pypi.org upload. `tests/test_testpypi_rehearsal.py` holds that contract.
 
