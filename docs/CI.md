@@ -89,6 +89,29 @@ documents for SLSA v1 Build Level 3 with artifact attestations.
 `slsa-framework/slsa-github-generator` is no longer actively maintained; use
 GitHub artifact attestations instead, verified with `gh attestation verify`.
 
+### `testpypi-rehearsal.yml` (manual dispatch, before the first real release)
+
+Rehearses steps 1, 2 and 5 against test.pypi.org: it gives the build a unique
+`<version>.dev<run id>` version (TestPyPI never accepts a version twice), runs
+`uv build` and the same `build_release_assets.py` dist check, then publishes
+with trusted publishing (`repository-url: https://test.pypi.org/legacy/`,
+attestations on) from the `testpypi` environment, which only accepts runs
+from `main`. It runs only by
+`workflow_dispatch`, never on a tag, and never creates a tag, a GitHub Release
+or a pypi.org upload. `tests/test_testpypi_rehearsal.py` holds that contract.
+
+One-time owner setup, both in a browser:
+
+- test.pypi.org: add a pending trusted publisher for project `hyvv`, owner
+  `mojomast`, repository `hyvv`, workflow `testpypi-rehearsal.yml`,
+  environment `testpypi`. A pending publisher does not reserve the name.
+- pypi.org (right before the first tag): the same with workflow
+  `release.yml`, environment `pypi`.
+
+The `pypi` environment that `release.yml` publishes from only accepts `v*`
+tags and has the owner as required reviewer with admin bypass off, so GitHub
+holds every real publish until the owner approves it.
+
 ### `e2e.yml` (end-to-end on real sandboxes)
 
 Runs on hyvv runners (section 4), trusted events only: push to `main`, nightly
