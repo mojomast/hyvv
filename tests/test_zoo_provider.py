@@ -23,7 +23,7 @@ sys.modules["launcher"] = L
 spec.loader.exec_module(L)
 
 ZOO = "zoo:glm-5.3-flash"
-KEY_VARS = ("ORBIT_WORKER_ZOO_KEY", "DEEPSEEK_API_KEY", "ORBIT_WORKER_GO_KEY")
+KEY_VARS = ("ORBIT_WORKER_ZOO_KEY", "DEEPSEEK_API_KEY", "ORBIT_WORKER_GO_KEY", "ORBIT_WORKER_NOUS_KEY")
 
 
 def _pop_keys():
@@ -88,7 +88,10 @@ class ZooRouting(unittest.TestCase):
         self.assertEqual(spec["base_url"], "https://www.zoocode.dev/api/gateway/v1")
         self.assertEqual(spec["wire"], "openai-chat")
         self.assertEqual(spec["key"], "zoo")
-        self.assertEqual(spec["fallback"], "deepseek:deepseek-flash")
+        self.assertEqual(spec["fallback"], "nous:deepseek-v4.1-flash-1017")
+        fallback = L.model_spec(self._cfg(), spec["fallback"])
+        self.assertEqual(fallback["key"], "nous")
+        self.assertEqual(fallback["base_url"], L.NOUS_BASE_URL)
         self.assertTrue(spec.get("backoff_s"))
 
     def test_config_entry_extends_the_builtin(self):
@@ -179,7 +182,8 @@ class ZooBackoff(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="zoo-att-")
         (Path(self.tmp) / "zoo.key").write_text("fake-zoo-key", "utf-8")
         (Path(self.tmp) / "go.key").write_text("fake-go-key", "utf-8")  # a go: brief still needs its own key
-        (Path(self.tmp) / "deepseek.key").write_text("fake-deepseek-key", "utf-8")  # Zoo's fallback target
+        (Path(self.tmp) / "deepseek.key").write_text("fake-deepseek-key", "utf-8")
+        (Path(self.tmp) / "nous.key").write_text("fake-nous-key", "utf-8")  # Zoo's fallback target
         self.la = mk(self.tmp)
 
     def tearDown(self):
@@ -224,14 +228,17 @@ class ZooBackoff(unittest.TestCase):
         self.assertIn("zoo admission 402", self.la.attempts[aid]["detail"])
 
     def test_persistent_429_falls_back_to_deepseek_flash(self):
-        # Zoo rate limits that never clear: exhaust the retries, then finish on DeepSeek official.
+        # Zoo rate limits that never clear: exhaust the retries, then finish on Nous 1017.
         aid, brief = self._brief("att_zoo00000004", rate_limit_models=[ZOO])
         self.la.submit(aid, brief)
         self.assertTrue(wait_for(lambda: self.la.attempts[aid]["state"] in L.TERMINAL, timeout=20))
         a = self.la.attempts[aid]
         self.assertEqual(a["state"], "succeeded", a.get("detail"))
-        self.assertEqual(a["model"], "deepseek:deepseek-flash")
-        self.assertEqual(a["fallback"]["to"], "deepseek:deepseek-flash")
+        self.assertEqual(a["model"], "nous:deepseek-v4.1-flash-1017")
+        self.assertEqual(a["fallback"]["to"], "nous:deepseek-v4.1-flash-1017")
+        fallback = L.model_spec(self.la.cfg, a["model"], a.get("brief"))
+        self.assertEqual(fallback["key"], "nous")
+        self.assertEqual(fallback["base_url"], L.NOUS_BASE_URL)
 
     def test_402_on_a_non_zoo_model_is_not_swallowed(self):
         aid, brief = self._brief("att_zoo00000005", error_first=1, error_text="HTTP 402 Insufficient credits")
@@ -245,11 +252,11 @@ class ZooBackoff(unittest.TestCase):
 
 
 class ZooPreferredDefault(unittest.TestCase):
-    """Zoo GLM 5.3 Flash is the default for a bee brief that names no model; DeepSeek flash is next.
+    """Zoo GLM 5.3 Flash is the default for a bee brief that names no model; Nous 1017 is next.
 
     The free pass is the cheapest useful route, so an unnamed brief should land on it whenever this
     host can authenticate; when the pass ends (or Zoo keeps refusing), the launcher falls back to
-    DeepSeek official flash rather than to Go's metered quota.
+    Nous DeepSeek v4.1 Flash 1017 rather than to Go's metered quota.
     """
 
     def setUp(self):
@@ -288,10 +295,10 @@ class ZooPreferredDefault(unittest.TestCase):
 
     def test_zoo_falls_back_to_deepseek_flash_when_retries_are_exhausted(self):
         self._key()
-        self.assertEqual(L.MODELS[ZOO]["fallback"], "deepseek:deepseek-flash")
+        self.assertEqual(L.MODELS[ZOO]["fallback"], "nous:deepseek-v4.1-flash-1017")
         self.assertNotEqual(L.MODELS[ZOO]["fallback"], "go:deepseek-v4.1-flash")
         spec = L.model_spec(self._cfg(), ZOO)
-        self.assertEqual(spec["fallback"], "deepseek:deepseek-flash")
+        self.assertEqual(spec["fallback"], "nous:deepseek-v4.1-flash-1017")
 
     def test_a_named_model_is_never_replaced_by_the_preference(self):
         self._key()

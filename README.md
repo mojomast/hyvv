@@ -19,7 +19,7 @@ This repository is the fourth layer: the runtime on each machine where work happ
 
 ## Status
 
-The imported runtime is **v0.1.15**. This branch bumps the package to **v0.1.19** so a deployed build can be told apart; the release is still 0.1.15. A brief that names no model uses the host's configured `model`; a host can opt in to `zoo:glm-5.3-flash` with `"prefer_zoo": true` in `config.json` when it has a `zoo` key (off by default since 2026-11-19: the free pass refuses programmatic use and ends ~Nov 29), and Zoo's fallback is DeepSeek official flash. Named models keep the 0.1.15 routing and are authoritative: unprefixed and `go:` go to OpenCode Go, `deepseek:` to the official DeepSeek API, and an explicitly named model always wins over `priority: high` (owner decision 2026-11-15: whatever the brief names is what runs). `priority: high` reroutes only a brief that names no model.
+The imported runtime is **v0.1.15**. This branch bumps the package to **v0.1.19** so a deployed build can be told apart; the release is still 0.1.15. A brief that names no model uses the host's configured `model`; a host can opt in to `zoo:glm-5.3-flash` with `"prefer_zoo": true` in `config.json` when it has a `zoo` key (off by default since 2026-11-19: the free pass refuses programmatic use and ends ~Nov 29), and Zoo's fallback is Nous DeepSeek v4.1 Flash 1017 (`nous:deepseek-v4.1-flash-1017`). Named models keep the 0.1.15 routing and are authoritative: unprefixed and `go:` go to OpenCode Go, `deepseek:` to the official DeepSeek API, and an explicitly named model always wins over `priority: high` (owner decision 2026-11-15: whatever the brief names is what runs). `priority: high` reroutes only a brief that names no model.
 
 The `/v1` contract in `contract/v1` is the source of truth going forward:
 
@@ -153,7 +153,7 @@ paid model. With `"prefer_zoo": true` it is the default for a bee brief that nam
 default); the `simple` tier (`pool:free`) and any explicitly named model or tier are
 untouched. A brief that names no model and is `priority: high` goes to DeepSeek official - except
 when the host default is the free pool, which is picked before priority is considered. When rate limits persist or the pass ends, the spec falls back to
-`deepseek:deepseek-flash` (DeepSeek official, not Go's metered quota). A host without a readable `zoo`
+`nous:deepseek-v4.1-flash-1017` (Nous Portal, not Go's metered quota). A host without a readable `zoo`
 key, or a host without `"prefer_zoo": true`, keeps its configured default model.
 A `models` entry in `config.json` overrides or extends the built-in spec (for example a shorter
 `backoff_s`).
