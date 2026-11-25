@@ -1039,6 +1039,72 @@ def deployment_receipt(cfg):
     return out
 
 
+_TICKET_SCHEMA = json.loads((LAUNCHER_DIR / "schemas" / "rizzstack-ticket.schema.json").read_text("utf-8"))
+
+
+def ticket_violations(ticket, schema=None) -> list[dict]:
+    schema = _TICKET_SCHEMA if schema is None else schema
+    if not isinstance(ticket, dict):
+        return [{"code": "ticket_invalid", "detail": "ticket must be an object"}]
+    violations = []
+    properties = schema.get("properties", {})
+    for claim in schema.get("required", []):
+        if claim not in ticket:
+            violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} is required"})
+    if schema.get("additionalProperties") is False:
+        for claim in sorted((key for key in ticket if key not in properties), key=str):
+            violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} is not allowed"})
+
+    def matches_type(value, kind):
+        if kind == "object":
+            return isinstance(value, dict)
+        if kind == "array":
+            return isinstance(value, list)
+        if kind == "string":
+            return isinstance(value, str)
+        if kind == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if kind == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if kind == "boolean":
+            return isinstance(value, bool)
+        if kind == "null":
+            return value is None
+        return True
+
+    for claim, rules in properties.items():
+        if claim not in ticket:
+            continue
+        value = ticket[claim]
+        expected = rules.get("type")
+        if expected is not None:
+            kinds = expected if isinstance(expected, list) else [expected]
+            if not any(matches_type(value, kind) for kind in kinds):
+                violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} has the wrong type"})
+                continue
+        if isinstance(value, str):
+            if "minLength" in rules and len(value) < rules["minLength"]:
+                violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} is shorter than minLength"})
+            if "pattern" in rules and re.search(rules["pattern"], value) is None:
+                violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} does not match the required pattern"})
+        if "enum" in rules and value not in rules["enum"]:
+            violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} is not an allowed value"})
+        if "const" in rules and value != rules["const"]:
+            violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} does not equal the required constant"})
+    return violations
+
+
+def ticket_report(cfg, brief) -> dict:
+    if "ticket" not in brief:
+        status = "missing"
+        violations = [{"code": "ticket_missing", "detail": "ticket is missing from the brief"}]
+    else:
+        violations = ticket_violations(brief["ticket"])
+        status = "valid" if not violations else "invalid"
+    return {"schema": "rizzstack.ticket-report/1", "mode": cfg.get("ticket_mode", "off"),
+            "status": status, "violations": violations, "signature": "not_checked"}
+
+
 def load_config(path):
     cfg = json.loads(Path(path).read_text("utf-8-sig"))
     cfg.setdefault("port", 47821)
@@ -1057,6 +1123,9 @@ def load_config(path):
         default_timeout_s = DEFAULT_ATTEMPT_TIMEOUT_S
     cfg["default_timeout_s"] = max(60, min(86400, default_timeout_s))
     cfg.setdefault("require_budget", False)
+    cfg.setdefault("ticket_mode", "off")
+    if cfg["ticket_mode"] not in ("off", "report"):
+        raise ValueError("ticket_mode must be off or report")
     cfg.setdefault("data_dir", str(Path.home() / ".orbit-launcher"))
     cfg.setdefault("projects", {})  # name -> {"repo": url} (authorized projects)
     cfg.setdefault("provisioning", {})  # {"policy": path, "journal": path, "enabled": bool}
@@ -2293,6 +2362,8 @@ class Launcher:
     def public(self, a):
         keys = ("attempt_id", "kind", "mode", "tier", "state", "detail", "run_id", "sandbox", "created_at", "updated_at", "lseq", "queue_position", "retry_at", "rate_limited", "model", "fallback", "pool", "model_history")
         d = {k: a.get(k) for k in keys}
+        if "ticket_report" in a:
+            d["ticket_report"] = a["ticket_report"]
         if a.get("workspace_error"):
             d["workspace_error"] = a["workspace_error"]
         if d["state"] == "queued": q = self._queue(); d["queue_position"] = q.index(a["attempt_id"]) + 1 if a["attempt_id"] in q else None  # one snapshot: a second _queue() call could race the .index()
@@ -2333,6 +2404,7 @@ class Launcher:
     def submit(self, aid, brief, model=None, kind=None, mode=None):
         with self.lock:
             if aid in self.attempts: return self.attempts[aid], False  # idempotent: never a second controller
+            report = ticket_report(self.cfg, brief) if self.cfg.get("ticket_mode", "off") == "report" else None
             kind = kind or brief.get("kind") or "opencode"
             if kind not in KINDS: raise ValueError(f"unknown kind: {kind} (allowed: {', '.join(KINDS)})")
             prof = resolve_security_profile(self.cfg, kind, brief)  # ValueError -> 400; coding bees: "default" only
@@ -2342,6 +2414,7 @@ class Launcher:
                 now = time.time()
                 a = {"attempt_id": aid, "kind": kind, "brief": brief, "state": "queued", "detail": "waiting for a worker slot", "created_at": now,
                      "updated_at": now, "lseq": 0, "cursor": 0, "rate_limited": 0, "model": None, "security_profile": prof}
+                if report is not None: a["ticket_report"] = report
                 self.attempts[aid] = a; self._save(a)
                 self.kick(); return a, True
             if kind == "agy-cua":
@@ -2355,6 +2428,7 @@ class Launcher:
             now = time.time()
             a = {"attempt_id": aid, "kind": kind, "brief": brief, "state": "queued", "detail": "waiting for a worker slot", "created_at": now,
                  "updated_at": now, "lseq": 0, "cursor": 0, "rate_limited": 0, "model": None if spec.get("pool") else spec["name"]}
+            if report is not None: a["ticket_report"] = report
             if spec.get("pool"): a.update(pool=spec["pool"], tried=[], model_history=[])
             if kind == "agy-cua":
                 a["tier"] = spec.get("tier"); a["mode"] = mode or brief.get("mode") or "ui"
