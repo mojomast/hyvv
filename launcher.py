@@ -35,10 +35,15 @@ if _landing_export is None:  # pragma: no cover - loaded from a sibling copy
     except Exception:
         _landing_export = None
 
-VERSION = "0.1.18"
+VERSION = "0.1.19"
 HEARTBEAT_S = 60  # controller emits a heartbeat event after this many quiet seconds
 MAX_WORKERS = 14  # hard ceiling for max_concurrent (owner directive: final ceiling, supersedes the interim cap-12)
 TERMINAL = {"succeeded", "failed", "cancelled"}
+
+# A resumable rate-limited attempt keeps its sandbox and run; the retry sends this short
+# continue turn instead of the full brief.
+RESUME_PROMPT = ("Continue the same task from where the previous turn stopped; do not restart "
+                 "from scratch. The prior turn was interrupted by a provider rate limit.")
 
 JOURNAL_ACTIVE = ("starting", "running", "cancel_requested")
 SAVE_REPLACE_TRIES = 10
@@ -56,9 +61,9 @@ WORKER_OPENCODE_CONFIG = {"$schema": "https://opencode.ai/config.json", "permiss
 def _free(model_id, ctx_tokens):
     # Prompt cap: leave ~80k tokens for OpenCode's own system prompt/tools (a probe used ~43k) and output;
     # ~3 chars per token; never above 300k chars (~100k tokens) for the free tier.
-    # fallback aliases to DeepSeek official deepseek-flash (see MODELS).
+    # fallback aliases to Nous DeepSeek v4.1 Flash 1017 (see MODELS).
     return {"model": f"opencode/{model_id}", "base_url": None, "wire": None, "key": "none", "free": True,
-            "fallback": "deepseek:deepseek-flash", "context_tokens": ctx_tokens,
+            "fallback": "nous:deepseek-v4.1-flash-1017", "context_tokens": ctx_tokens,
             "max_prompt_chars": max(60_000, min(300_000, (ctx_tokens - 80_000) * 3)), "backoff_s": [20, 60]}
 
 def _go_free(model_id, ctx_tokens):
@@ -70,7 +75,7 @@ def _go_free(model_id, ctx_tokens):
 # prefix (including bare `deepseek-v4.1-flash`), goes to OpenCode Go. `deepseek:<model>` (e.g.
 # `deepseek:deepseek-flash`) goes to DeepSeek official. An explicitly named model or tier is
 # authoritative; priority: high reroutes only a brief that names no model.
-# A Go monthly-limit 429 retries once on DeepSeek direct and records fallback="deepseek".
+# A Go monthly-limit 429 retries once on Nous DeepSeek 1017 and records fallback="ds1017n".
 # Free models only work from inside OpenCode, so they use OpenCode's built-in provider (opencode/<id>, no base_url).
 # Every free id below answered `opencode run -m opencode/<id>` on Oct 20, 2026 (jev-1.13-free and space-bunny-free were "Model unavailable").
 # Context sizes from models.dev (input limit where it is lower).
@@ -81,10 +86,10 @@ _GO_FLASH = {"model": "deepseek-v4.1-flash", "base_url": GO_BASE_URL, "wire": "o
 # launcher's MAX_WORKERS=14 ceiling sits well under. Thinking is always on and spends the
 # output budget FIRST, so callers must allow at least 4096 output tokens (8192 for coding); any
 # max_tokens below 1024 is silently raised to 1024 by the gateway. Streaming usage is always
-# zeros, so metrics must come from non-stream usage or an estimate. DeepSeek official flash is the
+# zeros, so metrics must come from non-stream usage or an estimate. Nous DeepSeek 1017 is the
 # fallback once Zoo rate limits persist (or after the free pass ends).
 _ZOO_GLM = {"model": "zoo/glm-5.3-flash", "base_url": ZOO_BASE_URL, "wire": "openai-chat", "key": "zoo",
-            "fallback": "deepseek:deepseek-flash", "backoff_s": [15, 30, 60]}
+            "fallback": "nous:deepseek-v4.1-flash-1017", "backoff_s": [15, 30, 60]}
 # Nous Portal, Tencent Hy4 Flash (owner request 2026-11-24). The key allows 180 requests/min and
 # 7,560/hour shared across every model, so nous attempts are paced: at most `max_active` run at
 # once and starts are spaced by `start_spacing_s` (both overridable per host in cfg.models).
@@ -108,7 +113,7 @@ MODELS = {
     "deepseek-flash": dict(_GO_FLASH),  # unprefixed -> Go (0.1.15)
     "deepseek-v4.1-flash": dict(_GO_FLASH),  # unprefixed / default briefs -> Go
     "go:deepseek-v4.1-flash": dict(_GO_FLASH),
-    "zoo:glm-5.3-flash": dict(_ZOO_GLM),  # free Zoo pass; Go fallback when the pass ends
+    "zoo:glm-5.3-flash": dict(_ZOO_GLM),  # free Zoo pass; Nous 1017 fallback when the pass ends
     "deepseek:deepseek-flash": dict(_DEEPSEEK_FLASH),
     "deepseek:deepseek-v4.1-flash": dict(_DEEPSEEK_FLASH),
     "nous:hy4-flash": dict(_NOUS_HY4),  # Nous Portal; paced, falls back to Go DeepSeek flash
@@ -242,7 +247,7 @@ def redact(s):
 # can leave a complete event or no event, never a torn one. Delivery is a local signal
 # (file or Unix socket); the outbox file itself is the replayable source of truth.
 LANDED_EVENT_TYPE = "rizzstack.bee.landed.v1"
-LANDED_EVENT_SCHEMA = "https://rizstack.dev/schemas/bee-landed/v1"
+LANDED_EVENT_SCHEMA = "https://github.com/mojomast/workflow/schemas/bee-landed.schema.json"
 LANDED_DATA_SCHEMA = "rizzstack.bee-landed/1"
 LANDED_EVENT_ID_PREFIX = "urn:rizzstack:bee-landed:"
 _LANDED_EVIDENCE_KEYS = ("schema", "feature_id", "job_id", "task_id", "attempt_id",
@@ -1861,14 +1866,95 @@ class FakeBackend:
                  "stdout_tail": "", "stderr_tail": "", "log_file": None} for i, c in enumerate(a["brief"].get("commands") or [])]
     async def check_cleanup(self, a): pass
 
+def _clip_text(value, limit, collapse_ws=False):
+    text = str(value).strip()
+    if collapse_ws:
+        text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+def _is_scalar(value):
+    return isinstance(value, (str, int, float)) and not isinstance(value, bool)
+
+def _finding_scalar_lines(findings):
+    lines = []
+    for key in ("failure_id", "verdict", "summary"):
+        value = findings.get(key)
+        if not _is_scalar(value):
+            continue
+        text = _clip_text(value, 2000 if key == "summary" else 200, collapse_ws=True)
+        if text:
+            lines.append(f"- {key}: {text}")
+    return lines
+
+def _source_refs(sources):
+    refs = []
+    for source in sources[:20]:
+        if not isinstance(source, dict):
+            continue
+        ref = source.get("ref")
+        if not _is_scalar(ref):
+            continue
+        kind = source.get("kind")
+        prefix = f"{kind}: " if isinstance(kind, str) and kind else ""
+        refs.append(_clip_text(prefix + str(ref), 300, collapse_ws=True))
+    return refs
+
+def _rejected_entries(alternatives):
+    entries = [_clip_text(x, 300, collapse_ws=True) for x in alternatives[:20] if _is_scalar(x)]
+    return [x for x in entries if x]
+
+def _finding_block(label, entries):
+    if not entries:
+        return None
+    return f"- {label}:\n" + "\n".join(f"  - {entry}" for entry in entries)
+
+def _render_findings(findings):
+    if not isinstance(findings, dict):
+        return None
+    lines = _finding_scalar_lines(findings)
+    sources = findings.get("sources")
+    if isinstance(sources, list):
+        block = _finding_block("sources", _source_refs(sources))
+        if block:
+            lines.append(block)
+    alternatives = findings.get("rejected_alternatives")
+    if isinstance(alternatives, list):
+        block = _finding_block("rejected alternatives", _rejected_entries(alternatives))
+        if block:
+            lines.append(block)
+    if not lines:
+        return None
+    return _clip_text("# Research findings\n" + "\n".join(lines), 4000)
+
+def _render_tests(tests):
+    if not isinstance(tests, list):
+        return None
+    names = [_clip_text(x, 500, collapse_ws=True) for x in tests[:50]
+             if isinstance(x, str) and x.strip()]
+    if not names:
+        return None
+    section = "# Tests that must pass\n" + "\n".join(f"- {name}" for name in names)
+    return _clip_text(section, 8000)
+
 def render_prompt(b):
     parts = [f"# Objective\n{b['objective']}"]
     for k, title in [("deliverables", "Deliverables"), ("acceptance", "Acceptance criteria"), ("assigned_files", "Files you may change"),
                      ("commands", "Tools/commands you may run"), ("deps", "Dependencies/context")]:
         if b.get(k): parts.append(f"# {title}\n" + "\n".join(f"- {x}" for x in b[k]))
+    findings = _render_findings(b.get("findings"))
+    if findings: parts.append(findings)
+    tests = _render_tests(b.get("tests"))
+    if tests: parts.append(tests)
     parts.append("# Rules\n- Work only inside the working directory.\n- Do not start subagents.\n- Do not print secrets or environment variables.")
     parts.append("# Return format\nEnd with a JSON block: {\"summary\":..., \"changed_files\":[...], \"checks\":[{\"name\":...,\"command\":...,\"passed\":bool}], \"open_issues\":[...]}")
     return "\n\n".join(parts)
+
+def _string_entries(value):
+    """The string entries of a brief list field; anything else is ignored."""
+    return [x for x in value or [] if isinstance(x, str)]
+
+def _nonempty_list(value):
+    return isinstance(value, list) and bool(value)
 
 def normalize_brief(b):
     """Accept both brief shapes: v0.1.1 (acceptance is a string list) and bundlebees main at c10aa42
@@ -1877,9 +1963,12 @@ def normalize_brief(b):
     acc = b.get("acceptance") if isinstance(b, dict) else None
     if isinstance(acc, dict):
         b = dict(b)
-        crit = [x for x in acc.get("criteria") or [] if isinstance(x, str)]
-        b["acceptance"] = crit + [f"Run: {c}" for c in acc.get("commands") or [] if isinstance(c, str)] + \
-                          [f"Test passes: {t}" for t in acc.get("tests") or [] if isinstance(t, str)]
+        crit = _string_entries(acc.get("criteria"))
+        acc_tests = _string_entries(acc.get("tests"))
+        b["acceptance"] = crit + [f"Run: {c}" for c in _string_entries(acc.get("commands"))] + \
+                          [f"Test passes: {t}" for t in acc_tests]
+        if acc_tests and not _nonempty_list(b.get("tests")):
+            b["tests"] = list(acc_tests)
     return b
 
 def _budget_requirement_error(cfg, b):
@@ -1959,6 +2048,147 @@ def journal_record_valid(obj):
     return isinstance(obj, dict) and isinstance(obj.get("attempt_id"), str) and isinstance(obj.get("state"), str)
 
 
+# ---------------------------------------------------------------- capacity (/v1/capacity)
+# Admission inputs for a coordinator that fills bee slots ("go max"). Every value that cannot be
+# read is None -- never a guess -- so the caller fails closed. Nothing here starts, stops or
+# changes an attempt, and nothing here carries a token, path, host or provider URL.
+CAPACITY_SCHEMA = "hyvv.capacity/1"
+CAPACITY_LANES = ("kimi", "nous", "go", "other")
+CAPACITY_RATE_LIMIT_WINDOW_S = 600
+CAPACITY_DOCKER_TTL_S = 30      # refresh the cached Docker probe at most this often
+CAPACITY_DOCKER_STALE_S = 120   # an older probe reads as unknown (ok: None)
+CAPACITY_DOCKER_TIMEOUT_S = 10
+
+def capacity_lane(cfg, model):
+    """Provider lane of a model id: kimi, nous, go or other. Unknown ids are `other`."""
+    if not model:
+        return "other"
+    try:
+        key = model_spec(cfg, model).get("key")
+    except Exception:
+        key = None
+    if key is None:  # classification only (never routing): fall back to the id's prefix
+        key = str(model).split(":", 1)[0] if ":" in str(model) else None
+    return key if key in ("kimi", "nous", "go") else "other"
+
+def parse_meminfo(text):
+    vals = {}
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] in ("MemTotal:", "MemAvailable:") and parts[1].isdigit():
+            vals[parts[0][:-1]] = int(parts[1]) // 1024
+    if "MemTotal" not in vals or "MemAvailable" not in vals:
+        return None
+    return {"mem_total_mb": vals["MemTotal"], "mem_available_mb": vals["MemAvailable"]}
+
+def _host_memory():
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = _MS(); ms.dwLength = ctypes.sizeof(_MS)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                return None
+            return {"mem_total_mb": int(ms.ullTotalPhys // 1048576), "mem_available_mb": int(ms.ullAvailPhys // 1048576)}
+        return parse_meminfo(Path("/proc/meminfo").read_text("utf-8"))
+    except Exception:
+        return None
+
+def _cpu_times():
+    """Cumulative (idle, total) CPU time, or None when unreadable."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            idle, kern, user = (ctypes.c_ulonglong(), ctypes.c_ulonglong(), ctypes.c_ulonglong())
+            if not ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user)):
+                return None
+            return idle.value, kern.value + user.value  # kernel time includes idle time
+        f = Path("/proc/stat").read_text("utf-8").splitlines()[0].split()
+        nums = [int(x) for x in f[1:]]
+        return nums[3] + (nums[4] if len(nums) > 4 else 0), sum(nums)
+    except Exception:
+        return None
+
+def cpu_busy_pct(prev, cur):
+    if not prev or not cur:
+        return None
+    didle, dtotal = cur[0] - prev[0], cur[1] - prev[1]
+    if dtotal <= 0:
+        return None
+    return round(max(0.0, min(100.0, 100.0 * (1 - didle / dtotal))), 1)
+
+_CPU_LAST = {"sample": None, "at": 0.0, "pct": None}
+_CPU_LOCK = threading.Lock()
+
+def host_snapshot():
+    mem = _host_memory() or {"mem_total_mb": None, "mem_available_mb": None}
+    with _CPU_LOCK:
+        cur = _cpu_times()
+        prev = _CPU_LAST["sample"]
+        if cur and (prev is None or time.time() - _CPU_LAST["at"] > 60):
+            time.sleep(0.25)  # a first (or very old) sample needs a short second window
+            prev, cur = cur, _cpu_times()
+        pct = cpu_busy_pct(prev, cur)
+        if pct is None and time.time() - _CPU_LAST["at"] < 10:
+            pct = _CPU_LAST["pct"]  # back-to-back reads: reuse the window just measured
+        if cur:
+            _CPU_LAST.update(sample=cur, at=time.time(), pct=pct)
+    return {"mem_total_mb": mem["mem_total_mb"], "mem_available_mb": mem["mem_available_mb"],
+            "cpu_count": os.cpu_count(), "cpu_busy_pct": pct}
+
+class DockerProbe:
+    """Cached, read-only `docker info` probe. A hung Docker daemon costs one bounded timeout
+    in a background thread, never an HTTP handler."""
+    ARGV = ["docker", "info", "--format", "{{.NCPU}} {{.MemTotal}} {{.ContainersRunning}} {{.ServerVersion}}"]
+
+    def __init__(self, runner=None):
+        self._runner = runner or _proc_run
+        self._lock = threading.Lock()
+        self._busy = False
+        self._at = 0.0
+        self._snap = {"ok": None, "ncpu": None, "mem_total_mb": None, "containers_running": None, "detail": "not_probed"}
+
+    def refresh(self):
+        try:
+            rc, out, _err = self._runner(list(self.ARGV), timeout=CAPACITY_DOCKER_TIMEOUT_S)
+            if rc != 0:
+                snap = {"ok": False, "ncpu": None, "mem_total_mb": None, "containers_running": None, "detail": f"exit_{rc}"}
+            else:
+                parts = (out or "").split()
+                ncpu, mem, running = (int(parts[0]), int(parts[1]), int(parts[2])) if len(parts) >= 3 else (None, None, None)
+                snap = {"ok": True, "ncpu": ncpu, "mem_total_mb": (mem // 1048576) if mem is not None else None,
+                        "containers_running": running, "detail": "ok"}
+        except Exception as ex:
+            import subprocess
+            detail = "timeout" if isinstance(ex, subprocess.TimeoutExpired) else ("unparseable" if isinstance(ex, ValueError) else "unreachable")
+            snap = {"ok": False, "ncpu": None, "mem_total_mb": None, "containers_running": None, "detail": detail}
+        with self._lock:
+            self._snap, self._at, self._busy = snap, time.time(), False
+
+    def _kick(self):
+        with self._lock:
+            if self._busy or (self._at and time.time() - self._at < CAPACITY_DOCKER_TTL_S):
+                return
+            self._busy = True
+        threading.Thread(target=self.refresh, daemon=True).start()
+
+    def snapshot(self, kick=True):
+        if kick:
+            self._kick()
+        with self._lock:
+            snap, at = dict(self._snap), self._at
+        age = round(time.time() - at, 1) if at else None
+        if at and age > CAPACITY_DOCKER_STALE_S:
+            snap = {"ok": None, "ncpu": None, "mem_total_mb": None, "containers_running": None, "detail": "stale"}
+        snap["age_s"] = age
+        return snap
+
+
 class Launcher:
     def __init__(self, cfg, backend):
         self.cfg, self.backend = cfg, backend
@@ -1973,6 +2203,9 @@ class Launcher:
         self.started_at = time.time(); self.loop_lag_ms = 0.0
         self.landing_conflicts = []
         self._cleaned_aids = set()
+        self.docker_probe = DockerProbe()
+        self._rate_limits = []  # (at, lane) of recent provider 429s, for /v1/capacity
+        self._cleaned_sandboxes = set()
         self._load()
         self.rails = None
         if cfg.get('rails_enabled') is True:
@@ -2133,12 +2366,20 @@ class Launcher:
         self.kick(); return a, True
 
     def cancel(self, aid):
+        prestart_sandbox = False
         with self.lock:
             a = self.attempts.get(aid)
             if not a: return None
             if a["state"] in TERMINAL: return a
-            if a["state"] in ("queued", "backoff"): self._set(a, "cancelled", "cancelled before start")
+            if a["state"] in ("queued", "backoff"):
+                self._set(a, "cancelled", "cancelled before start")
+                prestart_sandbox = bool(a.get("sandbox"))
             else: a["cancel"] = True; self._set(a, "cancel_requested", "interrupt sent")
+        if prestart_sandbox:
+            # A resumable rate-limited attempt still owns its sandbox while it is parked in
+            # backoff; cancelling before the retry starts must not leak it.
+            try: asyncio.run_coroutine_threadsafe(self._cleanup_once(a), self.loop)
+            except RuntimeError: pass  # loop closed: same no-op the pre-start cancel had
         self.kick(); return a
 
     def landed_result_path(self, a):
@@ -2207,9 +2448,20 @@ class Launcher:
         return True
 
     async def _cleanup_once(self, a, timeout=None):
-        """Idempotent teardown of only this attempt's recorded sandbox. Safe to call from finally."""
+        """Idempotent teardown of only this attempt's recorded sandbox. Safe to call from finally.
+
+        The ledger is keyed by sandbox, not attempt id: a retry keeps the same attempt id but
+        gets a new sandbox, and that second sandbox must also be torn down exactly once.
+        """
         aid = a.get("attempt_id")
-        if not aid or aid in self._cleaned_aids:
+        if not aid:
+            return
+        sandbox = a.get("sandbox")
+        if sandbox:
+            if sandbox in self._cleaned_sandboxes:
+                return
+            self._cleaned_sandboxes.add(sandbox)
+        elif aid in self._cleaned_aids:
             return
         self._cleaned_aids.add(aid)
         try:
@@ -2253,6 +2505,44 @@ class Launcher:
                 if rec and rec.get("state") in JOURNAL_ACTIVE:
                     active += 1
         return active, tmp
+
+    def note_rate_limit(self, model, at=None):
+        """Record one provider rate limit for /v1/capacity (lane only, never the error text)."""
+        lane = capacity_lane(self.cfg, model)
+        now = time.time()
+        with self.lock:
+            self._rate_limits.append((float(at if at is not None else now), lane))
+            cutoff = now - CAPACITY_RATE_LIMIT_WINDOW_S
+            self._rate_limits = [r for r in self._rate_limits if r[0] >= cutoff][-1000:]
+
+    def capacity_status(self):
+        now = time.time()
+        with self.lock:
+            active = self._active()
+            queued = [self.attempts[i] for i in self._queue()]
+            by_active = {k: 0 for k in CAPACITY_LANES}
+            by_queued = {k: 0 for k in CAPACITY_LANES}
+            for a in active:
+                by_active[capacity_lane(self.cfg, a.get("model"))] += 1
+            for a in queued:
+                by_queued[capacity_lane(self.cfg, a.get("model"))] += 1
+            cutoff = now - CAPACITY_RATE_LIMIT_WINDOW_S
+            limits = {k: {"count": 0, "last_at": None} for k in CAPACITY_LANES}
+            for at, lane in self._rate_limits:
+                if at >= cutoff:
+                    limits[lane]["count"] += 1
+                    limits[lane]["last_at"] = max(limits[lane]["last_at"] or 0.0, at)
+            max_c = self.cfg["max_concurrent"]
+        try:
+            jact, jtmp = self.journal_counts()
+            split = (len(active) != jact) or (jtmp > 0)
+        except Exception:
+            split = True  # unreadable journal: report the worst case
+        return {"schema": CAPACITY_SCHEMA, "observed_at": round(now, 3), "max_concurrent": max_c,
+                "active": len(active), "queued": len(queued), "split_brain": split,
+                "active_by_lane": by_active, "queued_by_lane": by_queued,
+                "host": host_snapshot(), "docker": self.docker_probe.snapshot(),
+                "rate_limits": {"window_s": CAPACITY_RATE_LIMIT_WINDOW_S, "by_lane": limits}}
 
     def publish_runtime_status(self):
         live = len(self._active())
@@ -2453,6 +2743,20 @@ class Launcher:
                 deadline = started + budget
                 watchdog = asyncio.ensure_future(self._budget_watchdog(a, asyncio.current_task(), deadline, budget, started))
             if a.get("kind") == "check": return await self._control_check(a)
+            if a.get("run_id") and a.get("resume_pending"):
+                a.pop("resume_pending", None)
+                try:
+                    ids = await self.backend.resume(a, RESUME_PROMPT)
+                    if isinstance(ids, dict):
+                        a.update({k: v for k, v in ids.items() if v is not None})
+                    self._set(a, "running", "run resumed after a rate limit")
+                except Exception:
+                    # Resuming is best-effort: if the backend cannot continue this run, tear the
+                    # old sandbox down and let this controller start a fresh one below.
+                    await self._cleanup_once(a)
+                    for k in ("run_id", "sandbox", "sandbox_id", "workdir", "local_base_rev", "seed_commit"):
+                        a.pop(k, None)
+                    a["cursor"] = 0
             if not a.get("run_id"):
                 agy = a.get("kind") == "agy-cua"
                 if a.get("pool") and not a.get("model"):
@@ -2472,8 +2776,14 @@ class Launcher:
                         a["rate_limited"], a["cursor"] = 0, 0
                         self._set(a, "queued", f"{src} key not configured on this PC; falling back to {fb}"); return
                     self._set(a, "failed", "provider key not configured on this PC"); return
+                # A restarted attempt may reuse the deterministic sandbox name its previous
+                # incarnation was torn down under; a fresh create is a new sandbox to clean.
+                for name in (a.get("sandbox"), sandbox_name(a) if a.get("model") else None):
+                    if name: self._cleaned_sandboxes.discard(name)
                 ids = await self.backend.start(a, key); del key
-                a.update(ids); self._set(a, "running", ("agy" if agy else "opencode") + " run started", {"run_id": ids["run_id"]})
+                a.update(ids)
+                if ids.get("sandbox"): self._cleaned_sandboxes.discard(ids["sandbox"])
+                self._set(a, "running", ("agy" if agy else "opencode") + " run started", {"run_id": ids["run_id"]})
             last_hb = last_ev = time.time()
             while True:
                 if a.get("budget_stop") or (deadline and time.time() >= deadline):
@@ -2537,7 +2847,8 @@ class Launcher:
                 with self.lock:
                     budget_owned = aid in self._budget_finishing or (
                         a.get("budget_stop") and a.get("state") not in TERMINAL)
-                if not budget_owned:
+                    resuming = bool(a.get("resume_pending")) and a.get("state") not in TERMINAL
+                if not budget_owned and not resuming:
                     try:
                         await self._cleanup_once(a)
                     except Exception:
@@ -2746,17 +3057,19 @@ class Launcher:
         self._set(a, "failed", f"{reason}; model unavailable and no remaining fallback")
 
     async def _fallback_to_deepseek(self, a, reason="go monthly-limit 429"):
-        # Retry once on DeepSeek official after a Go monthly-limit 429. Records fallback="deepseek".
+        # Retry once on Nous DeepSeek 1017 after a Go monthly-limit 429. Records fallback="ds1017n".
+        self.note_rate_limit(a.get("model"))
         await self._cleanup_once(a)
-        nxt = "deepseek:deepseek-flash"
-        a["fallback"] = "deepseek"
+        nxt = "nous:deepseek-v4.1-flash-1017"
+        a["fallback"] = "ds1017n"
         a["model"] = nxt
-        a.setdefault("model_history", []).append({"model": nxt, "fallback": "deepseek", "after": reason, "at": time.time()})
+        a.setdefault("model_history", []).append({"model": nxt, "fallback": "ds1017n", "after": reason, "at": time.time()})
         a["rate_limited"], a["cursor"] = 0, 0
         for k in ("run_id", "sandbox"): a.pop(k, None)
-        self._set(a, "queued", f"{reason}; fallback=deepseek")
+        self._set(a, "queued", f"{reason}; fallback=ds1017n")
 
     async def _backoff(self, a, exhausted=False, reason="provider rate limit", retry_after=None):
+        self.note_rate_limit(a.get("model"))
         if a.get("pool") and a.get("model") in FREE_POOL:
             await self._cleanup_once(a)
             bad = a["model"]; self.model_health[bad]["last_limited"] = time.time(); a["tried"].append(bad)
@@ -2770,8 +3083,8 @@ class Launcher:
             self._set(a, "queued", f"{reason} on {bad}; switching to {nxt}"); return
         spec = model_spec(self.cfg, a.get("model"), a.get("brief"))
         n = a["rate_limited"]; delays = spec.get("backoff_s") or self.cfg["backoff_s"]
-        await self._cleanup_once(a)
         if exhausted or n >= len(delays):
+            await self._cleanup_once(a)
             fb = spec.get("fallback")
             if self._may_fallback(a, spec):
                 a["fallback_hops"] = self._fallback_hops(a) + 1
@@ -2780,6 +3093,8 @@ class Launcher:
                 for k in ("run_id", "sandbox"): a.pop(k, None)
                 self._set(a, "queued", f"{reason} on {spec['name']}; falling back to {fb}"); return
             self._set(a, "failed", f"{reason} persisted after retries"); return
+        resumable = bool(a.get("run_id") and a.get("sandbox")
+                         and callable(getattr(self.backend, "resume", None)))
         a["rate_limited"] = n + 1
         delay = delays[n]
         if retry_after is not None:
@@ -2788,8 +3103,15 @@ class Launcher:
             delay = retry_after
         a["retry_at"] = time.time() + delay
         a["retry_after_s"] = retry_after
-        for k in ("run_id", "sandbox"): a.pop(k, None)
-        a["cursor"] = 0
+        if resumable:
+            # Same model, and the backend can continue the run: keep the sandbox, run id and
+            # cursor; the retry sends a short continue turn instead of a fresh full brief.
+            a["resume_pending"] = True
+        else:
+            # A model switch (or a backend without resume) restarts from a fresh sandbox.
+            await self._cleanup_once(a)
+            for k in ("run_id", "sandbox"): a.pop(k, None)
+            a["cursor"] = 0
         hint = " (provider Retry-After)" if retry_after is not None else " (queued)"
         self._set(a, "backoff", f"{reason}; retry {n + 1}/{len(delays)} in {delay:g}s{hint}")
         self.loop.call_later(delay + 0.05, self.kick)
@@ -3091,6 +3413,8 @@ def make_handler(L, token):
                 return self._send(200, {"ok": True, "version": VERSION, "max_concurrent": L.cfg["max_concurrent"], "active": st["active"], "journal_active": st["journal_active"], "journal_tmp": st["journal_tmp"], "split_brain": st["split_brain"], "queued": len(L._queue()), "model": L.cfg["model"],
                                        "configured_model": L.cfg["model"], "effective_model": eff_model, "models": allow, "uptime_s": round(time.time() - L.started_at), "loop_lag_ms": round(L.loop_lag_ms, 1),
                                        **({"deployment_receipt": rc} if (rc := deployment_receipt(L.cfg)) is not None else {})})
+            if p == ["v1", "capacity"]:  # admission inputs for go-max fillers (hyvv.capacity/1)
+                return self._send(200, L.capacity_status())
             if p == ["v1", "landing", "events"]:  # authenticated export of the durable canonical outbox
                 if _landing_export is None:
                     return self._send(501, {"error": "landing export is unavailable"})

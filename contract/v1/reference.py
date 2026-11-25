@@ -576,3 +576,11 @@ def usage_unknown_template(**overrides: Any) -> dict[str, Any]:
     }
     rec.update(overrides)
     return rec
+
+
+def usage_unknown_template_v2(**overrides: Any) -> dict[str, Any]:
+    """A bee.usage/v2 record: the v1 template with open provider labels (for example nous or kimi)."""
+    rec = usage_unknown_template()
+    rec["schema_version"] = "bee.usage/v2"
+    rec.update(overrides)
+    return rec

@@ -16,7 +16,7 @@ TOKEN = "t" * 40
 
 def _pop_keys():
     saved = {}
-    for k in ("DEEPSEEK_API_KEY", "ORBIT_WORKER_GO_KEY"):
+    for k in ("DEEPSEEK_API_KEY", "ORBIT_WORKER_GO_KEY", "ORBIT_WORKER_NOUS_KEY"):
         if k in os.environ:
             saved[k] = os.environ.pop(k)
     return saved
@@ -27,7 +27,7 @@ class DeepSeekModels(unittest.TestCase):
         self._saved = _pop_keys()
 
     def tearDown(self):
-        for k in ("DEEPSEEK_API_KEY", "ORBIT_WORKER_GO_KEY"):
+        for k in ("DEEPSEEK_API_KEY", "ORBIT_WORKER_GO_KEY", "ORBIT_WORKER_NOUS_KEY"):
             os.environ.pop(k, None)
         os.environ.update(self._saved)
 
@@ -114,10 +114,10 @@ class DeepSeekModels(unittest.TestCase):
 
     def test_free_fallback_aliases_to_deepseek(self):
         fb = L.MODELS["deepseek-v4.1-flash-free"]["fallback"]
-        self.assertEqual(fb, "deepseek:deepseek-flash")
+        self.assertEqual(fb, "nous:deepseek-v4.1-flash-1017")
         spec = L.model_spec(self._cfg(), fb)
-        self.assertEqual(spec["key"], "deepseek")
-        self.assertEqual(spec["base_url"], L.DEEPSEEK_BASE_URL)
+        self.assertEqual(spec["key"], "nous")
+        self.assertEqual(spec["base_url"], L.NOUS_BASE_URL)
 
 
 class DeepSeekDispatch(unittest.TestCase):
@@ -126,9 +126,10 @@ class DeepSeekDispatch(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="lch12d-")
         (Path(self.tmp) / "deepseek.key").write_text("fake-deepseek-key")
         (Path(self.tmp) / "go.key").write_text("fake-go-key")
+        (Path(self.tmp) / "nous.key").write_text("fake-nous-key")
 
     def tearDown(self):
-        for k in ("DEEPSEEK_API_KEY", "ORBIT_WORKER_GO_KEY"):
+        for k in ("DEEPSEEK_API_KEY", "ORBIT_WORKER_GO_KEY", "ORBIT_WORKER_NOUS_KEY"):
             os.environ.pop(k, None)
         os.environ.update(self._saved)
 
@@ -268,13 +269,14 @@ class DeepSeekDispatch(unittest.TestCase):
                 time.sleep(0.05)
             a = la.attempts["att_ds00000006"]
             self.assertEqual(a["state"], "succeeded", a.get("detail"))
-            self.assertEqual(a.get("fallback"), "deepseek")
-            self.assertEqual(a["model"], "deepseek:deepseek-flash")
+            self.assertEqual(a.get("fallback"), "ds1017n")
+            self.assertEqual(a["model"], "nous:deepseek-v4.1-flash-1017")
             spec = L.model_spec(la.cfg, a["model"], a.get("brief"))
-            self.assertEqual(spec["key"], "deepseek")
+            self.assertEqual(spec["key"], "nous")
+            self.assertEqual(spec["base_url"], L.NOUS_BASE_URL)
             # FakeBackend records models used across start() calls
             self.assertIn("deepseek-v4.1-flash", la.backend.models)
-            self.assertIn("deepseek:deepseek-flash", la.backend.models)
+            self.assertIn("nous:deepseek-v4.1-flash-1017", la.backend.models)
         finally:
             srv.shutdown()
 
@@ -293,7 +295,7 @@ class DeepSeekDispatch(unittest.TestCase):
                 time.sleep(0.05)
             a = la.attempts["att_ds00000007"]
             self.assertIn(a["state"], ("failed", "backoff", "queued"))
-            self.assertNotEqual(a.get("fallback"), "deepseek")
+            self.assertNotEqual(a.get("fallback"), "ds1017n")
         finally:
             srv.shutdown()
 

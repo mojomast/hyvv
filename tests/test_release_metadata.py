@@ -83,7 +83,9 @@ class MetadataAgrees(unittest.TestCase):
                     self.assertIn(flag.lower(), params, f"{doc}: `{line.strip()}` uses -{flag}")
         block = re.search(r"\$payload = @\((.*?)\)", ps, re.S).group(1)
         for rel in re.findall(r'"([^"]+)"', block):
-            self.assertTrue((ROOT / rel).is_file(), f"install.ps1 payload {rel} missing")
+            entry = ROOT / rel
+            # A payload entry is a file, or a pinned package directory copied recursively.
+            self.assertTrue(entry.is_file() or entry.is_dir(), f"install.ps1 payload {rel} missing")
 
     def test_readme_install_examples(self):
         readme = _read("README.md")

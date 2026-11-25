@@ -114,11 +114,12 @@ bindir="$HOME/.local/bin"
 mkdir -p "$bindir"
 ln -sfn "$prefix/current/.venv/bin/hyvv" "$bindir/hyvv"
 
-# launcher imports provisioning from the payload beside it; a wheel that omits
-# either module silently leaves launcher._provisioning as None. Fail here.
+# launcher imports provisioning, landing_export and the Rails runtime from the
+# payload beside it; a wheel that omits any of them leaves launcher._provisioning
+# as None or breaks Rails export at request time. Fail here.
 venv_python="$dest/.venv/bin/python"
-if ! (cd "$dest" && "$venv_python" -c 'import launcher, provisioning, landing_export' >/dev/null 2>&1); then
-  echo "installed runtime is incomplete: launcher, provisioning and landing_export must all import" >&2
+if ! (cd "$dest" && "$venv_python" -c 'import launcher, provisioning, landing_export, rails_emitter, rails_export, rails_log_source' >/dev/null 2>&1); then
+  echo "installed runtime is incomplete: launcher, provisioning, landing_export and the Rails modules must all import" >&2
   exit 1
 fi
 
