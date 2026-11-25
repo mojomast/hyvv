@@ -528,6 +528,73 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /v1/capacity:
+    get:
+      tags: [host]
+      operationId: getCapacity
+      summary: Admission inputs for a coordinator that fills bee slots
+      description: >-
+        Every attempt this launcher sees (any coordinator), counted by provider lane, plus host
+        memory and CPU, a cached read-only Docker probe and recent provider rate limits per lane.
+        Unknown values are null, never guessed, so a caller can fail closed. Never carries tokens,
+        paths, hosts or provider URLs.
+      x-hyvv-status: launcher-0.1.19
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: hyvv.capacity/1
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema, observed_at, max_concurrent, active, queued, split_brain,
+                           active_by_lane, queued_by_lane, host, docker, rate_limits]
+                properties:
+                  schema: {const: hyvv.capacity/1}
+                  observed_at: {type: number}
+                  max_concurrent: {type: integer}
+                  active: {type: integer}
+                  queued: {type: integer}
+                  split_brain: {type: boolean}
+                  active_by_lane:
+                    type: object
+                    description: Lanes are kimi, nous, go and other (by provider key).
+                    additionalProperties: {type: integer}
+                  queued_by_lane:
+                    type: object
+                    additionalProperties: {type: integer}
+                  host:
+                    type: object
+                    properties:
+                      mem_total_mb: {type: [integer, "null"]}
+                      mem_available_mb: {type: [integer, "null"]}
+                      cpu_count: {type: [integer, "null"]}
+                      cpu_busy_pct: {type: [number, "null"]}
+                  docker:
+                    type: object
+                    description: Cached `docker info` probe (read-only, bounded by a timeout); ok is null when never probed or stale.
+                    properties:
+                      ok: {type: [boolean, "null"]}
+                      age_s: {type: [number, "null"]}
+                      ncpu: {type: [integer, "null"]}
+                      mem_total_mb: {type: [integer, "null"]}
+                      containers_running: {type: [integer, "null"]}
+                      detail: {type: string}
+                  rate_limits:
+                    type: object
+                    properties:
+                      window_s: {type: integer}
+                      by_lane:
+                        type: object
+                        additionalProperties:
+                          type: object
+                          properties:
+                            count: {type: integer}
+                            last_at: {type: [number, "null"]}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /v1/landing/events:
     get:
       tags: [host]

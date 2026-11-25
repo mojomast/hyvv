@@ -22,6 +22,7 @@
     "POST /v1/route": "launcher-0.1.19",
     "GET /v1/provision/capabilities": "launcher-0.1.19",
     "GET /v1/landing/events": "launcher-0.1.19",
+    "GET /v1/capacity": "launcher-0.1.19",
     "GET /v1/leases": "specified",
     "POST /v1/leases": "specified",
     "DELETE /v1/leases/{lease_id}": "specified",
