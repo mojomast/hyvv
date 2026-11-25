@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mojomast/workflow/observability/schemas/resource-sample.schema.json",
+  "title": "Container or host resource sample (resource.sample/v1)",
+  "description": "A point sample (default every 10 s) for one bee container or one host, or a per-attempt rollup of the container samples. host_alias is an operator alias such as brrrrrrrr or moltussy-1, never a hostname or address.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "ts",
+    "scope",
+    "source",
+    "host_alias"
+  ],
+  "properties": {
+    "schema": {
+      "const": "resource.sample/v1"
+    },
+    "schema_version": {
+      "const": "v1"
+    },
+    "ts": {
+      "$ref": "common.schema.json#/$defs/utc_timestamp"
+    },
+    "scope": {
+      "enum": [
+        "container",
+        "host",
+        "attempt_rollup"
+      ]
+    },
+    "source": {
+      "enum": [
+        "docker_stats",
+        "cgroup",
+        "proc",
+        "unknown"
+      ]
+    },
+    "host_alias": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,31}$"
+    },
+    "attempt_id": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "project": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "container_label": {
+      "$ref": "common.schema.json#/$defs/nullable_id"
+    },
+    "mem_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "mem_peak_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "mem_limit_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "cpu_ratio": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 256
+    },
+    "cpu_limit": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 256
+    },
+    "pids": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "oom_killed": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "exit_code": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": -1024,
+      "maximum": 1024
+    },
+    "net_rx_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "net_tx_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "disk_free_ratio": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "load1": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "samples": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    }
+  }
+}

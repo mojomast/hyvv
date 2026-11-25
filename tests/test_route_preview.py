@@ -30,6 +30,7 @@ spec.loader.exec_module(L)
 ZOO = "zoo:glm-5.3-flash"
 GO_FLASH = "deepseek-v4.1-flash"
 DS_FLASH = "deepseek:deepseek-flash"
+D1017 = "nous:deepseek-v4.1-flash-1017"
 ZOO_WIRE = "zoo/glm-5.3-flash"
 ACCESS = "t" * 40
 ZOO_MATERIAL = "fake-zoo-credential"
@@ -137,7 +138,7 @@ class RoutePreview(unittest.TestCase):
             expected_source = "go"
             self.assertEqual(eff["key"], expected_source)
             # The Go default is the host default route: no fallback alias is configured on it
-            # (zoo carried DS_FLASH; the go spec intentionally does not).
+            # (zoo carried D1017; the go spec intentionally does not).
             self.assertIsNone(body["fallback"])
             self.assertEqual(body["effective_model"], "deepseek-v4.1-flash")
             self.assertIn("tier standard", body["why"])
@@ -198,7 +199,10 @@ class RoutePreview(unittest.TestCase):
             self.assertEqual(eff["model"], ZOO_WIRE)
             expected_source = "zoo"
             self.assertEqual(eff["key"], expected_source)
-            self.assertEqual(body["fallback"], DS_FLASH)
+            self.assertEqual(body["fallback"], D1017)
+            fallback = L.model_spec(la.cfg, body["fallback"])
+            self.assertEqual(fallback["key"], "nous")
+            self.assertEqual(fallback["base_url"], L.NOUS_BASE_URL)
             self.assertEqual(body["effective_model"], ZOO_WIRE)
             self.assertEqual(body["configured_model"], GO_FLASH)
             self.assertIn("preferred free pass", body["why"])

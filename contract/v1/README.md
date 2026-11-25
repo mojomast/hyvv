@@ -29,7 +29,7 @@ Four labels, one per endpoint and feature. `STATUS.json` is the source, every `o
 | --- | --- | --- |
 | **Implemented in launcher 0.1.19** (`launcher-0.1.19`) | `GET /v1/version`, `GET /v1/health`, `GET /v1/attempts`, `POST /v1/attempts`, `GET /v1/attempts/{attempt_id}`, `GET /v1/attempts/{attempt_id}/events`, `GET /v1/attempts/{attempt_id}/result`, `POST /v1/attempts/{attempt_id}/review`, `POST /v1/attempts/{attempt_id}/cancel`, `GET /v1/projects`, `GET /v1/containers`, `POST /v1/config`, `POST /v1/route`, `GET /v1/provision/capabilities`, `GET /v1/landing/events`, `GET /v1/capacity` | host bearer token on every route; priority_routing (an explicitly named model or tier is authoritative; priority high reroutes only a brief that names no model to DeepSeek official); go_fallback (automatic DeepSeek fallback on Go limits); GET /v1/version capabilities list |
 | **Implemented in the /v1 reference only** (`reference`) | `GET /v1/attempts/{attempt_id}/artifact` | artifact_fetch (hyvv.worker-artifact/1); per-coordinator keys plus per-attempt artifact capability; result_sha256 pinned on first read; owner-only result files (POSIX 0600, Windows owner-only ACL); bee.usage/v1 records in the artifact payload; project-state dispatch gate (409 project_parked / project_archived / project_state_changed, override plus reason, snapshot_path containment) |
-| **Specified, not implemented** (`specified`) | `GET /v1/leases`, `POST /v1/leases`, `DELETE /v1/leases/{lease_id}`, `POST /v1/leases/{lease_id}/renew` | bee-slot leases (capability leases, 429 capacity_exhausted) |
+| **Specified, not implemented** (`specified`) | `GET /v1/leases`, `POST /v1/leases`, `DELETE /v1/leases/{lease_id}`, `POST /v1/leases/{lease_id}/renew` | bee-slot leases (capability leases, 429 capacity_exhausted); bee.usage/v2 records (open provider labels) |
 | **Proposed** (`proposed`) | — | coordinator-signed briefs (HMAC over the canonical brief with the per-coordinator key, verified at settle) |
 <!-- status:end -->
 
@@ -78,3 +78,20 @@ Spec difference to flag: docs/18 §7 proposes one code, `project_parked`, for bo
 ## Specified, not implemented: bee-slot leases
 
 hyvv is the shared dispatch point for the global bee cap (default 12, CI limited to 2, optional per-coordinator caps). Coordinators acquire, renew and release leases at `/v1/leases`. A cap hit is **429 `capacity_exhausted`** with `Retry-After`. See [`LEASES.md`](LEASES.md). Schemas are versioned under `schemas/lease*.json`. Orbit and bundlebees are clients; MR.INDIA writes those adapters and their contract tests.
+
+## bee.usage/v2
+
+[`schemas/usage.v2.json`](schemas/usage.v2.json) is the next per-attempt usage
+record. It is field-for-field identical to the frozen `bee.usage/v1` record
+except for its discriminator (`schema_version: "bee.usage/v2"`) and three
+labels: `provider`, `route` and `fallback` now accept `provider_label` tokens
+(lower-case `[a-z0-9][a-z0-9._-]{0,63}`), so `nous`, `kimi`, `zoo`, `agy`,
+`free` and future routes are reported as themselves instead of `unknown`.
+`fallback` may still be null. All other fields and meanings, including unknown
+counts as null (never zero), are unchanged.
+
+`bee.usage/v1` is **frozen and unchanged**. Readers must dispatch on
+`schema_version` and accept both versions. Producers that have not moved to v2
+continue to emit v1; the v2 schema being present does not mean the launcher
+produces it yet. `usage_unknown_template_v2()` in `reference.py` is the reference
+shape. This is a record-version change, not a `/v1` HTTP API version change.
