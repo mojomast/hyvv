@@ -1,0 +1,14 @@
+{
+  "id": "hyvv-lease-tamper-gate",
+  "lease_version": "rizzstack.lease/1",
+  "source_rev": "f8c4ca2b903a391ec8de91a26b2130fc830a168a",
+  "scope": {
+    "assigned_files": [
+      ".github/scripts/lease_tamper.py",
+      ".github/workflows/ci.yml",
+      ".rizzstack/lease.json"
+    ],
+    "test_files": [],
+    "prohibited": []
+  }
+}
