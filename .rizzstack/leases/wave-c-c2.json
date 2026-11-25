@@ -1,0 +1,31 @@
+{
+  "id": "wave-c-c2",
+  "lease_version": "rizzstack.lease/1",
+  "slice": "wave-c-c2",
+  "pull_request": 65,
+  "branch": "feat/wave-c-c2",
+  "contract_id": "wave-c-c2",
+  "contract_sha256": "ccd4392ddafeacf02eca415d8a7e8045d1462db502e6d4a8ed7c99e53899533f",
+  "source_rev": "5c2e4a4f69c14f0f9fa68383b2147bd67f691318",
+  "scope": {
+    "assigned_files": [
+      "launcher.py",
+      "schemas/rizzstack-ticket.schema.json"
+    ],
+    "test_files": [
+      "tests/test_ticket_surface.py"
+    ],
+    "prohibited": [
+      ".github/workflows/**",
+      "CHANGELOG.md",
+      "pyproject.toml",
+      "uv.lock"
+    ],
+    "read_only": []
+  },
+  "derived_from": {
+    "contract": "rizzstack-t1634/contracts/wave-bc/C2.contract.json",
+    "approved_by": "owner standing approval for waves B/C and Part 2 (2026-11-25)",
+    "approved_at": "2026-11-25T17:12:00Z"
+  }
+}
