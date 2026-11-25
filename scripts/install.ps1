@@ -27,6 +27,10 @@ $payload = @(
   "launcher.py",
   "provisioning.py",
   "landing_export.py",
+  "rails_emitter.py",
+  "rails_export.py",
+  "rails_log_source.py",
+  "contrib/rizzstack_rails",
   "agy_cua_mcp.py",
   "brief.schema.json",
   "result.schema.json",
@@ -36,10 +40,13 @@ $payload = @(
 if (-not (Test-Path (Join-Path $Source "launcher.py"))) {
   throw "Source $Source does not contain launcher.py"
 }
-foreach ($required in @("provisioning.py", "landing_export.py")) {
+foreach ($required in @("provisioning.py", "landing_export.py", "rails_emitter.py", "rails_export.py", "rails_log_source.py")) {
   if (-not (Test-Path (Join-Path $Source $required))) {
     throw "Source $Source does not contain $required"
   }
+}
+if (-not (Test-Path (Join-Path $Source "contrib/rizzstack_rails/ledger.py"))) {
+  throw "Source $Source does not contain contrib/rizzstack_rails"
 }
 
 New-Item -ItemType Directory -Force $Prefix | Out-Null
@@ -92,7 +99,14 @@ function Copy-Payload {
   foreach ($rel in $payload) {
     $from = Join-Path $Source $rel
     $to = Join-Path $Prefix $rel
-    Copy-Item -Force $from $to
+    if (Test-Path $from -PathType Container) {
+      # A package entry (contrib\rizzstack_rails) must land beside the modules:
+      # rails_emitter resolves it as "contrib" next to its own file, so a flat file copy is not enough.
+      New-Item -ItemType Directory -Force $to | Out-Null
+      Copy-Item -Recurse -Force (Join-Path $from "*") $to
+    } else {
+      Copy-Item -Force $from $to
+    }
   }
   Get-ChildItem (Join-Path $Source "scripts") -Filter *.ps1 | ForEach-Object {
     if ($_.Name -eq "install.ps1" -or $_.Name -eq "install.sh") {

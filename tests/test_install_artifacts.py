@@ -28,6 +28,11 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 MODULES = ("provisioning.py", "landing_export.py")
+# The Rails export/ingest runtime. rails_emitter resolves rizzstack_rails as the
+# "contrib" directory beside its own file, so the package must be copied too.
+RAILS_MODULES = ("rails_emitter.py", "rails_export.py", "rails_log_source.py")
+RAILS_PACKAGE = "contrib/rizzstack_rails"
+RAILS_PACKAGE_FILES = ("__init__.py", "contracts.py", "ledger.py", "privacy.py", "vendor-manifest.json")
 VERSION = PYPROJECT["project"]["version"]
 
 
@@ -71,12 +76,117 @@ class PayloadDefinitions(unittest.TestCase):
     def test_install_sh_verifies_installed_runtime_imports(self):
         text = (ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
         self.assertIn("import launcher, provisioning, landing_export", text)
+        probe = re.search(r"-c 'import ([^']+)'", text)
+        if probe is None:
+            self.fail("install.sh runtime import probe not found")
+        imported = [name.strip() for name in probe.group(1).split(",")]
+        for module in ("launcher", "provisioning", "landing_export", *RAILS_MODULES):
+            self.assertIn(Path(module).stem, imported, f"install.sh probe does not import {module}")
 
     @unittest.skipUnless(shutil.which("sh"), "sh is required")
     def test_install_sh_dry_run_still_succeeds(self):
         result = run(["sh", str(ROOT / "scripts" / "install.sh"), "--dry-run"], cwd=ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("dry-run:", result.stdout)
+
+
+def copy_payload_entry(prefix: Path, rel: str) -> None:
+    """Mirror install.ps1 Copy-Payload: flat files, package directories recursively."""
+    source = ROOT / rel
+    target = prefix / rel
+    if source.is_dir():
+        shutil.copytree(source, target, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__"))
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+
+
+def assert_rails_runtime_imports_from(test: unittest.TestCase, prefix: Path) -> None:
+    """Prove the launcher and the Rails runtime import from the installed root, not the checkout."""
+    env = {key: value for key, value in os.environ.items()
+           if key not in {"PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"}}
+    env["PYTHONNOUSERSITE"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    code = (
+        "import json, launcher, rails_emitter, rails_export, rails_log_source\n"
+        "print(json.dumps({'launcher': launcher.__file__, 'emitter': rails_emitter.__file__,\n"
+        "                  'export': rails_export.__file__, 'log': rails_log_source.__file__}))\n"
+    )
+    result = run([sys.executable, "-c", code], cwd=prefix, env=env)
+    test.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    observed = json.loads(result.stdout.strip().splitlines()[-1])
+    for key in ("launcher", "emitter", "export", "log"):
+        installed = Path(observed[key]).resolve()
+        test.assertEqual(installed.parent, prefix.resolve(),
+                         f"{key} did not import from the install root: {installed}")
+
+
+class RailsPayload(unittest.TestCase):
+    """Incident: the Rails runtime was hand-copied onto a host because the installer
+    payload did not list it, so the next apply-update (install.ps1 -Update) would drop it.
+
+    The launcher imports rails_emitter, rails_export and rails_log_source at request
+    time; rails_emitter resolves rizzstack_rails as the ``contrib`` directory beside
+    its own file, so the pinned package has to be copied alongside the modules.
+    """
+
+    def test_windows_payload_carries_every_rails_runtime_module(self):
+        text = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+        names = payload_names(text, "payload")
+        for module in RAILS_MODULES:
+            self.assertIn(module, names, f"install.ps1 payload omits {module}; apply-update would drop it")
+            self.assertTrue((ROOT / module).is_file(), f"install.ps1 payload references missing {module}")
+        self.assertIn(RAILS_PACKAGE, names, "install.ps1 payload omits the pinned rizzstack_rails package")
+        for name in RAILS_PACKAGE_FILES:
+            self.assertTrue((ROOT / RAILS_PACKAGE / name).is_file(), f"{RAILS_PACKAGE}/{name} is missing")
+
+    def test_copy_payload_recurses_into_the_package_entry(self):
+        text = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+        body = re.search(r"function Copy-Payload \{(.*?)\n\}", text, re.S)
+        if body is None:
+            self.fail("Copy-Payload was not found in install.ps1")
+        self.assertIn("-PathType Container", body.group(1), "Copy-Payload does not detect directory entries")
+        self.assertIn("Copy-Item -Recurse", body.group(1), "Copy-Payload does not copy directory entries")
+
+    def test_payload_rails_runtime_imports_from_a_copied_install(self):
+        names = payload_names((ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8"), "payload")
+        with tempfile.TemporaryDirectory(prefix="hyvv-rails-payload-") as tmp:
+            prefix = Path(tmp) / "prefix"
+            prefix.mkdir()
+            for rel in names:
+                copy_payload_entry(prefix, rel)
+            assert_rails_runtime_imports_from(self, prefix)
+
+    def test_powershell_installer_and_update_copy_the_rails_runtime(self):
+        pwsh = shutil.which("pwsh") or shutil.which("powershell")
+        if not pwsh:
+            self.skipTest("pwsh is required to exercise the Windows installer")
+        with tempfile.TemporaryDirectory(prefix="hyvv-rails-install-") as tmp:
+            root = Path(tmp)
+            prefix, home = root / "prefix", root / "home"
+            home.mkdir()
+            env = {key: value for key, value in os.environ.items() if key not in {"PYTHONPATH", "PYTHONHOME"}}
+            env["USERPROFILE"] = str(home)
+            env["HOME"] = str(home)
+            script = str(ROOT / "scripts" / "install.ps1")
+            common = [pwsh, "-NoLogo", "-NonInteractive", "-File", script, "-Prefix", str(prefix), "-Source", str(ROOT)]
+
+            fresh = run(common, cwd=root, env=env)
+            self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
+            for module in RAILS_MODULES:
+                self.assertTrue((prefix / module).is_file(), f"fresh install omitted {module}")
+            for name in RAILS_PACKAGE_FILES:
+                self.assertTrue((prefix / RAILS_PACKAGE / name).is_file(), f"fresh install omitted {RAILS_PACKAGE}/{name}")
+
+            update = run([*common, "-Update", "-WaitSeconds", "5"], cwd=root, env=env)
+            self.assertEqual(update.returncode, 0, update.stdout + update.stderr)
+            for module in RAILS_MODULES:
+                self.assertTrue((prefix / module).is_file(), f"apply-update dropped {module}")
+            self.assertTrue((prefix / RAILS_PACKAGE / "ledger.py").is_file(), "apply-update dropped rizzstack_rails")
+            self.assertFalse((prefix / RAILS_PACKAGE / "rizzstack_rails").exists(),
+                             "apply-update copied the package into itself instead of merging")
+
+            assert_rails_runtime_imports_from(self, prefix)
 
 
 class BuiltArtifacts(unittest.TestCase):
@@ -136,6 +246,19 @@ class BuiltArtifacts(unittest.TestCase):
         for module in ("launcher.py", *MODULES):
             self.assertIn(module, names, f"{module} missing from wheel")
         self.assertIn(f"hyvv-{VERSION}.dist-info/METADATA", names)
+
+    def test_wheel_and_sdist_carry_the_rails_runtime(self):
+        with tarfile.open(self.sdist) as archive:
+            sdist_names = {name.split("/", 1)[1] for name in archive.getnames() if "/" in name}
+        with zipfile.ZipFile(self.wheel) as archive:
+            wheel_names = set(archive.namelist())
+        for module in RAILS_MODULES:
+            self.assertIn(module, sdist_names, f"{module} missing from sdist")
+            self.assertIn(module, wheel_names, f"{module} missing from wheel")
+        for name in RAILS_PACKAGE_FILES:
+            rel = f"{RAILS_PACKAGE}/{name}"
+            self.assertIn(rel, sdist_names, f"{rel} missing from sdist")
+            self.assertIn(rel, wheel_names, f"{rel} missing from wheel")
 
     def test_isolated_install_imports_launcher_with_provisioning(self):
         venv = self.tmp / "venv"
