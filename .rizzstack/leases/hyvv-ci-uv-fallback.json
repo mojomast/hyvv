@@ -1,0 +1,13 @@
+{
+  "id": "hyvv-ci-uv-fallback",
+  "lease_version": "rizzstack.lease/1",
+  "source_rev": "2f01e006c3597f013aaf04878b7690ca0c883a1c",
+  "scope": {
+    "assigned_files": [
+      ".github/workflows/ci.yml",
+      ".rizzstack/leases/hyvv-ci-uv-fallback.json"
+    ],
+    "test_files": [],
+    "prohibited": []
+  }
+}
