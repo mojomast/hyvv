@@ -383,7 +383,11 @@ def check_merge_group(repo, payload, environ, http=None, quiet=False):
     # ``tested`` maps a pull request number to the head the group stacks for it.
     # The chain is authoritative: it is read from git, not trusted from the API.
     tested = {}
-    for entry in _group_entry_heads(repo, head, base):
+    try:
+        chain = _group_entry_heads(repo, head, base)
+    except GateError as exc:
+        raise merge_group_error("git", "cannot read the group chain under %s: %s" % (head[:12], exc))
+    for entry in chain:
         if not _exists(repo, entry):
             raise merge_group_error(
                 "entry-missing",
@@ -416,7 +420,13 @@ def check_merge_group(repo, payload, environ, http=None, quiet=False):
                 "no-pr-for-entry",
                 "stacked entry %s resolves to no pull request" % entry[:12],
             )
-        tested[int(pull.get("number") or 0)] = entry
+        number = int(pull.get("number") or 0)
+        if not number:
+            raise merge_group_error(
+                "no-pr-for-entry",
+                "stacked entry %s resolves to a pull request without a number" % entry[:12],
+            )
+        tested[number] = entry
 
     for number in numbers:
         if number in tested:
