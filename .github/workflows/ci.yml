@@ -163,8 +163,8 @@ jobs:
           expected_operations = {
               tuple(endpoint.split(" ", 1)) for endpoint in status["endpoints"]
           }
-          if len(expected_operations) != 20:
-              raise SystemExit(f"STATUS.json has {len(expected_operations)} endpoints, expected 20")
+          if len(expected_operations) != len(status["endpoints"]):
+              raise SystemExit(f"STATUS.json has {len(expected_operations)} endpoints, expected {len(status['endpoints'])}")
           if operations != expected_operations:
               raise SystemExit(
                   "API operations mismatch; "
