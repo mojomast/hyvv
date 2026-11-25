@@ -1,0 +1,37 @@
+{
+  "id": "wave-c-c4",
+  "lease_version": "rizzstack.lease/1",
+  "slice": "wave-c-c4",
+  "pull_request": 70,
+  "branch": "feat/wave-c-c4",
+  "contract_id": "wave-c-c4",
+  "contract_sha256": "88b56bead47d50e54b613d0acf03316e065a242116e3be01f2ec023b7b7ef88e",
+  "source_rev": "c16033918f42552a0e9c239d3d94b861730fc8d5",
+  "scope": {
+    "assigned_files": [
+      "hyvv/ticket_verify.py",
+      "launcher.py",
+      "pyproject.toml"
+    ],
+    "test_files": [
+      "tests/test_ticket_verify.py"
+    ],
+    "prohibited": [
+      "tests/test_ticket_verify.py",
+      "CHANGELOG.md",
+      ".github/workflows/**",
+      "uv.lock",
+      "contract/**",
+      "evidence/**"
+    ],
+    "read_only": [
+      "schemas/rizzstack-ticket.schema.json",
+      "tests/test_ticket_surface.py"
+    ]
+  },
+  "derived_from": {
+    "contract": "rizzstack-t1634/contracts/wave-bc/C4.contract.json",
+    "approved_by": "owner answers 2026-11-25: approve WAVE-C C4 v2 88b56bea; condition - launcher.py hunk must be exactly the one cfg.setdefault(ticket_mode, off) line",
+    "approved_at": "2026-11-25T20:59:30Z"
+  }
+}
