@@ -7,14 +7,30 @@ did any commit touch a path the slice does not own, or a frozen test file?**
 A slice contract is an ``acdd/1`` contract (``scope.assigned_files``,
 ``scope.test_files``, ``scope.prohibited``, ``scope.read_only`` and
 ``source_rev``) or a lease record with the same ``scope`` shape plus a
-``source_rev``/``verify_sha``.  The contract path is resolved, in order, from:
+``source_rev``/``verify_sha``.
 
-1. ``--contract`` (used by tests and local runs);
-2. a pull-request label ``lease-contract:<path>`` (``lease:<path>`` also works);
-3. a pull-request body line ``Lease-Contract: <path>`` (``Contract-Path:`` also
-   works);
-4. the repository convention ``.rizzstack/lease.json`` (base revision first,
-   then the head revision).
+**The lease is never read from the pull-request branch.**  A pull request could
+edit its own lease, so the gate resolves it, by contract hash or by path, only
+from trusted sources:
+
+1. ``--contract`` / ``--contract-sha256`` (local runs and tests);
+2. a pull-request label ``lease-contract:<path>``, ``lease:<path>``,
+   ``lease-contract-sha256:<64-hex>`` or ``contract-sha256:<64-hex>``;
+3. a pull-request body line ``Lease-Contract: <path>``,
+   ``Lease-Contract-Sha256: <64-hex>`` (``Contract-Path:``/``Contract-SHA256:``
+   also work);
+4. a contract hash found in the base branch's ``.rizzstack/leases/*.json`` at
+   the base tip or merge-base, or in a frozen contract store
+   (``BUNDLEBEES_CONTRACT_STORE``, ``--contract-store``,
+   ``~/.hermes/plugin-data/bundlebees/contracts`` and
+   ``rizzstack-t1634/contracts``) keyed by hash;
+5. the repository convention ``.rizzstack/lease.json`` on the base branch.
+
+A lease that exists only on the pull-request branch fails closed with the named
+reason ``lease_not_on_base``.  The single bootstrap exception is a repository
+whose base branch does not yet contain ``.github/scripts/lease_tamper.py``:
+the pull request that introduces the gate has no gate to weaken, so its own
+lease is accepted (``bootstrap`` mode) and the run says so.
 
 A ``.rizzstack/lease.json`` file may be a pointer::
 
@@ -70,6 +86,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
 import os
 import posixpath
@@ -81,15 +98,30 @@ import urllib.parse
 import urllib.request
 
 LEASE_FILE = ".rizzstack/lease.json"
+LEASE_DIR = ".rizzstack/leases"
+GATE_SCRIPT = ".github/scripts/lease_tamper.py"
+CONTRACT_STORE_ENV = "BUNDLEBEES_CONTRACT_STORE"
+DEFAULT_CONTRACT_STORES = (
+    "~/.hermes/plugin-data/bundlebees/contracts",
+    "rizzstack-t1634/contracts",
+)
+STORE_MAX_FILES = 2000
+STORE_MAX_DEPTH = 3
 LABEL_CONTRACT_PREFIXES = ("lease-contract:", "lease:")
+LABEL_CONTRACT_HASH_PREFIXES = ("lease-contract-sha256:", "contract-sha256:")
 LABEL_VERIFY_PREFIX = "lease-verify:"
 BODY_CONTRACT = re.compile(
     r"(?im)^[ \t]*(?:<!--[ \t]*)?(?:lease-contract|contract-path)[ \t]*:[ \t]*`?([^`\s]+)`?"
+)
+BODY_CONTRACT_HASH = re.compile(
+    r"(?im)^[ \t]*(?:<!--[ \t]*)?(?:lease-contract-sha256|contract-sha256)[ \t]*:"
+    r"[ \t]*`?([0-9a-fA-F]{64})`?"
 )
 BODY_VERIFY = re.compile(
     r"(?im)^[ \t]*(?:<!--[ \t]*)?(?:lease-verify|verify-sha)[ \t]*:[ \t]*`?([0-9a-fA-F]{40,64})`?"
 )
 HEX_REV = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 # refs/heads/gh-readonly-queue/<base>/pr-<number>-<sha>
 QUEUE_REF = re.compile(r"/pr-(\d+)-([0-9a-fA-F]{7,64})")
 HTTP_TIMEOUT_SECONDS = 20
@@ -149,6 +181,66 @@ def _exists(repo, revision):
 
 def _is_ancestor(repo, older, newer):
     return _run(repo, "merge-base", "--is-ancestor", older, newer, check=False).returncode == 0
+
+
+def _merge_base(repo, base, head):
+    proc = _run(repo, "merge-base", base, head, check=False)
+    value = proc.stdout.strip()
+    return value if proc.returncode == 0 and value else base
+
+
+def contract_sha256(document):
+    """SHA-256 of compact, key-sorted JSON with the ``review`` block removed.
+
+    This is the frozen-contract identity used by bundlebees
+    (``bundlebees_plugin.contract.contract_sha256``): a lease carried in the
+    frozen store is found by this hash, not by its filename.
+    """
+    if not isinstance(document, dict):
+        raise GateError("a contract hash can only be computed for a JSON object")
+    body = {key: value for key, value in document.items() if key != "review"}
+    text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _contract_body(document):
+    """The contract inside a packet, or the document itself."""
+    if isinstance(document, dict) and isinstance(document.get("contract"), dict):
+        if "contract_sha256" in document or "packet_version" in document:
+            return document["contract"]
+    return document
+
+
+def declared_contract_hash(document):
+    """The hash a lease/packet declares for itself, if any (lowercase)."""
+    if not isinstance(document, dict):
+        return None
+    review = document.get("review")
+    if isinstance(review, dict) and isinstance(review.get("contract_sha256"), str):
+        value = review["contract_sha256"].strip().lower()
+        if HASH_RE.match(value):
+            return value
+    value = document.get("contract_sha256")
+    if isinstance(value, str) and HASH_RE.match(value.strip().lower()):
+        return value.strip().lower()
+    return None
+
+
+def lease_hashes(document):
+    """Every hash a lease document can be matched by: computed and declared."""
+    body = _contract_body(document)
+    found = []
+    try:
+        found.append(contract_sha256(body))
+    except GateError:
+        return []
+    declared = declared_contract_hash(document)
+    if declared and declared not in found:
+        found.append(declared)
+    declared = declared_contract_hash(body)
+    if declared and declared not in found:
+        found.append(declared)
+    return found
 
 
 def _file_at(repo, revision, path):
@@ -580,71 +672,296 @@ def _read_contract_object(repo, revision, path):
         raise GateError("contract %r at %s is not valid JSON: %s" % (path, revision[:12], exc))
 
 
-def resolve_contract(repo, target, explicit_path=None):
-    """Return (contract, contract_path, lease_doc, source_revision).
+def _contract_hash(target, explicit):
+    """Return (64-hex contract hash, where it came from) or (None, None)."""
+    if explicit:
+        value = explicit.strip().lower()
+        if not HASH_RE.match(value):
+            raise GateError("--contract-sha256 must be a 64-character lowercase hex digest")
+        return value, "--contract-sha256"
 
-    ``source_revision`` is the revision the contract document was read from
-    (head or base), so later checks know whether it is branch-controlled.
-    """
-    path, origin = _contract_path(target, explicit_path)
-    lease_doc = None
-    contract_revision = target.head
+    for label in target.labels:
+        lowered = label.lower()
+        for prefix in LABEL_CONTRACT_HASH_PREFIXES:
+            if lowered.startswith(prefix):
+                value = label.strip()[len(prefix):].strip().lower()
+                if not HASH_RE.match(value):
+                    raise GateError(
+                        "label %r does not name a 64-hex contract hash" % label
+                    )
+                return value, "label %r" % label
 
-    if path:
-        for revision in (target.head, target.base):
-            doc = _read_contract_object(repo, revision, path)
-            if doc is not None:
-                lease_doc = doc
-                contract_revision = revision
+    match = BODY_CONTRACT_HASH.search(target.body)
+    if match:
+        return match.group(1).lower(), "PR body"
+
+    return None, None
+
+
+def _gate_on_base(repo, target):
+    """True when the base branch already carries this gate (no bootstrap)."""
+    return _file_at(repo, target.base, GATE_SCRIPT) is not None
+
+
+def _base_revisions(repo, target):
+    """Trusted revisions, base tip first, then the merge-base."""
+    out = [(target.base, "base")]
+    base = _merge_base(repo, target.base, target.head)
+    if base and base != target.base:
+        out.append((base, "merge-base"))
+    return out
+
+
+def _lease_paths_at(repo, revision):
+    proc = _run(repo, "ls-tree", "-r", "--name-only", revision, "--", LEASE_DIR, check=False)
+    if proc.returncode != 0:
+        return []
+    return [line for line in proc.stdout.splitlines() if line.endswith(".json")]
+
+
+def _find_by_hash_in_tree(repo, revision, wanted):
+    """A lease under .rizzstack/leases at *revision* whose hash is *wanted*."""
+    for path in _lease_paths_at(repo, revision):
+        doc = _read_contract_object(repo, revision, path)
+        if isinstance(doc, dict) and wanted in lease_hashes(doc):
+            return doc, path
+    return None, None
+
+
+def _find_by_hash_on_head(repo, target, wanted):
+    return _find_by_hash_in_tree(repo, target.head, wanted)
+
+
+def _store_roots(repo, explicit, environ):
+    raw = list(explicit or [])
+    env = (environ.get(CONTRACT_STORE_ENV) or "").strip()
+    if env:
+        raw.extend(part for part in env.split(os.pathsep) if part.strip())
+    raw.extend(DEFAULT_CONTRACT_STORES)
+    raw.append(
+        os.path.join(os.path.dirname(os.path.abspath(str(repo))), "rizzstack-t1634", "contracts")
+    )
+    roots, seen = [], set()
+    for item in raw:
+        path = os.path.abspath(os.path.expanduser(str(item).strip()))
+        if path in seen:
+            continue
+        seen.add(path)
+        if os.path.isdir(path):
+            roots.append(path)
+    return roots
+
+
+def _store_json_files(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = dirpath[len(root):].count(os.sep)
+        if depth >= STORE_MAX_DEPTH:
+            dirnames[:] = []
+        dirnames.sort()
+        for name in sorted(filenames):
+            if name.endswith(".json"):
+                yield os.path.join(dirpath, name)
+
+
+def _read_json_file(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def _find_by_hash_in_store(roots, wanted):
+    """A frozen contract keyed by *wanted*: ``<root>/<hash>.json`` or by content."""
+    for root in roots:
+        direct = os.path.join(root, wanted + ".json")
+        if os.path.isfile(direct):
+            doc = _read_json_file(direct)
+            if not isinstance(doc, dict):
+                raise GateError("frozen contract %r is not a JSON object" % direct)
+            if wanted not in lease_hashes(doc):
+                raise GateError(
+                    "frozen contract %r is not the contract with hash %s" % (direct, wanted)
+                )
+            return doc, direct
+        count = 0
+        for path in _store_json_files(root):
+            count += 1
+            if count > STORE_MAX_FILES:
                 break
-        else:
-            raise GateError(
-                "contract %r (from %s) does not exist at PR head %s or base %s"
-                % (path, origin, target.head[:12], target.base[:12])
-            )
-    else:
-        path = LEASE_FILE
-        # The convention file may live on the base branch (a coordinator-owned
-        # lease) or be introduced by the slice itself (a first-slice lease).
-        for revision in (target.base, target.head):
+            doc = _read_json_file(path)
+            if isinstance(doc, dict) and wanted in lease_hashes(doc):
+                return doc, path
+    return None, None
+
+
+def resolve_contract(
+    repo,
+    target,
+    explicit_path=None,
+    explicit_hash=None,
+    explicit_stores=None,
+    environ=None,
+):
+    """Return (contract, contract_path, lease_doc, source_revision, notice).
+
+    The lease is read only from trusted sources: an explicit flag, the base
+    branch (tip, then merge-base) or the frozen contract store.  The PR head is
+    consulted only to report that a branch-only lease is not acceptable
+    (``lease_not_on_base``) -- or, in a repository that does not carry the gate
+    on its base branch yet, to bootstrap the pull request that introduces it.
+    """
+    environ = environ if environ is not None else os.environ
+    wanted, wanted_origin = _contract_hash(target, explicit_hash)
+    path, path_origin = _contract_path(target, explicit_path)
+    if not path and not wanted:
+        path, path_origin = LEASE_FILE, "the repository convention"
+
+    bootstrap = not _gate_on_base(repo, target)
+    base_revisions = _base_revisions(repo, target)
+
+    lease_doc = None
+    contract_revision = None
+    contract_path = None
+    origin = None
+    notice = None
+
+    # 1. A named path is read at the base tip, then at the merge-base.  A path
+    #    the branch adds or edits is never read unless this PR bootstraps the gate.
+    if path and not wanted:
+        for revision, label in base_revisions:
             doc = _read_contract_object(repo, revision, path)
             if doc is not None:
-                lease_doc = doc
-                contract_revision = revision
-                origin = "%s at %s" % (LEASE_FILE, "base" if revision == target.base else "head")
+                lease_doc, contract_revision, contract_path = doc, revision, path
+                origin = "%s at %s" % (path, label)
+                break
+
+    # 2. A named contract hash is looked up in the base lease directory, then
+    #    in the frozen contract store.  The hash, not the filename, is the key.
+    if lease_doc is None and wanted:
+        for revision, label in base_revisions:
+            doc, found = _find_by_hash_in_tree(repo, revision, wanted)
+            if doc is not None:
+                lease_doc, contract_revision, contract_path = doc, revision, found
+                origin = "%s at %s" % (found, label)
                 break
         if lease_doc is None:
-            raise GateError(
-                "no slice contract for %s (head %s): no 'lease-contract:<path>' label, "
-                "no 'Lease-Contract: <path>' body line, and no %s at head or base. "
-                "Add the lease before opening the pull request."
-                % (
-                    ("PR #%s" % target.number) if target.number else "this pull request",
-                    target.head[:12],
-                    LEASE_FILE,
-                )
+            doc, found = _find_by_hash_in_store(
+                _store_roots(repo, explicit_stores, environ), wanted
             )
+            if doc is not None:
+                lease_doc, contract_revision, contract_path = doc, "frozen-store", found
+                origin = "frozen contract store %s" % found
+                notice = (
+                    "lease-tamper: NOTE: contract sha256:%s resolved from the frozen contract "
+                    "store %s." % (wanted, found)
+                )
+
+    # 3. Bootstrap: the base branch has no gate script, so the pull request
+    #    that introduces it is the only source for its own lease.  It cannot
+    #    weaken an existing gate because there is none on the base.
+    if lease_doc is None and bootstrap:
+        if path:
+            doc = _read_contract_object(repo, target.head, path)
+            if doc is not None:
+                lease_doc, contract_revision, contract_path = doc, target.head, path
+                origin = "%s at PR head (bootstrap)" % path
+                notice = (
+                    "lease-tamper: NOTE: %s does not carry %s yet; reading the lease from the "
+                    "PR head to bootstrap the gate (bootstrap mode)." % (target.base[:12], GATE_SCRIPT)
+                )
+        if lease_doc is None and wanted:
+            doc, found = _find_by_hash_on_head(repo, target, wanted)
+            if doc is not None:
+                lease_doc, contract_revision, contract_path = doc, target.head, found
+                origin = "%s at PR head (bootstrap)" % found
+                notice = (
+                    "lease-tamper: NOTE: %s does not carry %s yet; reading the lease from the "
+                    "PR head to bootstrap the gate (bootstrap mode)." % (target.base[:12], GATE_SCRIPT)
+                )
+
+    if lease_doc is None:
+        branch_copy = False
+        if path and _file_at(repo, target.head, path) is not None:
+            branch_copy = True
+        if wanted and _find_by_hash_on_head(repo, target, wanted)[0] is not None:
+            branch_copy = True
+        if branch_copy:
+            raise GateError(
+                "contract %s (from %s) exists only on PR head %s, not on base %s or its "
+                "merge-base. A pull request may not supply or edit the lease it is judged by; "
+                "land the lease on the base branch (or in the frozen contract store) first."
+                % (
+                    path or ("sha256:%s" % (wanted or "?")),
+                    wanted_origin or path_origin or "the pull request",
+                    target.head[:12],
+                    target.base[:12],
+                ),
+                reason="lease_not_on_base",
+            )
+        if path and not wanted and path_origin != "the repository convention":
+            raise GateError(
+                "contract %r (from %s) does not exist at base %s or its merge-base; "
+                "only trusted, pre-existing leases are accepted. Land the lease on the base "
+                "branch (or in the frozen contract store) before opening the pull request."
+                % (path, path_origin, target.base[:12])
+            )
+        raise GateError(
+            "no slice contract for %s (head %s): no contract hash/path label or body line, "
+            "no matching lease in .rizzstack/leases on base %s, in the merge-base or in the "
+            "frozen contract store, and no %s on the base branch. Add the lease before "
+            "opening the pull request."
+            % (
+                ("PR #%s" % target.number) if target.number else "this pull request",
+                target.head[:12],
+                target.base[:12],
+                LEASE_FILE,
+            )
+        )
 
     if not isinstance(lease_doc, dict):
-        raise GateError("contract %r is not a JSON object" % path)
+        raise GateError("contract %r is not a JSON object" % contract_path)
+
+    if wanted and wanted not in lease_hashes(lease_doc):
+        raise GateError(
+            "contract %r (from %s) does not match the named contract hash %s (%s); "
+            "refusing to apply a lease whose content is not the one the pull request names."
+            % (contract_path, origin, wanted, wanted_origin)
+        )
 
     pointer = lease_doc.get("contract_path") or lease_doc.get("contract")
     if isinstance(pointer, str) and pointer.strip():
-        contract_path = _normalise(pointer)
-        contract = _read_contract_object(repo, contract_revision, contract_path)
+        target_path = _normalise(pointer)
+        if contract_revision == "frozen-store":
+            raise GateError(
+                "frozen contract store %r is a pointer to %r; a store entry must be the "
+                "contract itself" % (contract_path, target_path)
+            )
+        contract = _read_contract_object(repo, contract_revision, target_path)
         if contract is None:
+            branch_copy = contract_revision != target.head and (
+                _file_at(repo, target.head, target_path) is not None
+            )
+            if branch_copy:
+                raise GateError(
+                    "contract %r points at %r, which exists only on PR head %s, not at %s. "
+                    "A pull request may not supply the contract it is judged by."
+                    % (contract_path, target_path, target.head[:12], (contract_revision or "?")[:12]),
+                    reason="lease_not_on_base",
+                )
             raise GateError(
                 "contract %r points at %r, which does not exist at %s"
-                % (path, contract_path, contract_revision[:12])
+                % (contract_path, target_path, (contract_revision or "?")[:12])
             )
         if not isinstance(contract, dict):
-            raise GateError("contract %r is not a JSON object" % contract_path)
-        return contract, contract_path, lease_doc, contract_revision
+            raise GateError("contract %r is not a JSON object" % target_path)
+        return contract, target_path, lease_doc, contract_revision, notice
 
     if isinstance(pointer, dict):
-        return pointer, path, lease_doc, contract_revision
+        return pointer, contract_path, lease_doc, contract_revision, notice
 
-    return lease_doc, path, lease_doc, contract_revision
+    return lease_doc, contract_path, lease_doc, contract_revision, notice
+
 
 
 def _scope(contract):
@@ -689,6 +1006,11 @@ def _frozen_reason(path, scope):
 
 def _in_lease(path, scope):
     return _matches(path, scope["assigned_files"])
+
+
+def _exempt_path(path, exempt):
+    """Lease metadata is never enforced: the gate reads leases from base only."""
+    return path in exempt or path == LEASE_DIR or path.startswith(LEASE_DIR + "/")
 
 
 # ---------------------------------------------------------------------------
@@ -755,7 +1077,7 @@ def check(repo, target, contract, contract_path, lease_doc, verify_sha):
         subject = _subject(repo, sha)
         for path in _commit_paths(repo, sha):
             path = _normalise(path)
-            if path in exempt:
+            if _exempt_path(path, exempt):
                 continue
             frozen = _frozen_reason(path, scope)
             if frozen:
@@ -768,21 +1090,26 @@ def check(repo, target, contract, contract_path, lease_doc, verify_sha):
         if not parents:
             continue
         subject = _subject(repo, sha)
-        # A merge of the base (or any commit already on the base) is not an
-        # authored change: its content is main's history and is excluded from
-        # the commit range. An evil conflict resolution still differs from both
-        # parents, so inspect the intersection of the two first-parent diffs.
+        # A merge of the base (or of a commit already on the base) is not an
+        # authored change: the content it brings is the base branch's history.
+        # It is clean when that content touches nothing leased or frozen. A
+        # frozen test it brings in still fails, because a frozen test may never
+        # change in the pull request's history. An evil conflict resolution
+        # differs from both parents, so the intersection of the two diffs is
+        # inspected as well.
         if any(_is_ancestor(repo, parent, target.base) for parent in parents):
             if len(parents) < 2:
                 continue
-            left = {_normalise(path) for path in _diff_paths(repo, sha, parents[0])}
+            brought = {_normalise(path) for path in _diff_paths(repo, sha, parents[0])}
             right = {_normalise(path) for path in _diff_paths(repo, sha, parents[1])}
-            suspect = left & right
+            suspect = (brought & right) | {
+                path for path in brought if _frozen_reason(path, scope)
+            }
         else:
             suspect = {_normalise(path) for path in _diff_paths(repo, parents[0], sha)}
 
         for path in sorted(suspect):
-            if path in exempt:
+            if _exempt_path(path, exempt):
                 continue
             frozen = _frozen_reason(path, scope)
             if frozen:
@@ -875,6 +1202,13 @@ def main(argv=None, environ=None):
     parser.add_argument("event", nargs="?", default=environ.get("GITHUB_EVENT_PATH"))
     parser.add_argument("--repo", default=".")
     parser.add_argument("--contract", default=None)
+    parser.add_argument("--contract-sha256", default=None)
+    parser.add_argument(
+        "--contract-store",
+        action="append",
+        default=None,
+        help="frozen contract store directory (repeatable; also BUNDLEBEES_CONTRACT_STORE)",
+    )
     parser.add_argument("--verify-sha", default=None)
     parser.add_argument("--base", default=None)
     parser.add_argument("--head", default=None)
@@ -914,9 +1248,16 @@ def main(argv=None, environ=None):
         target.base = _resolve_rev(args.repo, target.base)
         target.head = _resolve_rev(args.repo, target.head)
 
-        contract, contract_path, lease_doc, _revision = resolve_contract(
-            args.repo, target, args.contract
+        contract, contract_path, lease_doc, _revision, notice = resolve_contract(
+            args.repo,
+            target,
+            args.contract,
+            args.contract_sha256,
+            args.contract_store,
+            environ,
         )
+        if notice and not args.quiet:
+            print(notice)
         if args.verify_sha:
             args.verify_sha = _resolve_rev(args.repo, args.verify_sha)
         findings, boundary, boundary_kind, commits, scope = check(
