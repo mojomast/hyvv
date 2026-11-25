@@ -76,7 +76,10 @@ jobs:
       - name: Sync and unit tests
         run: |
           uv sync --frozen --no-dev || uv sync --no-dev
-          uv run python -m unittest discover -s tests -v
+          # PyYAML is a CI-only lift: the OpenAPI parse test uses the ambient
+          # loader when present, and this uv overlay is its fallback, so the
+          # repo keeps no runtime or dev dependency on it.
+          uv run --with pyyaml==6.0.2 python -m unittest discover -s tests -v
 
       - name: Contract tests (/v1, in-process hyvv)
         # Same command a reviewer runs locally. Point it at a live host with
