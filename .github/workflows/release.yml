@@ -60,12 +60,23 @@ jobs:
           packages-dir: dist
           attestations: true
 
-      - name: Upload GitHub Release assets
+      - name: Upload GitHub Release assets (draft, attach, publish)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          # Upload only; the Release itself should already exist from the tag.
+          # Immutable releases lock assets and the tag at publish time, so the
+          # assets go onto a draft first and the draft is published last.
+          state="$(gh release view "$tag" --json isDraft -q .isDraft 2>/dev/null || echo missing)"
+          case "$state" in
+            missing) gh release create "$tag" --draft --verify-tag --title "hyvv ${tag#v}" --generate-notes ;;
+            true) echo "using the existing draft release $tag" ;;
+            false) echo "::error::release $tag is already published; attach assets to a draft and publish it last"
+              exit 1 ;;
+            *) echo "::error::unexpected release state for $tag: $state"
+              exit 1 ;;
+          esac
           # Explicit list: the two dist files plus everything in release-assets/.
           gh release upload "$tag" dist/*.tar.gz dist/*.whl release-assets/* --clobber
+          gh release edit "$tag" --draft=false

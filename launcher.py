@@ -2048,6 +2048,147 @@ def journal_record_valid(obj):
     return isinstance(obj, dict) and isinstance(obj.get("attempt_id"), str) and isinstance(obj.get("state"), str)
 
 
+# ---------------------------------------------------------------- capacity (/v1/capacity)
+# Admission inputs for a coordinator that fills bee slots ("go max"). Every value that cannot be
+# read is None -- never a guess -- so the caller fails closed. Nothing here starts, stops or
+# changes an attempt, and nothing here carries a token, path, host or provider URL.
+CAPACITY_SCHEMA = "hyvv.capacity/1"
+CAPACITY_LANES = ("kimi", "nous", "go", "other")
+CAPACITY_RATE_LIMIT_WINDOW_S = 600
+CAPACITY_DOCKER_TTL_S = 30      # refresh the cached Docker probe at most this often
+CAPACITY_DOCKER_STALE_S = 120   # an older probe reads as unknown (ok: None)
+CAPACITY_DOCKER_TIMEOUT_S = 10
+
+def capacity_lane(cfg, model):
+    """Provider lane of a model id: kimi, nous, go or other. Unknown ids are `other`."""
+    if not model:
+        return "other"
+    try:
+        key = model_spec(cfg, model).get("key")
+    except Exception:
+        key = None
+    if key is None:  # classification only (never routing): fall back to the id's prefix
+        key = str(model).split(":", 1)[0] if ":" in str(model) else None
+    return key if key in ("kimi", "nous", "go") else "other"
+
+def parse_meminfo(text):
+    vals = {}
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] in ("MemTotal:", "MemAvailable:") and parts[1].isdigit():
+            vals[parts[0][:-1]] = int(parts[1]) // 1024
+    if "MemTotal" not in vals or "MemAvailable" not in vals:
+        return None
+    return {"mem_total_mb": vals["MemTotal"], "mem_available_mb": vals["MemAvailable"]}
+
+def _host_memory():
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = _MS(); ms.dwLength = ctypes.sizeof(_MS)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                return None
+            return {"mem_total_mb": int(ms.ullTotalPhys // 1048576), "mem_available_mb": int(ms.ullAvailPhys // 1048576)}
+        return parse_meminfo(Path("/proc/meminfo").read_text("utf-8"))
+    except Exception:
+        return None
+
+def _cpu_times():
+    """Cumulative (idle, total) CPU time, or None when unreadable."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            idle, kern, user = (ctypes.c_ulonglong(), ctypes.c_ulonglong(), ctypes.c_ulonglong())
+            if not ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user)):
+                return None
+            return idle.value, kern.value + user.value  # kernel time includes idle time
+        f = Path("/proc/stat").read_text("utf-8").splitlines()[0].split()
+        nums = [int(x) for x in f[1:]]
+        return nums[3] + (nums[4] if len(nums) > 4 else 0), sum(nums)
+    except Exception:
+        return None
+
+def cpu_busy_pct(prev, cur):
+    if not prev or not cur:
+        return None
+    didle, dtotal = cur[0] - prev[0], cur[1] - prev[1]
+    if dtotal <= 0:
+        return None
+    return round(max(0.0, min(100.0, 100.0 * (1 - didle / dtotal))), 1)
+
+_CPU_LAST = {"sample": None, "at": 0.0, "pct": None}
+_CPU_LOCK = threading.Lock()
+
+def host_snapshot():
+    mem = _host_memory() or {"mem_total_mb": None, "mem_available_mb": None}
+    with _CPU_LOCK:
+        cur = _cpu_times()
+        prev = _CPU_LAST["sample"]
+        if cur and (prev is None or time.time() - _CPU_LAST["at"] > 60):
+            time.sleep(0.25)  # a first (or very old) sample needs a short second window
+            prev, cur = cur, _cpu_times()
+        pct = cpu_busy_pct(prev, cur)
+        if pct is None and time.time() - _CPU_LAST["at"] < 10:
+            pct = _CPU_LAST["pct"]  # back-to-back reads: reuse the window just measured
+        if cur:
+            _CPU_LAST.update(sample=cur, at=time.time(), pct=pct)
+    return {"mem_total_mb": mem["mem_total_mb"], "mem_available_mb": mem["mem_available_mb"],
+            "cpu_count": os.cpu_count(), "cpu_busy_pct": pct}
+
+class DockerProbe:
+    """Cached, read-only `docker info` probe. A hung Docker daemon costs one bounded timeout
+    in a background thread, never an HTTP handler."""
+    ARGV = ["docker", "info", "--format", "{{.NCPU}} {{.MemTotal}} {{.ContainersRunning}} {{.ServerVersion}}"]
+
+    def __init__(self, runner=None):
+        self._runner = runner or _proc_run
+        self._lock = threading.Lock()
+        self._busy = False
+        self._at = 0.0
+        self._snap = {"ok": None, "ncpu": None, "mem_total_mb": None, "containers_running": None, "detail": "not_probed"}
+
+    def refresh(self):
+        try:
+            rc, out, _err = self._runner(list(self.ARGV), timeout=CAPACITY_DOCKER_TIMEOUT_S)
+            if rc != 0:
+                snap = {"ok": False, "ncpu": None, "mem_total_mb": None, "containers_running": None, "detail": f"exit_{rc}"}
+            else:
+                parts = (out or "").split()
+                ncpu, mem, running = (int(parts[0]), int(parts[1]), int(parts[2])) if len(parts) >= 3 else (None, None, None)
+                snap = {"ok": True, "ncpu": ncpu, "mem_total_mb": (mem // 1048576) if mem is not None else None,
+                        "containers_running": running, "detail": "ok"}
+        except Exception as ex:
+            import subprocess
+            detail = "timeout" if isinstance(ex, subprocess.TimeoutExpired) else ("unparseable" if isinstance(ex, ValueError) else "unreachable")
+            snap = {"ok": False, "ncpu": None, "mem_total_mb": None, "containers_running": None, "detail": detail}
+        with self._lock:
+            self._snap, self._at, self._busy = snap, time.time(), False
+
+    def _kick(self):
+        with self._lock:
+            if self._busy or (self._at and time.time() - self._at < CAPACITY_DOCKER_TTL_S):
+                return
+            self._busy = True
+        threading.Thread(target=self.refresh, daemon=True).start()
+
+    def snapshot(self, kick=True):
+        if kick:
+            self._kick()
+        with self._lock:
+            snap, at = dict(self._snap), self._at
+        age = round(time.time() - at, 1) if at else None
+        if at and age > CAPACITY_DOCKER_STALE_S:
+            snap = {"ok": None, "ncpu": None, "mem_total_mb": None, "containers_running": None, "detail": "stale"}
+        snap["age_s"] = age
+        return snap
+
+
 class Launcher:
     def __init__(self, cfg, backend):
         self.cfg, self.backend = cfg, backend
@@ -2062,6 +2203,8 @@ class Launcher:
         self.started_at = time.time(); self.loop_lag_ms = 0.0
         self.landing_conflicts = []
         self._cleaned_aids = set()
+        self.docker_probe = DockerProbe()
+        self._rate_limits = []  # (at, lane) of recent provider 429s, for /v1/capacity
         self._cleaned_sandboxes = set()
         self._load()
         self.rails = None
@@ -2362,6 +2505,44 @@ class Launcher:
                 if rec and rec.get("state") in JOURNAL_ACTIVE:
                     active += 1
         return active, tmp
+
+    def note_rate_limit(self, model, at=None):
+        """Record one provider rate limit for /v1/capacity (lane only, never the error text)."""
+        lane = capacity_lane(self.cfg, model)
+        now = time.time()
+        with self.lock:
+            self._rate_limits.append((float(at if at is not None else now), lane))
+            cutoff = now - CAPACITY_RATE_LIMIT_WINDOW_S
+            self._rate_limits = [r for r in self._rate_limits if r[0] >= cutoff][-1000:]
+
+    def capacity_status(self):
+        now = time.time()
+        with self.lock:
+            active = self._active()
+            queued = [self.attempts[i] for i in self._queue()]
+            by_active = {k: 0 for k in CAPACITY_LANES}
+            by_queued = {k: 0 for k in CAPACITY_LANES}
+            for a in active:
+                by_active[capacity_lane(self.cfg, a.get("model"))] += 1
+            for a in queued:
+                by_queued[capacity_lane(self.cfg, a.get("model"))] += 1
+            cutoff = now - CAPACITY_RATE_LIMIT_WINDOW_S
+            limits = {k: {"count": 0, "last_at": None} for k in CAPACITY_LANES}
+            for at, lane in self._rate_limits:
+                if at >= cutoff:
+                    limits[lane]["count"] += 1
+                    limits[lane]["last_at"] = max(limits[lane]["last_at"] or 0.0, at)
+            max_c = self.cfg["max_concurrent"]
+        try:
+            jact, jtmp = self.journal_counts()
+            split = (len(active) != jact) or (jtmp > 0)
+        except Exception:
+            split = True  # unreadable journal: report the worst case
+        return {"schema": CAPACITY_SCHEMA, "observed_at": round(now, 3), "max_concurrent": max_c,
+                "active": len(active), "queued": len(queued), "split_brain": split,
+                "active_by_lane": by_active, "queued_by_lane": by_queued,
+                "host": host_snapshot(), "docker": self.docker_probe.snapshot(),
+                "rate_limits": {"window_s": CAPACITY_RATE_LIMIT_WINDOW_S, "by_lane": limits}}
 
     def publish_runtime_status(self):
         live = len(self._active())
@@ -2877,6 +3058,7 @@ class Launcher:
 
     async def _fallback_to_deepseek(self, a, reason="go monthly-limit 429"):
         # Retry once on Nous DeepSeek 1017 after a Go monthly-limit 429. Records fallback="ds1017n".
+        self.note_rate_limit(a.get("model"))
         await self._cleanup_once(a)
         nxt = "nous:deepseek-v4.1-flash-1017"
         a["fallback"] = "ds1017n"
@@ -2887,6 +3069,7 @@ class Launcher:
         self._set(a, "queued", f"{reason}; fallback=ds1017n")
 
     async def _backoff(self, a, exhausted=False, reason="provider rate limit", retry_after=None):
+        self.note_rate_limit(a.get("model"))
         if a.get("pool") and a.get("model") in FREE_POOL:
             await self._cleanup_once(a)
             bad = a["model"]; self.model_health[bad]["last_limited"] = time.time(); a["tried"].append(bad)
@@ -2938,8 +3121,15 @@ class Launcher:
         manifest = await self._manifest(a, res)
         (self.dir / "attempts" / f"{a['attempt_id']}.result.json").write_text(json.dumps(manifest, indent=1), "utf-8")
         ok = e.get("stop_reason") in ("end_turn", None) and not res.get("error") and e["kind"] == "turn_ended"
-        self._set(a, "succeeded" if ok else "failed", f"turn ended: {e.get('stop_reason') or e['kind']}")
+        # Tear the sandbox down before publishing the terminal state: a reader that observes
+        # "succeeded"/"failed" must never see the recorded sandbox still alive. _set's terminal
+        # write (journal save + landed-event publication) can stall on a contended runner, and
+        # the retry-resume tests synchronise on the terminal state - with the old order they
+        # could observe a finished attempt whose teardown had not run yet (the 3.13 red run
+        # saw cleaned == [] instead of ["sb-1"]). Teardown is idempotent, so the controller's
+        # finally call stays a no-op.
         await self._cleanup_once(a)
+        self._set(a, "succeeded" if ok else "failed", f"turn ended: {e.get('stop_reason') or e['kind']}")
 
     async def _manifest(self, a, res):
         b = a["brief"]; files = []
@@ -3230,6 +3420,8 @@ def make_handler(L, token):
                 return self._send(200, {"ok": True, "version": VERSION, "max_concurrent": L.cfg["max_concurrent"], "active": st["active"], "journal_active": st["journal_active"], "journal_tmp": st["journal_tmp"], "split_brain": st["split_brain"], "queued": len(L._queue()), "model": L.cfg["model"],
                                        "configured_model": L.cfg["model"], "effective_model": eff_model, "models": allow, "uptime_s": round(time.time() - L.started_at), "loop_lag_ms": round(L.loop_lag_ms, 1),
                                        **({"deployment_receipt": rc} if (rc := deployment_receipt(L.cfg)) is not None else {})})
+            if p == ["v1", "capacity"]:  # admission inputs for go-max fillers (hyvv.capacity/1)
+                return self._send(200, L.capacity_status())
             if p == ["v1", "landing", "events"]:  # authenticated export of the durable canonical outbox
                 if _landing_export is None:
                     return self._send(501, {"error": "landing export is unavailable"})
