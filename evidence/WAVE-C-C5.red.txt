@@ -1,0 +1,144 @@
+# WAVE-C-C5 RED evidence
+repo: hyvv
+branch: red/wave-c-c5
+base_rev: 5c2e4a4
+test_file: tests/test_ticket_enforce.py (+ the one superseded assertion in tests/test_ticket_surface.py)
+command: python3 -m unittest tests.test_ticket_enforce -v
+result: Ran 12 tests: FAILED (failures=9, errors=2)
+keys: generated at test time in memory (os.urandom); no key material is written or committed
+note: One regression passes at the red revision (ticket_mode off accepts an invalid ticket and reports nothing, as C2 froze). The rest fail because enforce is refused by load_config and no verification exists. report-mode behavior is owned by C2 and stays red until C2 lands.
+
+test_a_claims_object_instead_of_a_jws_is_refused (tests.test_ticket_enforce.EnforceAdmitsAndRefuses.test_a_claims_object_instead_of_a_jws_is_refused) ... FAIL
+test_a_missing_ticket_is_refused (tests.test_ticket_enforce.EnforceAdmitsAndRefuses.test_a_missing_ticket_is_refused) ... FAIL
+test_a_reused_jti_is_refused_on_the_second_create (tests.test_ticket_enforce.EnforceAdmitsAndRefuses.test_a_reused_jti_is_refused_on_the_second_create) ... FAIL
+test_a_ticket_for_another_brief_is_refused (tests.test_ticket_enforce.EnforceAdmitsAndRefuses.test_a_ticket_for_another_brief_is_refused) ... FAIL
+test_a_valid_ticket_proceeds (tests.test_ticket_enforce.EnforceAdmitsAndRefuses.test_a_valid_ticket_proceeds) ... ERROR
+test_a_wrong_audience_is_refused (tests.test_ticket_enforce.EnforceAdmitsAndRefuses.test_a_wrong_audience_is_refused) ... FAIL
+test_an_expired_ticket_is_refused (tests.test_ticket_enforce.EnforceAdmitsAndRefuses.test_an_expired_ticket_is_refused) ... FAIL
+test_an_invalid_signature_is_refused (tests.test_ticket_enforce.EnforceAdmitsAndRefuses.test_an_invalid_signature_is_refused) ... FAIL
+test_every_create_is_refused_when_no_public_key_is_configured (tests.test_ticket_enforce.EnforceFailsClosedWithoutKeys.test_every_create_is_refused_when_no_public_key_is_configured) ... FAIL
+test_off_accepts_an_invalid_ticket_without_a_report (tests.test_ticket_enforce.OffAndReportAreUnchanged.test_off_accepts_an_invalid_ticket_without_a_report) ... ok
+test_report_accepts_an_invalid_ticket_and_says_it_was_not_checked (tests.test_ticket_enforce.ReportStillOnlyReports.test_report_accepts_an_invalid_ticket_and_says_it_was_not_checked) ... ERROR
+test_default_is_off_enforce_is_accepted_and_the_environment_cannot_set_it (tests.test_ticket_enforce.TicketModeConfig.test_default_is_off_enforce_is_accepted_and_the_environment_cannot_set_it) ... FAIL
+
+======================================================================
+ERROR: test_a_valid_ticket_proceeds (tests.test_ticket_enforce.EnforceAdmitsAndRefuses.test_a_valid_ticket_proceeds)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_enforce.py", line 311, in test_a_valid_ticket_proceeds
+    self.assertEqual(body["ticket_report"]["status"], "valid")
+                     ~~~~^^^^^^^^^^^^^^^^^
+KeyError: 'ticket_report'
+
+======================================================================
+ERROR: test_report_accepts_an_invalid_ticket_and_says_it_was_not_checked (tests.test_ticket_enforce.ReportStillOnlyReports.test_report_accepts_an_invalid_ticket_and_says_it_was_not_checked)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_enforce.py", line 377, in test_report_accepts_an_invalid_ticket_and_says_it_was_not_checked
+    report = body["ticket_report"]
+             ~~~~^^^^^^^^^^^^^^^^^
+KeyError: 'ticket_report'
+
+======================================================================
+FAIL: test_a_claims_object_instead_of_a_jws_is_refused (tests.test_ticket_enforce.EnforceAdmitsAndRefuses.test_a_claims_object_instead_of_a_jws_is_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_enforce.py", line 348, in test_a_claims_object_instead_of_a_jws_is_refused
+    self.assertRefused("ticket_invalid", "att_c5obj00001", {"project": "demo"})
+    ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<worktree>/tests/test_ticket_enforce.py", line 285, in assertRefused
+    self.assertEqual(status, 403, body)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+AssertionError: 201 != 403 : {'attempt_id': 'att_c5obj00001', 'kind': 'opencode', 'mode': None, 'tier': None, 'state': 'queued', 'detail': 'waiting for a worker slot', 'run_id': None, 'sandbox': None, 'created_at': 1795628411.516047, 'updated_at': 1795628411.516047, 'lseq': 0, 'queue_position': 1, 'retry_at': None, 'rate_limited': 0, 'model': 'deepseek-v4.1-flash', 'fallback': None, 'pool': None, 'model_history': None}
+
+======================================================================
+FAIL: test_a_missing_ticket_is_refused (tests.test_ticket_enforce.EnforceAdmitsAndRefuses.test_a_missing_ticket_is_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_enforce.py", line 320, in test_a_missing_ticket_is_refused
+    self.assertEqual(status, 403, body)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+AssertionError: 201 != 403 : {'attempt_id': 'att_c5miss0001', 'kind': 'opencode', 'mode': None, 'tier': None, 'state': 'queued', 'detail': 'waiting for a worker slot', 'run_id': None, 'sandbox': None, 'created_at': 1795628412.1462438, 'updated_at': 1795628412.1462438, 'lseq': 0, 'queue_position': 1, 'retry_at': None, 'rate_limited': 0, 'model': 'deepseek-v4.1-flash', 'fallback': None, 'pool': None, 'model_history': None}
+
+======================================================================
+FAIL: test_a_reused_jti_is_refused_on_the_second_create (tests.test_ticket_enforce.EnforceAdmitsAndRefuses.test_a_reused_jti_is_refused_on_the_second_create)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_enforce.py", line 345, in test_a_reused_jti_is_refused_on_the_second_create
+    self.assertRefused("ticket_replayed", "att_c5rep00002", ticket)
+    ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<worktree>/tests/test_ticket_enforce.py", line 285, in assertRefused
+    self.assertEqual(status, 403, body)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+AssertionError: 201 != 403 : {'attempt_id': 'att_c5rep00002', 'kind': 'opencode', 'mode': None, 'tier': None, 'state': 'queued', 'detail': 'waiting for a worker slot', 'run_id': None, 'sandbox': None, 'created_at': 1795628413.057371, 'updated_at': 1795628413.057371, 'lseq': 0, 'queue_position': 1, 'retry_at': None, 'rate_limited': 0, 'model': 'deepseek-v4.1-flash', 'fallback': None, 'pool': None, 'model_history': None}
+
+======================================================================
+FAIL: test_a_ticket_for_another_brief_is_refused (tests.test_ticket_enforce.EnforceAdmitsAndRefuses.test_a_ticket_for_another_brief_is_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_enforce.py", line 339, in test_a_ticket_for_another_brief_is_refused
+    self.assertRefused("ticket_brief_mismatch", "att_c5brf00001", ticket)
+    ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<worktree>/tests/test_ticket_enforce.py", line 285, in assertRefused
+    self.assertEqual(status, 403, body)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+AssertionError: 201 != 403 : {'attempt_id': 'att_c5brf00001', 'kind': 'opencode', 'mode': None, 'tier': None, 'state': 'queued', 'detail': 'waiting for a worker slot', 'run_id': None, 'sandbox': None, 'created_at': 1795628413.951085, 'updated_at': 1795628413.951085, 'lseq': 0, 'queue_position': 1, 'retry_at': None, 'rate_limited': 0, 'model': 'deepseek-v4.1-flash', 'fallback': None, 'pool': None, 'model_history': None}
+
+======================================================================
+FAIL: test_a_wrong_audience_is_refused (tests.test_ticket_enforce.EnforceAdmitsAndRefuses.test_a_wrong_audience_is_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_enforce.py", line 330, in test_a_wrong_audience_is_refused
+    self.assertRefused("ticket_invalid", "att_c5aud00001", ticket)
+    ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<worktree>/tests/test_ticket_enforce.py", line 285, in assertRefused
+    self.assertEqual(status, 403, body)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+AssertionError: 201 != 403 : {'attempt_id': 'att_c5aud00001', 'kind': 'opencode', 'mode': None, 'tier': None, 'state': 'queued', 'detail': 'waiting for a worker slot', 'run_id': None, 'sandbox': None, 'created_at': 1795628415.804418, 'updated_at': 1795628415.804418, 'lseq': 0, 'queue_position': 1, 'retry_at': None, 'rate_limited': 0, 'model': 'deepseek-v4.1-flash', 'fallback': None, 'pool': None, 'model_history': None}
+
+======================================================================
+FAIL: test_an_expired_ticket_is_refused (tests.test_ticket_enforce.EnforceAdmitsAndRefuses.test_an_expired_ticket_is_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_enforce.py", line 334, in test_an_expired_ticket_is_refused
+    self.assertRefused("ticket_expired", "att_c5exp00001", ticket)
+    ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<worktree>/tests/test_ticket_enforce.py", line 285, in assertRefused
+    self.assertEqual(status, 403, body)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+AssertionError: 201 != 403 : {'attempt_id': 'att_c5exp00001', 'kind': 'opencode', 'mode': None, 'tier': None, 'state': 'queued', 'detail': 'waiting for a worker slot', 'run_id': None, 'sandbox': None, 'created_at': 1795628416.6603546, 'updated_at': 1795628416.6603546, 'lseq': 0, 'queue_position': 1, 'retry_at': None, 'rate_limited': 0, 'model': 'deepseek-v4.1-flash', 'fallback': None, 'pool': None, 'model_history': None}
+
+======================================================================
+FAIL: test_an_invalid_signature_is_refused (tests.test_ticket_enforce.EnforceAdmitsAndRefuses.test_an_invalid_signature_is_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_enforce.py", line 326, in test_an_invalid_signature_is_refused
+    self.assertRefused("ticket_invalid", "att_c5sig00001", ticket)
+    ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<worktree>/tests/test_ticket_enforce.py", line 285, in assertRefused
+    self.assertEqual(status, 403, body)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+AssertionError: 201 != 403 : {'attempt_id': 'att_c5sig00001', 'kind': 'opencode', 'mode': None, 'tier': None, 'state': 'queued', 'detail': 'waiting for a worker slot', 'run_id': None, 'sandbox': None, 'created_at': 1795628417.537176, 'updated_at': 1795628417.537176, 'lseq': 0, 'queue_position': 1, 'retry_at': None, 'rate_limited': 0, 'model': 'deepseek-v4.1-flash', 'fallback': None, 'pool': None, 'model_history': None}
+
+======================================================================
+FAIL: test_every_create_is_refused_when_no_public_key_is_configured (tests.test_ticket_enforce.EnforceFailsClosedWithoutKeys.test_every_create_is_refused_when_no_public_key_is_configured)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_enforce.py", line 356, in test_every_create_is_refused_when_no_public_key_is_configured
+    self.assertEqual(status, 403, body)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+AssertionError: 201 != 403 : {'attempt_id': 'att_c5nok00001', 'kind': 'opencode', 'mode': None, 'tier': None, 'state': 'queued', 'detail': 'waiting for a worker slot', 'run_id': None, 'sandbox': None, 'created_at': 1795628418.4474852, 'updated_at': 1795628418.4474852, 'lseq': 0, 'queue_position': 1, 'retry_at': None, 'rate_limited': 0, 'model': 'deepseek-v4.1-flash', 'fallback': None, 'pool': None, 'model_history': None}
+
+======================================================================
+FAIL: test_default_is_off_enforce_is_accepted_and_the_environment_cannot_set_it (tests.test_ticket_enforce.TicketModeConfig.test_default_is_off_enforce_is_accepted_and_the_environment_cannot_set_it)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "<worktree>/tests/test_ticket_enforce.py", line 395, in test_default_is_off_enforce_is_accepted_and_the_environment_cannot_set_it
+    self.assertEqual(L.load_config(self._config({})).get("ticket_mode"), "off")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: None != 'off'
+
+----------------------------------------------------------------------
+Ran 12 tests in 9.358s
+
+FAILED (failures=9, errors=2)

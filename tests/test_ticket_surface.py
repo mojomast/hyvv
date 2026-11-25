@@ -297,8 +297,14 @@ class ConfigTicketMode(unittest.TestCase):
         self.assertEqual(cfg["ticket_mode"], "report")
 
         with self.assertRaises(ValueError) as caught:
-            L.load_config(self._config({"ticket_mode": "enforce"}))
+            L.load_config(self._config({"ticket_mode": "bogus"}))
         self.assertIn("ticket_mode", str(caught.exception))
+        # C5 supersedes C2 AC-007: enforce is a legal mode from C5 on. The
+        # method name is kept so the C2 contract's node reference resolves.
+        self.assertEqual(
+            L.load_config(self._config({"ticket_mode": "enforce"}))["ticket_mode"],
+            "enforce",
+        )
 
         names = ("HYYV_TICKET_MODE", "TICKET_MODE", "RIZZSTACK_TICKET_MODE", "BUNDLEBEES_TICKET_MODE")
         saved = {name: os.environ.get(name) for name in names}
