@@ -6,9 +6,14 @@ from zero with the full prompt. When the backend can resume, the launcher
 keeps the sandbox and session and sends a short continue turn instead.
 #4: cleanup is keyed by attempt id, so after a retry the second sandbox is
 never torn down. Key it by sandbox.
+
+Follow-up to #66: _finish() tears the sandbox down before publishing the terminal state, so an
+unbounded backend.cleanup could leave the attempt non-terminal and holding its worker slot. The
+teardown is now bounded at 2*BUDGET_STOP_GRACE_S, the attempt lands succeeded/failed regardless,
+and the outcome is recorded as cleanup_status in the attempt journal and the result manifest.
 Run: python3 -m pytest -q tests/test_retry_resume_and_teardown.py   (no cua, no network)
 """
-import asyncio, os, sys, tempfile, threading, time, unittest
+import asyncio, io, json, os, sys, tempfile, threading, time, unittest
 from pathlib import Path
 from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]; sys.path.insert(0, str(ROOT))
@@ -126,6 +131,96 @@ class ResumeAfterRateLimit(unittest.TestCase):
             self.assertTrue(_settle(la, aid))
             self.assertEqual(la.attempts[aid]["state"], "succeeded", la.attempts[aid].get("detail"))
             self.assertEqual(la.backend.starts, 2)
+
+
+class HangingCleanupBackend(CountingBackend):
+    """Teardown that never returns: the pre-fix _finish awaited it with no bound."""
+
+    async def cleanup(self, a):
+        self.cleaned.append(a.get("sandbox"))
+        await asyncio.sleep(3600)
+
+
+class FailingCleanupBackend(CountingBackend):
+    """Teardown that raises: the attempt must still land and say the teardown failed."""
+
+    async def cleanup(self, a):
+        self.cleaned.append(a.get("sandbox"))
+        raise RuntimeError("sandbox delete refused")
+
+
+class FinishTeardownIsBounded(unittest.TestCase):
+    """#66 moved the teardown above the terminal write; unbounded, a hung backend.cleanup then left
+    the attempt non-terminal and holding its worker slot. Bound it like every other stop step, land
+    the attempt anyway, and record cleanup_status in both the journal and the result manifest."""
+
+    GRACE = 0.5  # patched BUDGET_STOP_GRACE_S: the bounded teardown waits 2 * GRACE
+
+    def _finish_once(self, backend_cls, aid):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, KEY_ENV), \
+             mock.patch.object(launcher, "BUDGET_STOP_GRACE_S", self.GRACE):
+            la = _launcher(d, backend_cls)
+            la.submit(aid, {"objective": "x"})
+            t0 = time.monotonic()
+            ok = _wait(lambda: la.attempts[aid]["state"] in launcher.TERMINAL, timeout=10)
+            elapsed = time.monotonic() - t0
+            time.sleep(0.2)  # let the controller's finally-teardown run
+            journal = json.loads((Path(d) / "attempts" / f"{aid}.json").read_text("utf-8"))
+            man = json.loads((Path(d) / "attempts" / f"{aid}.result.json").read_text("utf-8"))
+            return ok, elapsed, la.attempts[aid], journal, man, list(la.backend.cleaned), la._active()
+
+    def test_cleanup_that_never_returns_is_bounded_and_the_attempt_still_lands(self):
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stderr", buf):
+            ok, elapsed, a, journal, man, cleaned, active = self._finish_once(HangingCleanupBackend, "att_cln00000001")
+        self.assertTrue(ok, f"a hung cleanup left the attempt non-terminal: {a.get('detail')!r}")
+        self.assertEqual(a["state"], "succeeded", a.get("detail"))
+        self.assertLessEqual(elapsed, 2 * self.GRACE + 2, f"the teardown was not bounded: terminal after {elapsed:.1f}s")
+        self.assertEqual(a["cleanup_status"], "timed_out")
+        self.assertEqual(journal["cleanup_status"], "timed_out", "the attempt journal does not say the teardown timed out")
+        self.assertEqual(man["cleanup_status"], "timed_out", "the result manifest does not say the teardown timed out")
+        self.assertEqual(cleaned, ["sb-1"], "a timed-out teardown must not be re-issued behind the live one")
+        self.assertEqual(active, [], "the finished attempt still holds a worker slot")
+        self.assertIn("cleanup timed_out", buf.getvalue(), "the timeout was not logged")
+
+    def test_cleanup_that_raises_still_lands_and_records_failed(self):
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stderr", buf):
+            ok, elapsed, a, journal, man, cleaned, active = self._finish_once(FailingCleanupBackend, "att_cln00000002")
+        self.assertTrue(ok, f"a raising cleanup left the attempt non-terminal: {a.get('detail')!r}")
+        self.assertEqual(a["state"], "succeeded", a.get("detail"))
+        self.assertLessEqual(elapsed, 2 * self.GRACE + 2, f"the teardown was not bounded: terminal after {elapsed:.1f}s")
+        self.assertEqual(a["cleanup_status"], "failed")
+        self.assertEqual(journal["cleanup_status"], "failed", "the attempt journal does not say the teardown failed")
+        self.assertEqual(man["cleanup_status"], "failed", "the result manifest does not say the teardown failed")
+        self.assertEqual(cleaned, ["sb-1"], "a failed teardown must not be re-issued behind the live one")
+        self.assertEqual(active, [], "the finished attempt still holds a worker slot")
+        self.assertIn("cleanup failed", buf.getvalue(), "the failure was not logged")
+
+    def test_cleanup_once_reports_cleaned_and_skipped(self):
+        with tempfile.TemporaryDirectory() as d:
+            la = _launcher(d, CountingBackend)
+            a = {"attempt_id": "att_cln00000003", "sandbox": "sb-1"}
+
+            async def go():
+                return await la._cleanup_once(a), await la._cleanup_once(a)
+
+            self.assertEqual(asyncio.run_coroutine_threadsafe(go(), la.loop).result(5), ("cleaned", "skipped"))
+            self.assertEqual(la.backend.cleaned, ["sb-1"])
+
+    def test_cleanup_once_bounds_a_hanging_backend(self):
+        with tempfile.TemporaryDirectory() as d:
+            la = _launcher(d, HangingCleanupBackend)
+            a = {"attempt_id": "att_cln00000004", "sandbox": "sb-2"}
+
+            async def go():
+                return await la._cleanup_once(a, timeout=self.GRACE), await la._cleanup_once(a, timeout=self.GRACE)
+
+            t0 = time.monotonic()
+            first, again = asyncio.run_coroutine_threadsafe(go(), la.loop).result(5)
+            self.assertEqual((first, again), ("timed_out", "skipped"))
+            self.assertLessEqual(time.monotonic() - t0, self.GRACE + 2)
+            self.assertEqual(la.backend.cleaned, ["sb-2"], "the ledger must not re-issue a timed-out teardown")
 
 
 if __name__ == "__main__":

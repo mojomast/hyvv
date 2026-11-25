@@ -2189,6 +2189,15 @@ class DockerProbe:
         return snap
 
 
+def log_cleanup(a, status):
+    """One operator line when teardown did not confirm. Never a secret, path or hostname."""
+    try:
+        print(f"[launcher] cleanup {status} attempt={a.get('attempt_id')} sandbox={a.get('sandbox')}",
+              file=sys.stderr, flush=True)
+    except Exception:
+        pass  # a closed stderr must not turn a recorded teardown into a crash
+
+
 class Launcher:
     def __init__(self, cfg, backend):
         self.cfg, self.backend = cfg, backend
@@ -2452,17 +2461,24 @@ class Launcher:
 
         The ledger is keyed by sandbox, not attempt id: a retry keeps the same attempt id but
         gets a new sandbox, and that second sandbox must also be torn down exactly once.
+
+        Returns what happened - "cleaned", "skipped" (already torn down, or nothing recorded),
+        "failed" (the backend raised) or "timed_out" - and never raises: teardown is best effort,
+        and the caller records the outcome. With `timeout` the wait is bounded on the launcher's
+        own clock, so a backend.cleanup that never returns cannot wedge a caller that still owes
+        the attempt a terminal state. The ledger entry stays: teardown is exactly once per
+        sandbox, and a timed-out delete must not be re-issued behind a live one.
         """
         aid = a.get("attempt_id")
         if not aid:
-            return
+            return "skipped"
         sandbox = a.get("sandbox")
         if sandbox:
             if sandbox in self._cleaned_sandboxes:
-                return
+                return "skipped"
             self._cleaned_sandboxes.add(sandbox)
         elif aid in self._cleaned_aids:
-            return
+            return "skipped"
         self._cleaned_aids.add(aid)
         try:
             coro = self.backend.cleanup(a)
@@ -2470,8 +2486,11 @@ class Launcher:
                 await asyncio.wait_for(coro, timeout)
             else:
                 await coro
+        except asyncio.TimeoutError:
+            return "timed_out"
         except Exception:
-            pass
+            return "failed"
+        return "cleaned"
 
     def _sync_cleanup(self, a):
         try:
@@ -2959,7 +2978,9 @@ class Launcher:
                 try:
                     # bounded like every other stop step: a backend.result() that never returns
                     # must not leave the attempt budget_stop-marked and non-terminal forever.
-                    await asyncio.wait_for(self._finish(a, done), BUDGET_STOP_GRACE_S)
+                    # _finish bounds its own teardown at 2*GRACE, so the wait adds one GRACE for
+                    # the collection instead of cutting a slow-but-honest cleanup short.
+                    await asyncio.wait_for(self._finish(a, done), 3 * BUDGET_STOP_GRACE_S)
                     cleaned = True  # _finish tore the worker down itself; the finally must not repeat it
                 except Exception as ex:
                     with self.lock:
@@ -3118,9 +3139,14 @@ class Launcher:
 
     async def _finish(self, a, e):
         res = await self.backend.result(a)
+        # Evidence is collected before the teardown: patch/environment/file hashes need the live
+        # sandbox, so unlike the terminal write they cannot move below the cleanup.
         manifest = await self._manifest(a, res)
-        (self.dir / "attempts" / f"{a['attempt_id']}.result.json").write_text(json.dumps(manifest, indent=1), "utf-8")
-        ok = e.get("stop_reason") in ("end_turn", None) and not res.get("error") and e["kind"] == "turn_ended"
+        path = self.dir / "attempts" / f"{a['attempt_id']}.result.json"
+        # Land the evidence before the teardown: the teardown below can now take a full bounded
+        # grace, and a crash inside it must still leave _recovered_manifest something to restore
+        # (the outcome is re-written with cleanup_status once the teardown answers).
+        path.write_text(json.dumps(manifest, indent=1), "utf-8")
         # Tear the sandbox down before publishing the terminal state: a reader that observes
         # "succeeded"/"failed" must never see the recorded sandbox still alive. _set's terminal
         # write (journal save + landed-event publication) can stall on a contended runner, and
@@ -3128,7 +3154,17 @@ class Launcher:
         # could observe a finished attempt whose teardown had not run yet (the 3.13 red run
         # saw cleaned == [] instead of ["sb-1"]). Teardown is idempotent, so the controller's
         # finally call stays a no-op.
-        await self._cleanup_once(a)
+        # The teardown is bounded like every other stop step: a backend.cleanup that never
+        # returns must not leave the attempt non-terminal and holding its worker slot. Whatever
+        # it did is recorded on the attempt (journal) and in the result manifest, and the
+        # terminal write below happens regardless of the outcome.
+        status = await self._cleanup_once(a, timeout=2 * BUDGET_STOP_GRACE_S)
+        a["cleanup_status"] = status
+        manifest["cleanup_status"] = status
+        if status in ("failed", "timed_out"):
+            log_cleanup(a, status)
+        path.write_text(json.dumps(manifest, indent=1), "utf-8")
+        ok = e.get("stop_reason") in ("end_turn", None) and not res.get("error") and e["kind"] == "turn_ended"
         self._set(a, "succeeded" if ok else "failed", f"turn ended: {e.get('stop_reason') or e['kind']}")
 
     async def _manifest(self, a, res):
