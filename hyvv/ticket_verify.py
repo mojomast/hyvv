@@ -132,23 +132,25 @@ def load_public_keys(config) -> dict[str, bytes]:
         raise TicketKeyConfigError("ticket_public_keys must be a non-empty mapping") from exc
     if not isinstance(configured, Mapping) or not configured:
         raise TicketKeyConfigError("ticket_public_keys must be a non-empty mapping")
-    keys = {}
-    for kid, value in configured.items():
-        if not isinstance(kid, str) or not kid:
-            raise TicketKeyConfigError("each ticket public key needs a non-empty string kid")
-        if not isinstance(value, str) or _CONFIGURED_KEY.fullmatch(value) is None:
-            raise TicketKeyConfigError("ticket public keys must be base64url raw Ed25519 public keys")
-        unpadded = value[:-1] if value.endswith("=") else value
-        if value.endswith("=") and len(value) % 4:
-            raise TicketKeyConfigError("ticket public key has invalid base64url padding")
-        try:
-            raw = _b64url_decode(unpadded)
-        except ValueError as exc:
-            raise TicketKeyConfigError("ticket public key is not valid base64url") from exc
-        if len(raw) != 32:
-            raise TicketKeyConfigError("ticket public keys must decode to exactly 32 bytes")
-        keys[kid] = raw
-    return keys
+    return {kid: _decode_public_key(kid, value) for kid, value in configured.items()}
+
+
+def _decode_public_key(kid, value) -> bytes:
+    """Validate one configured kid/public-key pair and return the raw 32 key bytes."""
+    if not isinstance(kid, str) or not kid:
+        raise TicketKeyConfigError("each ticket public key needs a non-empty string kid")
+    if not isinstance(value, str) or _CONFIGURED_KEY.fullmatch(value) is None:
+        raise TicketKeyConfigError("ticket public keys must be base64url raw Ed25519 public keys")
+    unpadded = value[:-1] if value.endswith("=") else value
+    if value.endswith("=") and len(value) % 4:
+        raise TicketKeyConfigError("ticket public key has invalid base64url padding")
+    try:
+        raw = _b64url_decode(unpadded)
+    except ValueError as exc:
+        raise TicketKeyConfigError("ticket public key is not valid base64url") from exc
+    if len(raw) != 32:
+        raise TicketKeyConfigError("ticket public keys must decode to exactly 32 bytes")
+    return raw
 
 
 class ReplayCache:
@@ -178,36 +180,48 @@ class ReplayCache:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         flags |= getattr(os, "O_NOFOLLOW", 0)
         with self._lock:
-            while True:
-                try:
-                    fd = os.open(path, flags, 0o600)
-                except FileExistsError:
-                    try:
-                        previous_exp = self._read_exp(path)
-                        live = previous_exp > now
-                    except FileNotFoundError:
-                        continue
-                    except (OSError, TypeError, ValueError) as exc:
-                        raise TicketReplayed("ticket jti has already been used") from exc
-                    if live:
-                        raise TicketReplayed("ticket jti has already been used")
-                    try:
-                        path.unlink()
-                    except FileNotFoundError:
-                        pass
-                    continue
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as entry:
-                        json.dump({"exp": exp}, entry, separators=(",", ":"))
-                        entry.flush()
-                        os.fsync(entry.fileno())
-                except Exception:
-                    try:
-                        path.unlink()
-                    except OSError:
-                        pass
-                    raise
-                return
+            while not self._take(path, flags, exp, now):
+                continue
+
+    def _take(self, path: Path, flags: int, exp, now) -> bool:
+        """Create the replay entry; True when it was written, False to retry the loop."""
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError:
+            self._reclaim(path, now)
+            return False
+        self._write_entry(fd, path, exp)
+        return True
+
+    def _reclaim(self, path: Path, now):
+        """Drop a dead entry, keep a live one refused; a vanished entry means retry."""
+        try:
+            previous_exp = self._read_exp(path)
+            live = previous_exp > now
+        except FileNotFoundError:
+            return
+        except (OSError, TypeError, ValueError) as exc:
+            raise TicketReplayed("ticket jti has already been used") from exc
+        if live:
+            raise TicketReplayed("ticket jti has already been used")
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _write_entry(self, fd: int, path: Path, exp):
+        """Write the exp record through the open fd; unlink on any failure, then re-raise."""
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as entry:
+                json.dump({"exp": exp}, entry, separators=(",", ":"))
+                entry.flush()
+                os.fsync(entry.fileno())
+        except Exception:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            raise
 
     def prune(self, now):
         with self._lock:
@@ -266,20 +280,29 @@ def _invalid() -> TicketError:
     return TicketError("invalid dispatch ticket")
 
 
-def verify_ticket(ticket, *, brief, public_keys, audience, now=None, replay) -> dict:
-    now = time.time() if now is None else now
+def _ticket_parts(ticket) -> list[str]:
+    """Split a compact JWS into its three non-empty segments."""
     if not isinstance(ticket, str):
         raise _invalid()
     parts = ticket.split(".")
     if len(parts) != 3 or any(not part for part in parts):
         raise _invalid()
+    return parts
+
+
+def _decode_segments(parts):
+    """Decode the header, claims and signature segments; anything malformed is ticket_invalid."""
     try:
         header = _json_object(_b64url_decode(parts[0]))
         claims = _json_object(_b64url_decode(parts[1]))
         signature = _b64url_decode(parts[2])
     except (TypeError, ValueError, RecursionError) as exc:
         raise _invalid() from exc
+    return header, claims, signature
 
+
+def _checked_header(header, claims, public_keys) -> str:
+    """Return the kid after every header/claims-shape check; refuse anything off-spec."""
     kid = header.get("kid")
     if header.get("alg") != "EdDSA" or not isinstance(kid, str):
         raise _invalid()
@@ -289,7 +312,11 @@ def verify_ticket(ticket, *, brief, public_keys, audience, now=None, replay) -> 
         raise _invalid()
     if not isinstance(claims["jti"], str) or not claims["jti"]:
         raise _invalid()
+    return kid
 
+
+def _verify_signature(parts, signature, public_key_bytes):
+    """Verify Ed25519 with a lazy cryptography import; a bad signature is ticket_invalid."""
     try:
         from cryptography.exceptions import InvalidSignature
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -299,11 +326,14 @@ def verify_ticket(ticket, *, brief, public_keys, audience, now=None, replay) -> 
         ) from exc
 
     try:
-        public_key = Ed25519PublicKey.from_public_bytes(public_keys[kid])
+        public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
         public_key.verify(signature, f"{parts[0]}.{parts[1]}".encode("ascii"))
     except (InvalidSignature, TypeError, ValueError) as exc:
         raise _invalid() from exc
 
+
+def _check_claims(claims, brief, audience, now):
+    """Check audience, lifetime and brief binding; return the validated exp."""
     if claims["aud"] != audience:
         raise _invalid()
     iat = claims["iat"]
@@ -320,6 +350,16 @@ def verify_ticket(ticket, *, brief, public_keys, audience, now=None, replay) -> 
         raise _invalid() from exc
     if claims["brief_sha256"] != expected_digest:
         raise TicketBriefMismatch("dispatch ticket is bound to a different brief")
+    return exp
+
+
+def verify_ticket(ticket, *, brief, public_keys, audience, now=None, replay) -> dict:
+    now = time.time() if now is None else now
+    parts = _ticket_parts(ticket)
+    header, claims, signature = _decode_segments(parts)
+    kid = _checked_header(header, claims, public_keys)
+    _verify_signature(parts, signature, public_keys[kid])
+    exp = _check_claims(claims, brief, audience, now)
 
     replay.consume(claims["jti"], exp, now)
     replay.prune(now)
