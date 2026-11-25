@@ -32,7 +32,31 @@ from both parents are checked.  The contract file itself (and
 ``.rizzstack/lease.json``) is metadata and is exempt.
 
 Exit status: 0 = clean or no pull request in the event; 1 = tamper, an invalid
-lease, or an unresolvable contract (fail closed).  Standard library only.
+lease, an unresolvable contract, or a merge_group whose pull-request context
+cannot be established (always fail closed).  Standard library only.
+
+A ``merge_group`` event is a queued candidate, not a pull request: its head is
+a synthetic merge commit that may stack several pull requests.  The gate does
+**not** re-check the combined group diff against one lease -- the lease belongs
+to one slice, and a stacked diff belongs to several.  Instead it proves, per
+pull request, that the head the queue is testing is exactly the head where the
+``pull_request`` run of this gate already passed:
+
+1. every ``pr-<N>-<sha>`` in the queue branch name
+   ``refs/heads/gh-readonly-queue/<base>/pr-<N>-<sha>`` is resolved with
+   ``GET /repos/{repo}/pulls/{N}``;
+2. the entry heads stacked by the group are read from its first-parent merge
+   chain and each is resolved to its pull request;
+3. for every pull request found, its **current** head sha must be an ancestor
+   of the group head (a head that moved after the queue built the group is not
+   the reviewed head) and must carry a completed, successful ``lease-tamper``
+   check run -- the proof that the gate passed at that exact sha.
+
+Any failure to establish that context is a hard failure with the named reason
+``merge_group_pr_unresolved`` (exit 1).  It is never a neutral or skipped
+conclusion: GitHub counts a neutral required check as passing, so a neutral
+result would be a way around the gate.  A resolved pull request whose reviewed
+head did not pass the gate also fails.
 
 Usage:
     python3 .github/scripts/lease_tamper.py [EVENT_JSON_PATH]
@@ -52,6 +76,7 @@ import posixpath
 import re
 import subprocess
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -65,12 +90,33 @@ BODY_VERIFY = re.compile(
     r"(?im)^[ \t]*(?:<!--[ \t]*)?(?:lease-verify|verify-sha)[ \t]*:[ \t]*`?([0-9a-fA-F]{40,64})`?"
 )
 HEX_REV = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+# refs/heads/gh-readonly-queue/<base>/pr-<number>-<sha>
+QUEUE_REF = re.compile(r"/pr-(\d+)-([0-9a-fA-F]{7,64})")
 HTTP_TIMEOUT_SECONDS = 20
 MAX_PAGES = 10
+MAX_GROUP_ENTRIES = 100
+DEFAULT_API_URL = "https://api.github.com"
+LEASE_JOB_NAME = "lease-tamper"
+MERGE_GROUP_REASON = "merge_group_pr_unresolved"
 
 
 class GateError(RuntimeError):
-    """The lease/contract could not be resolved or applied (fail closed)."""
+    """The lease/contract could not be resolved or applied (fail closed).
+
+    ``reason`` is a stable, named machine-readable code for the failure.  It is
+    required for merge_group failures, which must never be reported as a
+    neutral/skipped conclusion: GitHub counts a neutral required check as
+    passing, so neutral would be a way around the gate.
+    """
+
+    def __init__(self, message, reason=None):
+        super().__init__(message)
+        self.reason = reason
+
+
+def merge_group_error(subtype, detail):
+    """A merge_group context failure: always fatal, always named."""
+    return GateError("[%s] %s" % (subtype, detail), reason=MERGE_GROUP_REASON)
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +230,10 @@ def _http_get_json(url, token):
         return json.loads(response.read().decode("utf-8")), response.headers.get("Link") or ""
 
 
+def _api_url(environ):
+    return (environ.get("GITHUB_API_URL") or DEFAULT_API_URL).rstrip("/")
+
+
 def _next_page(link_header):
     for part in (link_header or "").split(","):
         if 'rel="next"' in part:
@@ -191,7 +241,17 @@ def _next_page(link_header):
     return ""
 
 
-def _pull_requests_for_commit(repo, sha, token, api_url="https://api.github.com"):
+def _get_checked(url, token, http=None):
+    """GET a GitHub API url, turning transport/parse failures into GateError."""
+    try:
+        return (http or _http_get_json)(url, token)
+    except GateError:
+        raise
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise GateError("%s: %s" % (url, exc))
+
+
+def _pull_requests_for_commit(repo, sha, token, api_url=DEFAULT_API_URL, http=None):
     url = "%s/repos/%s/commits/%s/pulls?per_page=100" % (
         api_url,
         repo,
@@ -199,7 +259,7 @@ def _pull_requests_for_commit(repo, sha, token, api_url="https://api.github.com"
     )
     pulls = []
     for _ in range(MAX_PAGES):
-        payload, link = _http_get_json(url, token)
+        payload, link = _get_checked(url, token, http)
         if not isinstance(payload, list):
             raise GateError("the merge-queue pull-request lookup did not return a list")
         pulls.extend(item for item in payload if isinstance(item, dict))
@@ -209,16 +269,219 @@ def _pull_requests_for_commit(repo, sha, token, api_url="https://api.github.com"
     raise GateError("the merge-queue pull-request lookup did not terminate")
 
 
-def target_from_event(payload, event_name, environ):
+def _pull_request_by_number(repo, number, token, api_url=DEFAULT_API_URL, http=None):
+    url = "%s/repos/%s/pulls/%d" % (api_url, repo, int(number))
+    payload, _link = _get_checked(url, token, http)
+    if not isinstance(payload, dict):
+        raise GateError("%s did not return a pull request" % url)
+    return payload
+
+
+def merge_group_pr_numbers(head_ref):
+    """Every pull request number named by a gh-readonly-queue branch name."""
+    found = []
+    for match in QUEUE_REF.finditer(str(head_ref or "")):
+        number = int(match.group(1))
+        if number not in found:
+            found.append(number)
+    return found
+
+
+def _lease_green_at(repo, sha, token, api_url=DEFAULT_API_URL, http=None):
+    """True when a completed, successful ``lease-tamper`` check run exists on ``sha``."""
+    url = "%s/repos/%s/commits/%s/check-runs?check_name=%s&filter=latest&per_page=100" % (
+        api_url,
+        repo,
+        urllib.parse.quote(sha),
+        urllib.parse.quote(LEASE_JOB_NAME),
+    )
+    payload, _link = _get_checked(url, token, http)
+    runs = payload.get("check_runs") if isinstance(payload, dict) else None
+    if not isinstance(runs, list):
+        raise GateError("%s did not return check runs" % url)
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        if str(run.get("name") or "") != LEASE_JOB_NAME:
+            continue
+        if str(run.get("status") or "") not in ("", "completed"):
+            continue
+        if str(run.get("conclusion") or "") == "success":
+            return True
+    return False
+
+
+def _group_entry_heads(repo, head, base):
+    """The pull-request heads a merge group stacks, from its first-parent chain.
+
+    GitHub builds a group by merging each entry in turn, so every merge on the
+    first-parent chain contributes the entry head as its second parent.  The
+    chain stops at the group base (or when a commit is no longer a merge).
+    """
+    entries = []
+    current = head
+    for _ in range(MAX_GROUP_ENTRIES):
+        if not current or current == base or _is_ancestor(repo, current, base):
+            break
+        parents = _parents(repo, current)
+        if len(parents) < 2:
+            break
+        entries.extend(parents[1:])
+        if len(parents) > 2:
+            break
+        current = parents[0]
+    return entries
+
+
+def _resolved_pull_request(repo, number, token, api_url, http=None):
+    """Fetch pull request ``number`` and return it with its current head sha."""
+    try:
+        pull = _pull_request_by_number(repo, number, token, api_url, http)
+    except GateError as exc:
+        raise merge_group_error("api", "pull request #%s: %s" % (number, exc))
+    head = ((pull.get("head") or {}).get("sha") or "").strip()
+    if not head:
+        raise merge_group_error("no-head", "pull request #%s has no head sha" % number)
+    return pull, head
+
+
+def check_merge_group(repo, payload, environ, http=None, quiet=False):
+    """Fail unless every queued pull request's reviewed head already passed this gate.
+
+    No lease is applied to the combined group diff: a stacked group belongs to
+    several slices, so the proof is per pull request -- the head the group is
+    testing must be the pull request's current head and must carry a successful
+    ``lease-tamper`` check run.
+    """
+    group = payload.get("merge_group") or {}
+    head = (group.get("head_sha") or "").strip()
+    head_ref = str(group.get("head_ref") or "").strip()
+    base = (group.get("base_sha") or "").strip()
+    if not head or not base:
+        raise merge_group_error(
+            "payload-incomplete",
+            "the merge_group payload has no head_sha/base_sha (ref %s)" % (head_ref or "<none>"),
+        )
+    name = (environ.get("GITHUB_REPOSITORY") or "").strip()
+    token = (environ.get("GITHUB_TOKEN") or environ.get("GH_TOKEN") or "").strip()
+    if not name or not token:
+        raise merge_group_error(
+            "no-credentials",
+            "merge_group needs GITHUB_REPOSITORY and GITHUB_TOKEN to resolve the queued pull "
+            "requests (head %s, ref %s)" % (head[:12], head_ref or "<none>"),
+        )
+    api_url = _api_url(environ)
+
+    numbers = merge_group_pr_numbers(head_ref)
+    if not numbers:
+        raise merge_group_error(
+            "no-pr-in-ref",
+            "the queue branch %r names no pull request (expected "
+            "gh-readonly-queue/<base>/pr-<N>-<sha>)" % (head_ref or "<none>"),
+        )
+
+    # ``tested`` maps a pull request number to the head the group stacks for it.
+    # The chain is authoritative: it is read from git, not trusted from the API.
+    tested = {}
+    for entry in _group_entry_heads(repo, head, base):
+        if not _exists(repo, entry):
+            raise merge_group_error(
+                "entry-missing",
+                "stacked entry %s is not in this checkout (fetch-depth: 0)" % entry[:12],
+            )
+        try:
+            candidates = _pull_requests_for_commit(name, entry, token, api_url, http)
+        except GateError as exc:
+            raise merge_group_error("api", "stacked entry %s: %s" % (entry[:12], exc))
+        pull = next(
+            (item for item in candidates if ((item.get("head") or {}).get("sha") == entry)),
+            None,
+        )
+        if pull is None and candidates:
+            # The commit belongs to a pull request whose head has since moved:
+            # the group still stacks the old head, so this is a moved head, not
+            # an unknown entry.
+            moved = candidates[0]
+            raise merge_group_error(
+                "head-moved",
+                "stacked entry %s belongs to pull request #%s, whose head is now %s"
+                % (
+                    entry[:12],
+                    moved.get("number"),
+                    ((moved.get("head") or {}).get("sha") or "?")[:12],
+                ),
+            )
+        if pull is None:
+            raise merge_group_error(
+                "no-pr-for-entry",
+                "stacked entry %s resolves to no pull request" % entry[:12],
+            )
+        tested[int(pull.get("number") or 0)] = entry
+
+    for number in numbers:
+        if number in tested:
+            continue
+        # A one-entry group can be a plain fast-forward: the named head is the
+        # group head itself.  Anything else means the named PR is not queued.
+        _pull, current = _resolved_pull_request(name, number, token, api_url, http)
+        if current != head:
+            raise merge_group_error(
+                "head-not-in-group",
+                "pull request #%s head %s is not part of merge group head %s"
+                % (number, current[:12], head[:12]),
+            )
+        tested[number] = head
+
+    if not tested:
+        raise merge_group_error(
+            "no-pr", "merge group %s resolved to no pull request" % head[:12]
+        )
+
+    for number, tested_head in sorted(tested.items()):
+        _pull, current = _resolved_pull_request(name, number, token, api_url, http)
+        if current != tested_head:
+            raise merge_group_error(
+                "head-moved",
+                "pull request #%s head moved: the group is testing %s but the pull request is "
+                "at %s, so the head where lease-tamper passed is not the head being merged"
+                % (number, tested_head[:12], current[:12]),
+            )
+        if not _lease_green_at(name, tested_head, token, api_url, http):
+            raise merge_group_error(
+                "not-green-at-head",
+                "pull request #%s has no successful %s check run at its head %s; the queue "
+                "cannot prove the reviewed head passed this gate"
+                % (number, LEASE_JOB_NAME, tested_head[:12]),
+            )
+        if not quiet:
+            print(
+                "lease-tamper: merge_group: PR #%s head %s is in group head %s and lease-tamper "
+                "passed at that exact head." % (number, tested_head[:12], head[:12])
+            )
+    if not quiet:
+        print(
+            "lease-tamper: OK: %d pull request(s) in merge group %s on base %s; each reviewed "
+            "head passed lease-tamper before it was queued." % (len(tested), head[:12], base[:12])
+        )
+    return 0
+
+
+def infer_event_name(payload):
+    """Best-effort event name when GITHUB_EVENT_NAME is not set."""
+    if "merge_group" in payload:
+        return "merge_group"
+    if "pull_request" in payload:
+        return "pull_request"
+    return "other"
+
+
+def target_from_event(payload, event_name, environ, http=None):
     """Return a Target, or None for an event that carries no pull request."""
-    name = (event_name or "").strip()
-    if not name:
-        if "pull_request" in payload:
-            name = "pull_request"
-        elif "merge_group" in payload:
-            name = "merge_group"
-        else:
-            name = "other"
+    name = (event_name or "").strip() or infer_event_name(payload)
+
+    if name == "merge_group":
+        # Routed to check_merge_group() by main(); reaching here is a bug.
+        raise merge_group_error("internal", "merge_group must be handled by check_merge_group()")
 
     if name == "pull_request":
         pull = payload.get("pull_request") or {}
@@ -226,32 +489,6 @@ def target_from_event(payload, event_name, environ):
         head = ((pull.get("head") or {}).get("sha") or "").strip()
         if not base or not head:
             raise GateError("the pull_request payload has no base/head sha")
-        return Target(base, head, _labels_of(pull), pull.get("body") or "", pull.get("number"))
-
-    if name == "merge_group":
-        group = payload.get("merge_group") or {}
-        head = (group.get("head_sha") or "").strip()
-        if not head:
-            raise GateError("the merge_group payload has no head_sha")
-        repo = (environ.get("GITHUB_REPOSITORY") or "").strip()
-        token = (environ.get("GITHUB_TOKEN") or environ.get("GH_TOKEN") or "").strip()
-        if not repo or not token:
-            raise GateError(
-                "merge_group needs GITHUB_REPOSITORY and GITHUB_TOKEN to resolve the queued pull request"
-            )
-        pulls = _pull_requests_for_commit(repo, head, token)
-        pull = next(
-            (item for item in pulls if ((item.get("head") or {}).get("sha") == head)),
-            pulls[0] if pulls else None,
-        )
-        if pull is None:
-            raise GateError(
-                "merge_group head %s is not associated with a pull request; the lease cannot be resolved"
-                % head
-            )
-        base = ((pull.get("base") or {}).get("sha") or "").strip()
-        if not base:
-            raise GateError("the queued pull request has no base sha")
         return Target(base, head, _labels_of(pull), pull.get("body") or "", pull.get("number"))
 
     return None
@@ -649,7 +886,12 @@ def main(argv=None, environ=None):
                     payload = json.load(handle)
             except (OSError, ValueError) as exc:
                 raise GateError("cannot read the event payload %r: %s" % (args.event, exc))
-            target = target_from_event(payload, environ.get("GITHUB_EVENT_NAME"), environ)
+            event_name = (
+                environ.get("GITHUB_EVENT_NAME") or ""
+            ).strip() or infer_event_name(payload)
+            if event_name == "merge_group":
+                return check_merge_group(args.repo, payload, environ, quiet=args.quiet)
+            target = target_from_event(payload, event_name, environ)
             if target is None:
                 if not args.quiet:
                     print("lease-tamper: no pull request in this event; nothing to check.")
@@ -659,11 +901,12 @@ def main(argv=None, environ=None):
             if body:
                 target.body = body
 
+        target.base = _resolve_rev(args.repo, target.base)
+        target.head = _resolve_rev(args.repo, target.head)
+
         contract, contract_path, lease_doc, _revision = resolve_contract(
             args.repo, target, args.contract
         )
-        target.base = _resolve_rev(args.repo, target.base)
-        target.head = _resolve_rev(args.repo, target.head)
         if args.verify_sha:
             args.verify_sha = _resolve_rev(args.repo, args.verify_sha)
         findings, boundary, boundary_kind, commits, scope = check(
@@ -677,8 +920,15 @@ def main(argv=None, environ=None):
             print(render_success(contract, contract_path, boundary, boundary_kind, commits, scope, target.head))
         return 0
     except GateError as exc:
-        print("lease-tamper: FAILED: %s" % exc)
-        print("::error::lease-tamper: %s" % str(exc).replace("\n", " "))
+        if exc.reason:
+            print("lease-tamper: FAILED (reason=%s): %s" % (exc.reason, exc))
+            print(
+                "::error title=lease-tamper %s::%s"
+                % (exc.reason, str(exc).replace("\n", " "))
+            )
+        else:
+            print("lease-tamper: FAILED: %s" % exc)
+            print("::error::lease-tamper: %s" % str(exc).replace("\n", " "))
         return 1
     except subprocess.TimeoutExpired:
         print("lease-tamper: FAILED: git did not finish within the timeout; failing closed.")

@@ -6,6 +6,7 @@
     "assigned_files": [
       ".github/scripts/lease_tamper.py",
       ".github/workflows/ci.yml",
+      "tests/test_lease_tamper_merge_group.py",
       ".rizzstack/leases/hyvv-lease-tamper-gate.json"
     ],
     "test_files": [],

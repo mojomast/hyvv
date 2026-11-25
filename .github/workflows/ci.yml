@@ -225,6 +225,9 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      # merge_group: prove each queued PR's head already passed this job by
+      # reading its check runs (GET /commits/{sha}/check-runs).
+      checks: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
