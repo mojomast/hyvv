@@ -198,6 +198,18 @@ class ReleaseAssets(unittest.TestCase):
         self.assertIn("gh release upload", y)
         self.assertIn("tags: [\"v*\"]", y)  # only a pushed tag triggers it
 
+    def test_release_workflow_publishes_draft_first_for_immutable_releases(self):
+        """Immutable releases lock assets at publish, so assets go onto a draft first."""
+        y = _read(".github/workflows/release.yml")
+        create = y.index('gh release create "$tag" --draft --verify-tag')
+        upload = y.index("gh release upload")
+        publish = y.index('gh release edit "$tag" --draft=false')
+        self.assertLess(create, upload)
+        self.assertLess(upload, publish)
+        # A release that is already published can't take assets; fail closed, never clobber it.
+        self.assertIn("already published", y)
+        self.assertRegex(y, r"false\)[^\n]*\n[^\n]*exit 1")
+
     def test_ci_runs_the_asset_build_without_tagging(self):
         y = _read(".github/workflows/ci.yml")
         self.assertIn("python scripts/build_release_assets.py --dist dist --out release-assets", y)
