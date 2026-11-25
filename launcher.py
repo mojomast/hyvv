@@ -1057,6 +1057,7 @@ def load_config(path):
         default_timeout_s = DEFAULT_ATTEMPT_TIMEOUT_S
     cfg["default_timeout_s"] = max(60, min(86400, default_timeout_s))
     cfg.setdefault("require_budget", False)
+    cfg.setdefault("ticket_mode", "off")
     cfg.setdefault("data_dir", str(Path.home() / ".orbit-launcher"))
     cfg.setdefault("projects", {})  # name -> {"repo": url} (authorized projects)
     cfg.setdefault("provisioning", {})  # {"policy": path, "journal": path, "enabled": bool}
