@@ -1,10 +1,16 @@
-"""The unit-test job provides the pinned cryptography the ticket tests need.
+"""The unit-test job provides the pinned cryptography the ticket verifier needs.
 
-The ``tickets`` extra is optional at install time, and CI runs
-``uv sync --frozen --no-dev``: without an overlay the Ed25519 verifier tests
-fail with ``ModuleNotFoundError`` instead of being tested. The overlay must
-stay a test-environment pin: cryptography never becomes a core dependency,
-and the pin must sit inside the range the extra declares.
+C3's ``tickets`` extra is optional at install time, and the test job runs
+``uv sync --frozen --no-dev``, so the verifier's lazy ``cryptography`` import
+fails with ``ModuleNotFoundError`` unless the job supplies it. The overlay is
+a test-environment pin only: cryptography never becomes a core dependency,
+``uv.lock`` is untouched, and the pin must sit inside the range the extra
+declares.
+
+The overlay mirrors the bundlebees verify interpreter exactly:
+``cryptography==50.0.2`` plus ``cffi==2.1.1`` / ``pycparser==3.12`` from a
+hash-pinned requirements file installed with ``--require-hashes``, so every
+matrix leg resolves the same tested build.
 """
 
 from __future__ import annotations
@@ -15,7 +21,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
-PIN = "cryptography==44.0.0"
+REQUIREMENTS = ROOT / ".github" / "requirements" / "cryptography.txt"
+PIN = "cryptography==50.0.2"
+PINNED = {"cryptography": "50.0.2", "cffi": "2.1.1", "pycparser": "3.12"}
+HASH_RE = re.compile(r"--hash=sha256:[0-9a-f]{64}\b")
 
 
 def pyproject() -> dict:
@@ -26,17 +35,38 @@ def workflow_text() -> str:
     return WORKFLOW.read_text(encoding="utf-8")
 
 
-def job_block(name: str) -> str:
-    """The lines of one top-level job in the workflow."""
+def requirements_text() -> str:
+    return REQUIREMENTS.read_text(encoding="utf-8")
+
+
+def requirement_blocks(text: str) -> list[str]:
+    """Logical requirement lines, with backslash continuations joined."""
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not current and (not stripped or stripped.startswith("#")):
+            continue
+        current.append(stripped)
+        if not stripped.endswith("\\"):
+            blocks.append(" ".join(part.rstrip("\\").strip() for part in current))
+            current = []
+    if current:
+        blocks.append(" ".join(part.rstrip("\\").strip() for part in current))
+    return blocks
+
+
+def step_block(name: str) -> str:
+    """The lines of one named step inside the unit-test job."""
     lines = workflow_text().splitlines()
     start = next(
-        (index for index, line in enumerate(lines) if line.rstrip() == f"  {name}:"),
+        (index for index, line in enumerate(lines) if line.strip() == f"- name: {name}"),
         None,
     )
-    assert start is not None, f"workflow has no {name!r} job"
+    assert start is not None, f"workflow has no {name!r} step"
     block = [lines[start]]
     for line in lines[start + 1:]:
-        if re.match(r"^  [A-Za-z0-9_-]+:\s*$", line):
+        if line.strip().startswith("- name:") or re.match(r"^  [A-Za-z0-9_-]+:\s*$", line):
             break
         block.append(line)
     return "\n".join(block)
@@ -73,12 +103,30 @@ def test_the_ci_pin_sits_inside_the_declared_range() -> None:
     )
 
 
-def test_the_unit_test_step_carries_the_pinned_overlay() -> None:
-    block = job_block("test")
-    assert PIN in block, f"the test job must provide {PIN}"
-    assert re.search(r"uv run[^\n]*--with\s+" + re.escape(PIN), block), (
-        "the pin must ride the uv run command that executes the unit suite"
+def test_the_requirements_file_pins_every_version_with_hashes() -> None:
+    blocks = requirement_blocks(requirements_text())
+    assert blocks, "the overlay requirements file must declare its pins"
+    for name, version in PINNED.items():
+        matching = [block for block in blocks if block.split()[0] == f"{name}=={version}"]
+        assert len(matching) == 1, f"{name}=={version} must be pinned exactly once"
+        assert HASH_RE.search(matching[0]), f"{name}=={version} must carry sha256 hashes"
+    for block in blocks:
+        first = block.split()[0]
+        assert "==" in first, f"every overlay requirement must be exact: {block!r}"
+        assert HASH_RE.search(block), f"every overlay requirement needs a hash: {block!r}"
+
+
+def test_the_unit_test_step_installs_the_hash_pinned_overlay() -> None:
+    block = step_block("Sync and unit tests")
+    assert re.search(
+        r"uv pip install[^\n]*--require-hashes[^\n]*-r[^\n]*\.github/requirements/cryptography\.txt",
+        block,
+    ), "the unit-test step must install the hash-pinned requirements file"
+    assert re.search(r"uv run --no-sync[^\n]*python -m unittest", block), (
+        "the suite must run from the synced venv without a second resolution"
     )
+    assert "cryptography==44.0.0" not in block, "the superseded floating pin must be gone"
+    assert PIN in requirements_text(), f"the requirements file must pin {PIN}"
 
 
 def test_cryptography_stays_out_of_the_core_dependencies() -> None:
