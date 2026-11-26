@@ -5,6 +5,7 @@ the checks are proven against git history rather than mocked diffs.
 """
 
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -18,6 +19,31 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / ".github" / "scripts" / "lease_tamper.py"
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+#: sha256 of the shared policy block and the shared fixtures.  Both repositories
+#: that vendor this gate (workflow and hyvv) and the merge lane (rizzstack)
+#: assert the same values, so the copies cannot drift silently.
+SHARED_POLICY_SHA256 = "f749821a6170379743a7e440edcb0d90141de8d04bf22ef9a3b6d28a78b83ec8"
+REVIEW_LINES_SHA256 = "ac2de684dd22fceed5aa2f18ac6d7d6f8c101c0fd67a619d2a2c6a663642311b"
+CARRY_FIXTURES_SHA256 = "33435d738b84742c8e2b5cfa3e153cf20921fb7a1985f808bbde68603941165e"
+SHARED_BLOCK_BEGIN = "# --- BEGIN SHARED GATE POLICY"
+SHARED_BLOCK_END = "# --- END SHARED GATE POLICY -------------------------------------------------"
+
+
+def load_gate_module():
+    """Import the gate script as a module (it has no import-time side effects)."""
+    spec = importlib.util.spec_from_file_location("lease_tamper_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def shared_policy_block():
+    text = SCRIPT.read_text(encoding="utf-8")
+    start = text.index(SHARED_BLOCK_BEGIN)
+    end = text.index(SHARED_BLOCK_END) + len(SHARED_BLOCK_END)
+    return text[start:end]
 
 
 class GitRepo:
@@ -779,15 +805,8 @@ class SliceClassificationTests(unittest.TestCase):
 # -- base-merge review carry-forward ---------------------------------------
 
 
-class BaseMergeReviewCarryTests(unittest.TestCase):
-    """Owner rule: a review at an earlier head carries over a base-merge-only update.
-
-    Accepted only when (a) the review commit is an ancestor of the head, (b)
-    every commit after it that is not on the base is a merge whose non-first
-    parents are on the base, and (c) the pull request's diff against the base is
-    byte-identical (same paths, same blob shas) to the reviewed diff. The four
-    refusal cases are asserted with their named reason.
-    """
+class CarryFixtureTests(unittest.TestCase):
+    """Temporary repositories for the carry-forward and rejection tests."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="lease-tamper-carry-"))
@@ -871,6 +890,17 @@ class BaseMergeReviewCarryTests(unittest.TestCase):
             "GITHUB_API_URL": self.api.url,
             "GITHUB_TOKEN": "test-token",
         }
+
+
+class BaseMergeReviewCarryTests(CarryFixtureTests):
+    """Owner rule: a review at an earlier head carries over a base-merge-only update.
+
+    Accepted only when (a) the review commit is an ancestor of the head, (b)
+    every commit after it that is not on the base is a merge whose non-first
+    parents are on the base, and (c) the pull request's diff against the base is
+    byte-identical (same paths, same blob shas) to the reviewed diff. The four
+    refusal cases are asserted with their named reason.
+    """
 
     # -- the rule ---------------------------------------------------------
 
@@ -974,6 +1004,87 @@ class BaseMergeReviewCarryTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
         self.assertIn("review_not_ancestor", proc.stdout)
+
+
+# -- newest decisive review governs ----------------------------------------
+
+
+class RejectionGovernsTests(CarryFixtureTests):
+    """A rejection submitted after the approval being used refuses it.
+
+    The three reproduction cases from the Phase 2 review: a rejection at the
+    approved commit, a rejection at the new head after a base-merge update, and
+    a rejection at the same head as the approval.  A later re-approval
+    supersedes the rejection, so the rule is "newest decisive review", not
+    "any rejection ever".
+    """
+
+    def review(self, sha, state="COMMENTED", body=None, submitted_at="2026-11-26T00:00:00Z"):
+        return {
+            "state": state,
+            "commit_id": sha,
+            "body": body if body is not None else "APPROVE (independent review) at %s" % sha,
+            "submitted_at": submitted_at,
+        }
+
+    def test_rejection_at_the_approved_commit_refuses_the_carried_review(self):
+        repo, _base, reviewed = self.build()
+        self.api.reviews[12] = [
+            self.review(reviewed),
+            self.review(reviewed, state="CHANGES_REQUESTED", body="no",
+                        submitted_at="2026-11-26T01:00:00Z"),
+        ]
+        new_base = self.advance_base(repo)
+        head = self.merge(repo)
+
+        proc = self.run_gate(repo, new_base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
+        self.assertIn("review_changes_requested", proc.stdout)
+
+    def test_rejection_at_the_new_head_refuses_the_carried_review(self):
+        repo, _base, reviewed = self.build()
+        new_base = self.advance_base(repo)
+        head = self.merge(repo)
+        self.api.reviews[12] = [
+            self.review(reviewed),
+            self.review(head, body="CHANGES REQUESTED (the carry is unsound) at %s" % head,
+                        submitted_at="2026-11-26T01:00:00Z"),
+        ]
+
+        proc = self.run_gate(repo, new_base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
+        self.assertIn("review_changes_requested", proc.stdout)
+
+    def test_rejection_at_the_same_head_refuses_the_exact_review(self):
+        repo, base, reviewed = self.build()
+        self.api.reviews[12] = [
+            self.review(reviewed),
+            self.review(reviewed, state="CHANGES_REQUESTED", body="no",
+                        submitted_at="2026-11-26T01:00:00Z"),
+        ]
+
+        proc = self.run_gate(repo, base, reviewed, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
+        self.assertIn("review_changes_requested", proc.stdout)
+
+    def test_a_later_reapproval_supersedes_the_rejection(self):
+        repo, base, reviewed = self.build()
+        self.api.reviews[12] = [
+            self.review(reviewed),
+            self.review(reviewed, state="CHANGES_REQUESTED", body="no",
+                        submitted_at="2026-11-26T01:00:00Z"),
+            self.review(reviewed, submitted_at="2026-11-26T02:00:00Z"),
+        ]
+
+        proc = self.run_gate(repo, base, reviewed, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
 # -- lease hardening -------------------------------------------------------
@@ -1448,6 +1559,100 @@ class MergeGroupTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("[no-credentials]", proc.stdout)
         self.assertIn("reason=merge_group_pr_unresolved", proc.stdout)
+
+
+# -- shared policy and fixtures --------------------------------------------
+
+
+class SharedPolicyContractTests(unittest.TestCase):
+    """The gate and the lane must run the same parser, carry and path rules."""
+
+    def test_shared_policy_block_is_byte_identical(self):
+        self.assertEqual(
+            hashlib.sha256(shared_policy_block().encode("utf-8")).hexdigest(),
+            SHARED_POLICY_SHA256,
+            "the shared policy block changed; vendor the identical block into "
+            "rizzstack scripts/merge_lane_v5.py and update the hash in both suites",
+        )
+        module = load_gate_module()
+        for name in (
+            "parse_review_line",
+            "review_form",
+            "governing_rejection",
+            "approval_chain",
+            "review_carry_forward",
+            "sensitive_paths",
+            "check_run_is_success",
+        ):
+            self.assertTrue(hasattr(module, name), name)
+
+    def test_shared_review_line_fixtures(self):
+        fixture = FIXTURES / "review_lines.json"
+        self.assertEqual(hashlib.sha256(fixture.read_bytes()).hexdigest(), REVIEW_LINES_SHA256)
+        module = load_gate_module()
+        document = json.loads(fixture.read_text(encoding="utf-8"))
+        for case in document["cases"]:
+            kind, sha = module.parse_review_line(case["body"])
+            self.assertEqual(kind, case["kind"], case["name"])
+            self.assertEqual(sha, case["sha"], case["name"])
+
+    def test_only_a_completed_success_is_green(self):
+        module = load_gate_module()
+        self.assertTrue(
+            module.check_run_is_success({"status": "completed", "conclusion": "success"})
+        )
+        for conclusion in ("neutral", "skipped", "failure", "cancelled", "stale", "action_required", ""):
+            self.assertFalse(
+                module.check_run_is_success({"status": "completed", "conclusion": conclusion}),
+                conclusion,
+            )
+        self.assertFalse(
+            module.check_run_is_success({"status": "in_progress", "conclusion": None})
+        )
+
+    def test_sensitive_paths_include_the_explicit_list(self):
+        module = load_gate_module()
+        required = {
+            "bundlebees_plugin/verify_local.py",
+            "bundlebees_plugin/contract.py",
+            "bundlebees_plugin/approval.py",
+            "bundlebees_plugin/tdd.py",
+            "bundlebees_plugin/acdd_cli.py",
+            "bundlebees_plugin/subversion_scan.py",
+            "bundlebees_plugin/test_receipts.py",
+            "bundlebees_plugin/transport.py",
+            "bundlebees_plugin/return_report.py",
+            "tests/test_lease_tamper.py",
+        }
+        self.assertLessEqual(required, set(module.SENSITIVE_PATHS))
+        for path in required:
+            self.assertEqual(module.sensitive_paths([path]), [path], path)
+        self.assertEqual(module.sensitive_paths(["bundlebees_plugin/delegate.py"]), [])
+
+
+class SharedCarryFixtureTests(unittest.TestCase):
+    """Both implementations must agree with one set of git fixtures."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="lease-tamper-shared-carry-"))
+        self.module = load_gate_module()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_shared_carry_scenarios(self):
+        fixture = FIXTURES / "carry_scenarios.py"
+        self.assertEqual(hashlib.sha256(fixture.read_bytes()).hexdigest(), CARRY_FIXTURES_SHA256)
+        spec = importlib.util.spec_from_file_location("carry_scenarios", fixture)
+        scenarios = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenarios)
+        for name, review_sha, base, head, reason, ok in scenarios.build_all(self.tmp):
+            got_ok, got_reason, detail = self.module.review_carry_forward(
+                str(self.tmp / name), review_sha, base, head
+            )
+            self.assertEqual(
+                (got_ok, got_reason), (ok, reason), "%s: %s" % (name, detail)
+            )
 
 
 if __name__ == "__main__":
