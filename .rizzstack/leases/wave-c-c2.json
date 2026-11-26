@@ -2,8 +2,8 @@
   "id": "wave-c-c2",
   "lease_version": "rizzstack.lease/1",
   "slice": "wave-c-c2",
-  "pull_request": 65,
-  "branch": "feat/wave-c-c2",
+  "pull_request": 83,
+  "branch": "feat/wave-c-c2-r3",
   "contract_id": "wave-c-c2",
   "contract_sha256": "ccd4392ddafeacf02eca415d8a7e8045d1462db502e6d4a8ed7c99e53899533f",
   "source_rev": "5c2e4a4f69c14f0f9fa68383b2147bd67f691318",
@@ -25,7 +25,12 @@
   },
   "derived_from": {
     "contract": "rizzstack-t1634/contracts/wave-bc/C2.contract.json",
-    "approved_by": "owner standing approval for waves B/C and Part 2 (2026-11-25)",
-    "approved_at": "2026-11-25T17:12:00Z"
+    "approved_by": "owner (chat): approved: ccd4392d",
+    "approved_at": "2026-11-26T01:20:00Z"
+  },
+  "review": {
+    "status": "frozen",
+    "approved_by": "owner (chat): approved: ccd4392d",
+    "approved_at": "2026-11-26T01:20:00Z"
   }
 }

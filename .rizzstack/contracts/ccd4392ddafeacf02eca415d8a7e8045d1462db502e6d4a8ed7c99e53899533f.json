@@ -1,0 +1,178 @@
+{
+ "contract_version": "acdd/1",
+ "id": "wave-c-C2",
+ "title": "Accept and report rizzstack.ticket/1 claims at POST /v1/attempts (report mode only)",
+ "outcome": {
+  "summary": "POST /v1/attempts accepts an optional brief.ticket claims object and, when ticket_mode is report, validates it against the vendored schemas/rizzstack-ticket.schema.json (draft 2020-12, twelve ADR claims, no unknown claims). The attempt is always accepted: the outcome is persisted and returned as ticket_report with status missing|valid|invalid, a violations list whose entries name the failing claim, and signature \"not_checked\". ticket_mode defaults to off, accepts only off|report, is read from config only (no environment variable), and refuses enforce at load. No signature verification, crypto import or key material is added; C4 owns verification and wave D owns JCS.",
+  "observable_behavior": [
+   "With ticket_mode off, a create with no ticket and a create with a malformed ticket are both accepted exactly as before; neither the response nor the attempt journal gains a ticket_report key.",
+   "With ticket_mode report, a schema-invalid ticket is accepted and recorded as ticket_report.status=invalid with ticket_invalid violations whose detail names the failing claim (e.g. source_rev).",
+   "With ticket_mode report, a brief with no ticket is accepted and recorded as ticket_report.status=missing with one ticket_missing violation.",
+   "A claims set with the ADR's twelve claims validates against schemas/rizzstack-ticket.schema.json and is recorded as ticket_report.status=valid with no violations.",
+   "Every report carries signature=\"not_checked\"; a JWS-shaped string is treated as an invalid claims object, never verified; launcher.py gains no crypto import and the vendored schema holds no key material.",
+   "ticket_mode defaults to off, accepts off|report, refuses enforce with ValueError at load_config, and HYYV_TICKET_MODE/TICKET_MODE/RIZZSTACK_TICKET_MODE/BUNDLEBEES_TICKET_MODE do not change it."
+  ]
+ },
+ "interfaces": [
+  {
+   "name": "POST /v1/attempts",
+   "kind": "http",
+   "change": "modify",
+   "notes": "Additive: brief.ticket is optional; in report mode the 200/201 body gains ticket_report. No new refusal status in this slice."
+  },
+  {
+   "name": "launcher.load_config",
+   "kind": "function",
+   "change": "modify",
+   "notes": "Defaults ticket_mode to off and refuses any value other than off|report."
+  },
+  {
+   "name": "launcher.ticket_violations",
+   "kind": "function",
+   "change": "add",
+   "notes": "Pure validator over the vendored schema: claims object in, list of {code, detail} out (empty means valid). No crypto, no network, no key material."
+  },
+  {
+   "name": "launcher.ticket_report",
+   "kind": "function",
+   "change": "add",
+   "notes": "Builds {schema: rizzstack.ticket-report/1, mode, status, violations, signature: not_checked} from cfg and brief."
+  },
+  {
+   "name": "schemas/rizzstack-ticket.schema.json",
+   "kind": "schema",
+   "change": "add",
+   "notes": "Vendored copy of workflow #171 (commit 6fed14c): draft 2020-12, title rizzstack.ticket/1, twelve required claims, additionalProperties false."
+  }
+ ],
+ "acceptance_criteria": [
+  {
+   "id": "AC-001",
+   "statement": "a brief with no ticket is accepted unchanged and no ticket_report appears in the response or journal",
+   "verification": "test",
+   "tests": [
+    "tests/test_ticket_surface.py::OffModeTicketSurface::test_no_ticket_brief_is_accepted_unchanged"
+   ],
+   "regression": true
+  },
+  {
+   "id": "AC-002",
+   "statement": "ticket_mode off ignores a malformed ticket, stores the brief as sent and records no report",
+   "verification": "test",
+   "tests": [
+    "tests/test_ticket_surface.py::OffModeTicketSurface::test_off_mode_ignores_a_malformed_ticket"
+   ],
+   "regression": true
+  },
+  {
+   "id": "AC-003",
+   "statement": "report mode accepts a malformed ticket, records ticket_invalid and names source_rev in the violations",
+   "verification": "test",
+   "tests": [
+    "tests/test_ticket_surface.py::ReportModeTicketSurface::test_report_mode_records_a_malformed_ticket_and_still_accepts"
+   ]
+  },
+  {
+   "id": "AC-004",
+   "statement": "report mode accepts a missing ticket and records exactly one ticket_missing violation",
+   "verification": "test",
+   "tests": [
+    "tests/test_ticket_surface.py::ReportModeTicketSurface::test_report_mode_records_a_missing_ticket_and_still_accepts"
+   ]
+  },
+  {
+   "id": "AC-005",
+   "statement": "the twelve ADR claims validate against the vendored schema and are reported valid",
+   "verification": "test",
+   "tests": [
+    "tests/test_ticket_surface.py::ReportModeTicketSurface::test_twelve_claim_ticket_passes_schema_validation"
+   ]
+  },
+  {
+   "id": "AC-006",
+   "statement": "reports say signature not_checked and the slice adds no signature verification, crypto import or key material",
+   "verification": "test",
+   "tests": [
+    "tests/test_ticket_surface.py::ReportModeTicketSurface::test_no_signature_verification_or_key_material_in_this_slice"
+   ]
+  },
+  {
+   "id": "AC-007",
+   "statement": "ticket_mode defaults to off, accepts report, refuses enforce and ignores the candidate environment variables",
+   "verification": "test",
+   "tests": [
+    "tests/test_ticket_surface.py::ConfigTicketMode::test_ticket_mode_defaults_off_and_environment_cannot_enable_enforce"
+   ]
+  }
+ ],
+ "dependencies": [
+  "wave-c-C1: workflow schemas/rizzstack-ticket.schema.json (6fed14c) is the source of the vendored copy",
+  "wave-b-B1: the parsable /v1 contract this endpoint surface is described against"
+ ],
+ "assumptions": [
+  "brief.ticket carries the decoded claims object in C2; the compact JWS form arrives with C4 verification.",
+  "C2 does not recompute brief_sha256 or compare claims to the brief; wave D's RFC 8785 core and C4 own that."
+ ],
+ "scope": {
+  "assigned_files": [
+   "launcher.py",
+   "schemas/rizzstack-ticket.schema.json"
+  ],
+  "test_files": [
+   "tests/test_ticket_surface.py"
+  ],
+  "prohibited": [
+   ".github/workflows/**",
+   "CHANGELOG.md",
+   "pyproject.toml",
+   "uv.lock"
+  ]
+ },
+ "source_rev": "5c2e4a4f69c14f0f9fa68383b2147bd67f691318",
+ "tdd": {
+  "applicable": true,
+  "test_first": true
+ },
+ "verification": {
+  "independent": true,
+  "commands": [
+   "python -m unittest tests.test_ticket_surface -v"
+  ]
+ },
+ "evidence_required": [
+  "red",
+  "green",
+  "review"
+ ],
+ "authorization": {
+  "human_gates": [
+   "merge",
+   "tag",
+   "release",
+   "deploy",
+   "publish"
+  ],
+  "not_authorized": [
+   "merge",
+   "deploy",
+   "restart",
+   "tag",
+   "branch deletion",
+   "live canary"
+  ]
+ },
+ "risk": {
+  "tier": "high",
+  "reasons": [
+   "changes the admission surface every bee create crosses (/v1/attempts)",
+   "first hyvv half of the ADR 0002 security boundary; a report that looks like enforcement would mislead rollouts"
+  ]
+ },
+ "review": {
+  "status": "approved",
+  "approved_by": "Kyle (owner), typed approval in chat, 2026-11-25",
+  "approved_at": "2026-11-26T01:17:00Z",
+  "contract_sha256": "ccd4392ddafeacf02eca415d8a7e8045d1462db502e6d4a8ed7c99e53899533f",
+  "note": "explicit approval replaces standing-approval attribution"
+ }
+}

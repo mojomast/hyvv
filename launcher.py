@@ -35,6 +35,9 @@ if _landing_export is None:  # pragma: no cover - loaded from a sibling copy
     except Exception:
         _landing_export = None
 
+# The release base this source tree sits on (pyproject.toml is the single source). What a running
+# launcher reports is build_version(): `git describe` adds the commits past the tag, so a build off
+# a tag can never answer the bare release (see the build identity section below).
 VERSION = "0.1.19"
 HEARTBEAT_S = 60  # controller emits a heartbeat event after this many quiet seconds
 MAX_WORKERS = 14  # hard ceiling for max_concurrent (owner directive: final ceiling, supersedes the interim cap-12)
@@ -963,6 +966,126 @@ def replay_landed_events(data_dir, cfg=None, notifier=None):
         after = page["next_cursor"]
 
 
+# ---------------------------------------------------------------- build identity
+# A running launcher reports the commit it was built from, never a release tag it does not
+# contain. A worker PC answered "0.1.19" while running a tree 25 commits past tag v0.1.19, so a
+# build off the tag and the tag itself were indistinguishable. The reported version comes from
+# `git describe --tags --always --dirty` (`0.1.19+25.g7f73b7c`, `.dirty` for a modified tree).
+# An installed copy has no .git, so the same describe output is baked beside launcher.py at
+# build/package time (hyvv-build.json) or recorded by the apply-update (hyvv-deployed.json).
+# With only a SHA the version names the SHA (`0.1.19+g7f73b7c`); with no identity at all it
+# says `0.1.19+unknown`. Only a clean checkout exactly at the tag may answer the bare release.
+BUILD_INFO_NAME = "hyvv-build.json"
+_BUILD_DESCRIBE_KEYS = ("describe", "git_describe", "build_describe")
+_BUILD_SHA_KEYS = ("sha", "rev", "revision", "source_rev", "commit")
+_TAG_DESCRIBE_RE = re.compile(
+    r"^v?(?P<base>\d+(?:\.\d+){1,3})(?:-(?P<count>\d+)-g(?P<sha>[0-9a-f]{7,40}))?(?P<dirty>-dirty)?$")
+_COMMIT_RE = re.compile(r"[0-9a-f]{7,64}")
+_GIT_CACHE: dict[str, dict] = {}
+
+
+def _run_git(root, *args):
+    """stdout of one git command in *root*, or None when git or the command fails."""
+    import subprocess
+    try:
+        r = subprocess.run(["git", "--no-optional-locks", *args], cwd=str(root), capture_output=True,
+                           text=True, timeout=10, stdin=subprocess.DEVNULL,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _describe_fields(raw, sha):
+    """Parse describe output into its release base, tag, distance, short sha and dirty flag."""
+    dirty = raw.endswith("-dirty")
+    m = _TAG_DESCRIBE_RE.fullmatch(raw)
+    short = (sha or "").strip().lower()[:7]
+    if m:
+        short = m.group("sha") or short
+        return {"base": m.group("base"), "tag": "v" + m.group("base"),
+                "count": int(m.group("count") or 0), "short": short, "dirty": dirty}
+    if _COMMIT_RE.fullmatch(raw.removesuffix("-dirty")):  # `--always` with no tag reachable
+        short = raw.removesuffix("-dirty")[:7]
+    return {"base": VERSION, "tag": None, "count": None, "short": short, "dirty": dirty}
+
+
+def _version_text(fields):
+    """The one version form allowed for these fields; only a clean on-tag build is the release."""
+    base, count, short = fields["base"], fields["count"], fields["short"]
+    if count == 0:
+        version = base
+    elif count:
+        version = f"{base}+{count}.g{short}"
+    elif short:
+        version = f"{base}+g{short}"
+    else:
+        version = f"{base}+unknown"
+    if fields["dirty"]:
+        version += ".dirty" if "+" in version else "+dirty"
+    return version
+
+
+def build_from_describe(describe, sha="", source="git"):
+    """Map ``git describe --tags --always --dirty`` output to the reported build identity.
+
+    The bare release (``0.1.19``) is the only form returned for a clean checkout exactly at the
+    tag; every other form carries a local segment naming how far past the tag or which commit.
+    """
+    raw = (describe or "").strip()
+    fields = _describe_fields(raw, sha)
+    return {"version": _version_text(fields), "release": fields["base"], "tag": fields["tag"],
+            "commits_past_tag": fields["count"], "describe": raw or None,
+            "sha": (sha or "").strip().lower() or None, "short_sha": fields["short"] or None,
+            "dirty": fields["dirty"], "source": source}
+
+
+def _build_info_from(path):
+    """(describe, sha) recorded in a build/receipt JSON file, or None."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    describe = next((data[k].strip() for k in _BUILD_DESCRIBE_KEYS
+                     if isinstance(data.get(k), str) and data[k].strip()), "")
+    sha = next((data[k].strip() for k in _BUILD_SHA_KEYS
+                if isinstance(data.get(k), str) and data[k].strip()), "")
+    return (describe, sha) if (describe or sha) else None
+
+
+def build_identity(root=None, cfg=None):
+    """The build this process runs: git metadata, else the baked/deployed record, else unknown.
+
+    The git answer is cached per install root: a process reports the build it started from.
+    Without git metadata the baked hyvv-build.json wins over the apply-update receipt, so a
+    packaged build keeps its own describe output and never inherits a newer deploy's identity.
+    """
+    root = Path(root or LAUNCHER_DIR).resolve()
+    ident = _GIT_CACHE.get(str(root))
+    if ident is None:
+        has_git = (root / ".git").exists()
+        describe = _run_git(root, "describe", "--tags", "--always", "--dirty") if has_git else None
+        if describe:
+            ident = build_from_describe(describe, _run_git(root, "rev-parse", "HEAD") or "", "git")
+            _GIT_CACHE[str(root)] = ident
+    if ident is not None:
+        return dict(ident)
+    baked = _build_info_from(root / BUILD_INFO_NAME)
+    if baked:
+        return build_from_describe(baked[0], baked[1], "baked")
+    receipt = deployment_receipt(cfg or {}, root=root)
+    if receipt and "status" not in receipt:
+        return build_from_describe(receipt.get("describe", ""), receipt.get("rev", ""), "receipt")
+    return build_from_describe("", "", "unknown")
+
+
+def build_version(root=None, cfg=None):
+    """The version string every launcher surface reports."""
+    return build_identity(root, cfg)["version"]
+
+
 # ---------------------------------------------------------------- deployment receipt (/v1/health)
 # The admin apply-update records what it deployed in hyvv-deployed.json. /v1/health republishes only
 # the validated identity fields so a coordinator can confirm the running build from deployment
@@ -974,11 +1097,12 @@ _RECEIPT_AT_KEYS = ("deployed_at", "applied_at", "installed_at_utc")
 # the running launcher.py), with keys repo/sha/version/installed_at_utc/files.
 LAUNCHER_DIR = Path(__file__).resolve().parent
 _RECEIPT_REV_KEYS = ("rev", "revision", "source_rev", "sha", "commit")
-_RECEIPT_VERSION_RE = re.compile(r"\d+(?:\.\d+){1,3}")
+# A receipt may record a describe-derived build version (`0.1.19+25.g7f73b7c`), not only a release.
+_RECEIPT_VERSION_RE = re.compile(r"\d+(?:\.\d+){1,3}(?:\+[a-z0-9]+(?:\.[a-z0-9]+)*)?")
 _RECEIPT_REV_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
-def _receipt_paths(cfg):
+def _receipt_paths(cfg, root=None):
     explicit = cfg.get("deployment_receipt_path")
     if explicit:  # a configured location never falls back to a default one
         return [Path(explicit).expanduser()], True
@@ -987,21 +1111,28 @@ def _receipt_paths(cfg):
         paths.append(Path(cfg["_config_path"]).expanduser().parent / DEPLOYMENT_RECEIPT_NAME)
     if cfg.get("data_dir"):
         paths.append(Path(cfg["data_dir"]).expanduser() / DEPLOYMENT_RECEIPT_NAME)
-    install = LAUNCHER_DIR / DEPLOYMENT_RECEIPT_NAME
+    install = Path(root or LAUNCHER_DIR) / DEPLOYMENT_RECEIPT_NAME
     if install not in paths:
         paths.append(install)
     return paths, False
 
 
-def deployment_receipt(cfg):
-    """``{"deployed_at", "version", "rev"}`` from the apply-update receipt, an invalid marker, or None.
+def _valid_describe(text):
+    """True for describe output this launcher can turn into a build identity."""
+    t = (text or "").strip()
+    return bool(_TAG_DESCRIBE_RE.fullmatch(t) or _COMMIT_RE.fullmatch(t.removesuffix("-dirty")))
+
+
+def deployment_receipt(cfg, root=None):
+    """``{"deployed_at", "version", "rev", "describe"}`` from the apply-update receipt, invalid, or None.
 
     None means no receipt exists at the default locations (the key is then omitted from /v1/health).
     A configured path that is missing, an unreadable/oversize file, or a receipt without a zoned
-    ``deployed_at`` timestamp and a well-formed identity (dotted version and/or 40/64-hex rev) yields
-    ``{"status": "invalid", "reason": ...}`` -- never a repaired or partial receipt.
+    ``deployed_at`` timestamp and a well-formed identity (dotted or describe-derived version,
+    describe output, and/or 40/64-hex rev) yields ``{"status": "invalid", "reason": ...}`` -- never
+    a repaired or partial receipt.
     """
-    paths, explicit = _receipt_paths(cfg)
+    paths, explicit = _receipt_paths(cfg, root)
     path = next((p for p in paths if p.is_file()), None)
     if path is None:
         return {"status": "invalid", "reason": "receipt_unreadable"} if explicit else None
@@ -1034,9 +1165,107 @@ def deployment_receipt(cfg):
         if not (isinstance(rev, str) and _RECEIPT_REV_RE.fullmatch(rev.strip().lower())):
             return invalid("receipt_malformed")
         out["rev"] = rev.strip().lower()
-    if "version" not in out and "rev" not in out:
+    describe = next((data[k] for k in _BUILD_DESCRIBE_KEYS if data.get(k) is not None), None)
+    if describe is not None:
+        if not (isinstance(describe, str) and _valid_describe(describe)):
+            return invalid("receipt_malformed")
+        out["describe"] = describe.strip()
+    if not ({"version", "rev", "describe"} & set(out)):
         return invalid("receipt_malformed")
     return out
+
+
+_TICKET_SCHEMA_CACHE = None
+
+
+def _ticket_schema():
+    global _TICKET_SCHEMA_CACHE
+    if _TICKET_SCHEMA_CACHE is None:
+        _TICKET_SCHEMA_CACHE = json.loads((LAUNCHER_DIR / "schemas" / "rizzstack-ticket.schema.json").read_text("utf-8"))
+    return _TICKET_SCHEMA_CACHE
+
+
+def _ticket_matches_type(value, kind):
+    if kind == "object":
+        return isinstance(value, dict)
+    if kind == "array":
+        return isinstance(value, list)
+    if kind == "string":
+        return isinstance(value, str)
+    if kind == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if kind == "boolean":
+        return isinstance(value, bool)
+    if kind == "null":
+        return value is None
+    return True
+
+
+def _ticket_shape_violations(ticket, schema):
+    violations = []
+    properties = schema.get("properties", {})
+    for claim in schema.get("required", []):
+        if claim not in ticket:
+            violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} is required"})
+    if schema.get("additionalProperties") is False:
+        for claim in sorted((key for key in ticket if key not in properties), key=str):
+            violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} is not allowed"})
+    return violations
+
+
+def _ticket_string_violations(claim, value, rules):
+    violations = []
+    if "minLength" in rules and len(value) < rules["minLength"]:
+        violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} is shorter than minLength"})
+    if "pattern" in rules and re.search(rules["pattern"], value) is None:
+        violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} does not match the required pattern"})
+    return violations
+
+
+def _ticket_allowed_value_violations(claim, value, rules):
+    violations = []
+    if "enum" in rules and value not in rules["enum"]:
+        violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} is not an allowed value"})
+    if "const" in rules and value != rules["const"]:
+        violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} does not equal the required constant"})
+    return violations
+
+
+def _ticket_claim_violations(claim, value, rules):
+    expected = rules.get("type")
+    if expected is not None:
+        kinds = expected if isinstance(expected, list) else [expected]
+        if not any(_ticket_matches_type(value, kind) for kind in kinds):
+            return [{"code": "ticket_invalid", "detail": f"ticket claim {claim} has the wrong type"}]
+    violations = []
+    if isinstance(value, str):
+        violations.extend(_ticket_string_violations(claim, value, rules))
+    violations.extend(_ticket_allowed_value_violations(claim, value, rules))
+    return violations
+
+
+def ticket_violations(ticket, schema=None) -> list[dict]:
+    schema = _ticket_schema() if schema is None else schema
+    if not isinstance(ticket, dict):
+        return [{"code": "ticket_invalid", "detail": "ticket must be an object"}]
+    violations = _ticket_shape_violations(ticket, schema)
+    for claim, rules in schema.get("properties", {}).items():
+        if claim in ticket:
+            violations.extend(_ticket_claim_violations(claim, ticket[claim], rules))
+    return violations
+
+
+def ticket_report(cfg, brief) -> dict:
+    if "ticket" not in brief:
+        status = "missing"
+        violations = [{"code": "ticket_missing", "detail": "ticket is missing from the brief"}]
+    else:
+        violations = ticket_violations(brief["ticket"])
+        status = "valid" if not violations else "invalid"
+    return {"schema": "rizzstack.ticket-report/1", "mode": cfg.get("ticket_mode", "off"),
+            "status": status, "violations": violations, "signature": "not_checked"}
 
 
 def load_config(path):
@@ -1057,6 +1286,9 @@ def load_config(path):
         default_timeout_s = DEFAULT_ATTEMPT_TIMEOUT_S
     cfg["default_timeout_s"] = max(60, min(86400, default_timeout_s))
     cfg.setdefault("require_budget", False)
+    cfg.setdefault("ticket_mode", "off")
+    if cfg["ticket_mode"] not in ("off", "report"):
+        raise ValueError("ticket_mode must be off or report")
     cfg.setdefault("data_dir", str(Path.home() / ".orbit-launcher"))
     cfg.setdefault("projects", {})  # name -> {"repo": url} (authorized projects)
     cfg.setdefault("provisioning", {})  # {"policy": path, "journal": path, "enabled": bool}
@@ -2189,6 +2421,15 @@ class DockerProbe:
         return snap
 
 
+def log_cleanup(a, status):
+    """One operator line when teardown did not confirm. Never a secret, path or hostname."""
+    try:
+        print(f"[launcher] cleanup {status} attempt={a.get('attempt_id')} sandbox={a.get('sandbox')}",
+              file=sys.stderr, flush=True)
+    except Exception:
+        pass  # a closed stderr must not turn a recorded teardown into a crash
+
+
 class Launcher:
     def __init__(self, cfg, backend):
         self.cfg, self.backend = cfg, backend
@@ -2293,6 +2534,8 @@ class Launcher:
     def public(self, a):
         keys = ("attempt_id", "kind", "mode", "tier", "state", "detail", "run_id", "sandbox", "created_at", "updated_at", "lseq", "queue_position", "retry_at", "rate_limited", "model", "fallback", "pool", "model_history")
         d = {k: a.get(k) for k in keys}
+        if "ticket_report" in a:
+            d["ticket_report"] = a["ticket_report"]
         if a.get("workspace_error"):
             d["workspace_error"] = a["workspace_error"]
         if d["state"] == "queued": q = self._queue(); d["queue_position"] = q.index(a["attempt_id"]) + 1 if a["attempt_id"] in q else None  # one snapshot: a second _queue() call could race the .index()
@@ -2333,6 +2576,7 @@ class Launcher:
     def submit(self, aid, brief, model=None, kind=None, mode=None):
         with self.lock:
             if aid in self.attempts: return self.attempts[aid], False  # idempotent: never a second controller
+            report = ticket_report(self.cfg, brief) if self.cfg.get("ticket_mode", "off") == "report" else None
             kind = kind or brief.get("kind") or "opencode"
             if kind not in KINDS: raise ValueError(f"unknown kind: {kind} (allowed: {', '.join(KINDS)})")
             prof = resolve_security_profile(self.cfg, kind, brief)  # ValueError -> 400; coding bees: "default" only
@@ -2342,6 +2586,7 @@ class Launcher:
                 now = time.time()
                 a = {"attempt_id": aid, "kind": kind, "brief": brief, "state": "queued", "detail": "waiting for a worker slot", "created_at": now,
                      "updated_at": now, "lseq": 0, "cursor": 0, "rate_limited": 0, "model": None, "security_profile": prof}
+                if report is not None: a["ticket_report"] = report
                 self.attempts[aid] = a; self._save(a)
                 self.kick(); return a, True
             if kind == "agy-cua":
@@ -2355,6 +2600,7 @@ class Launcher:
             now = time.time()
             a = {"attempt_id": aid, "kind": kind, "brief": brief, "state": "queued", "detail": "waiting for a worker slot", "created_at": now,
                  "updated_at": now, "lseq": 0, "cursor": 0, "rate_limited": 0, "model": None if spec.get("pool") else spec["name"]}
+            if report is not None: a["ticket_report"] = report
             if spec.get("pool"): a.update(pool=spec["pool"], tried=[], model_history=[])
             if kind == "agy-cua":
                 a["tier"] = spec.get("tier"); a["mode"] = mode or brief.get("mode") or "ui"
@@ -2452,17 +2698,24 @@ class Launcher:
 
         The ledger is keyed by sandbox, not attempt id: a retry keeps the same attempt id but
         gets a new sandbox, and that second sandbox must also be torn down exactly once.
+
+        Returns what happened - "cleaned", "skipped" (already torn down, or nothing recorded),
+        "failed" (the backend raised) or "timed_out" - and never raises: teardown is best effort,
+        and the caller records the outcome. With `timeout` the wait is bounded on the launcher's
+        own clock, so a backend.cleanup that never returns cannot wedge a caller that still owes
+        the attempt a terminal state. The ledger entry stays: teardown is exactly once per
+        sandbox, and a timed-out delete must not be re-issued behind a live one.
         """
         aid = a.get("attempt_id")
         if not aid:
-            return
+            return "skipped"
         sandbox = a.get("sandbox")
         if sandbox:
             if sandbox in self._cleaned_sandboxes:
-                return
+                return "skipped"
             self._cleaned_sandboxes.add(sandbox)
         elif aid in self._cleaned_aids:
-            return
+            return "skipped"
         self._cleaned_aids.add(aid)
         try:
             coro = self.backend.cleanup(a)
@@ -2470,8 +2723,11 @@ class Launcher:
                 await asyncio.wait_for(coro, timeout)
             else:
                 await coro
+        except asyncio.TimeoutError:
+            return "timed_out"
         except Exception:
-            pass
+            return "failed"
+        return "cleaned"
 
     def _sync_cleanup(self, a):
         try:
@@ -2547,9 +2803,10 @@ class Launcher:
     def publish_runtime_status(self):
         live = len(self._active())
         journal_active, journal_tmp = self.journal_counts()
+        build = build_identity(cfg=getattr(self, "cfg", None))
         body = {"active": live, "journal_active": journal_active, "journal_tmp": journal_tmp,
                 "split_brain": (live != journal_active) or (journal_tmp > 0),
-                "version": VERSION, "updated_at": time.time()}
+                "version": build["version"], "build": build, "updated_at": time.time()}
         path = self.dir / "runtime_status.json"
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(body, indent=1), "utf-8")
@@ -2959,7 +3216,9 @@ class Launcher:
                 try:
                     # bounded like every other stop step: a backend.result() that never returns
                     # must not leave the attempt budget_stop-marked and non-terminal forever.
-                    await asyncio.wait_for(self._finish(a, done), BUDGET_STOP_GRACE_S)
+                    # _finish bounds its own teardown at 2*GRACE, so the wait adds one GRACE for
+                    # the collection instead of cutting a slow-but-honest cleanup short.
+                    await asyncio.wait_for(self._finish(a, done), 3 * BUDGET_STOP_GRACE_S)
                     cleaned = True  # _finish tore the worker down itself; the finally must not repeat it
                 except Exception as ex:
                     with self.lock:
@@ -3011,7 +3270,7 @@ class Launcher:
             b = a["brief"]
             manifest = {"schema": "orbit.local-worker.check-result/v1", "attempt_id": a["attempt_id"],
                         "source": {"project": b.get("project"), "repo_rev": b.get("source_rev"), "image": prof.get("image"), "kind": "check",
-                                   "security_profile": a.get("security_profile"), "launcher": VERSION},
+                                   "security_profile": a.get("security_profile"), "launcher": build_version()},
                         "observed": {"node": platform.node(), "run_id": a.get("run_id"), "sandbox_id": a.get("sandbox_id"), "workdir": a.get("workdir"),
                                      "local_base_rev": a.get("local_base_rev"), "seed_commit": a.get("seed_commit"),
                                      "result_file": str(self.dir / "attempts" / f"{a['attempt_id']}.result.json")},
@@ -3118,9 +3377,14 @@ class Launcher:
 
     async def _finish(self, a, e):
         res = await self.backend.result(a)
+        # Evidence is collected before the teardown: patch/environment/file hashes need the live
+        # sandbox, so unlike the terminal write they cannot move below the cleanup.
         manifest = await self._manifest(a, res)
-        (self.dir / "attempts" / f"{a['attempt_id']}.result.json").write_text(json.dumps(manifest, indent=1), "utf-8")
-        ok = e.get("stop_reason") in ("end_turn", None) and not res.get("error") and e["kind"] == "turn_ended"
+        path = self.dir / "attempts" / f"{a['attempt_id']}.result.json"
+        # Land the evidence before the teardown: the teardown below can now take a full bounded
+        # grace, and a crash inside it must still leave _recovered_manifest something to restore
+        # (the outcome is re-written with cleanup_status once the teardown answers).
+        path.write_text(json.dumps(manifest, indent=1), "utf-8")
         # Tear the sandbox down before publishing the terminal state: a reader that observes
         # "succeeded"/"failed" must never see the recorded sandbox still alive. _set's terminal
         # write (journal save + landed-event publication) can stall on a contended runner, and
@@ -3128,7 +3392,17 @@ class Launcher:
         # could observe a finished attempt whose teardown had not run yet (the 3.13 red run
         # saw cleaned == [] instead of ["sb-1"]). Teardown is idempotent, so the controller's
         # finally call stays a no-op.
-        await self._cleanup_once(a)
+        # The teardown is bounded like every other stop step: a backend.cleanup that never
+        # returns must not leave the attempt non-terminal and holding its worker slot. Whatever
+        # it did is recorded on the attempt (journal) and in the result manifest, and the
+        # terminal write below happens regardless of the outcome.
+        status = await self._cleanup_once(a, timeout=2 * BUDGET_STOP_GRACE_S)
+        a["cleanup_status"] = status
+        manifest["cleanup_status"] = status
+        if status in ("failed", "timed_out"):
+            log_cleanup(a, status)
+        path.write_text(json.dumps(manifest, indent=1), "utf-8")
+        ok = e.get("stop_reason") in ("end_turn", None) and not res.get("error") and e["kind"] == "turn_ended"
         self._set(a, "succeeded" if ok else "failed", f"turn ended: {e.get('stop_reason') or e['kind']}")
 
     async def _manifest(self, a, res):
@@ -3149,7 +3423,7 @@ class Launcher:
             except Exception: claims = {"unparsed": True}
         return {"schema": "orbit.local-worker.result/v1", "attempt_id": a["attempt_id"],
                 "source": {"project": b.get("project"), "repo_rev": b.get("source_rev"), "input_manifest_sha256": b.get("input_manifest_sha256"),
-                           "image": self.cfg["image"], "kind": a.get("kind") or "opencode", "mode": a.get("mode"), "tier": a.get("tier"), "harness": "agy" if a.get("kind") == "agy-cua" else "opencode", "model": a.get("model") or self.cfg["model"], "fallback": a.get("fallback"), "tier_pool": a.get("pool"), "model_history": a.get("model_history"), "launcher": VERSION},
+                           "image": self.cfg["image"], "kind": a.get("kind") or "opencode", "mode": a.get("mode"), "tier": a.get("tier"), "harness": "agy" if a.get("kind") == "agy-cua" else "opencode", "model": a.get("model") or self.cfg["model"], "fallback": a.get("fallback"), "tier_pool": a.get("pool"), "model_history": a.get("model_history"), "launcher": build_version()},
                 "observed": {"node": platform.node(), "run_id": a.get("run_id"), "sandbox_id": a.get("sandbox_id"), "workdir": a.get("workdir"), "local_base_rev": a.get("local_base_rev"), "seed_commit": a.get("seed_commit"),
                              "result_file": str(self.dir / "attempts" / f"{a['attempt_id']}.result.json"), "status": res.get("status"), "stop_reason": res.get("stop_reason"),
                              "tool_calls": res.get("tool_calls"), "usage": res.get("usage"), "files": (patch or {}).get("files") or files, "artifacts": files, "error": res.get("error")},
@@ -3344,7 +3618,7 @@ def make_handler(L, token):
         from rails_export import ReadAccess, handle_read
         rails_access = ReadAccess(L.cfg, token)
     class H(BaseHTTPRequestHandler):
-        server_version = "orbit-launcher/" + VERSION
+        server_version = "orbit-launcher/" + build_version()
         protocol_version = "HTTP/1.1"  # keep-alive (plan C); every reply sets Content-Length
         timeout = 120  # idle keep-alive sockets close after 2 min (the box client drops them after 60 s)
         def log_message(self, *a): pass
@@ -3400,7 +3674,9 @@ def make_handler(L, token):
                 return self._send(200, {"containers": [{"image": L.cfg.get("image"), "runtime": L.cfg.get("runtime"), "memory_mb": L.cfg.get("memory_mb")}],
                                         "security_profiles": ["default"] + sorted(L.cfg.get("security_profiles") or {})})
             if p == ["v1", "version"]:
-                return self._send(200, {"api_version": "v1", "version": VERSION,
+                build = build_identity(cfg=L.cfg)
+                return self._send(200, {"api_version": "v1", "version": build["version"], "release": VERSION,
+                                        "build": build,
                                         "capabilities": ["priority_routing", "go_fallback"]})
             if p == ["v1", "health"]:
                 # `models` is the dispatchable allow-list (built-ins plus this host's config entries),
@@ -3417,7 +3693,8 @@ def make_handler(L, token):
                     live = len(L._active()); jact, jtmp = L.journal_counts()
                     st = {"active": live, "journal_active": jact, "journal_tmp": jtmp,
                           "split_brain": (live != jact) or (jtmp > 0)}
-                return self._send(200, {"ok": True, "version": VERSION, "max_concurrent": L.cfg["max_concurrent"], "active": st["active"], "journal_active": st["journal_active"], "journal_tmp": st["journal_tmp"], "split_brain": st["split_brain"], "queued": len(L._queue()), "model": L.cfg["model"],
+                build = build_identity(cfg=L.cfg)
+                return self._send(200, {"ok": True, "version": build["version"], "release": VERSION, "build": build, "max_concurrent": L.cfg["max_concurrent"], "active": st["active"], "journal_active": st["journal_active"], "journal_tmp": st["journal_tmp"], "split_brain": st["split_brain"], "queued": len(L._queue()), "model": L.cfg["model"],
                                        "configured_model": L.cfg["model"], "effective_model": eff_model, "models": allow, "uptime_s": round(time.time() - L.started_at), "loop_lag_ms": round(L.loop_lag_ms, 1),
                                        **({"deployment_receipt": rc} if (rc := deployment_receipt(L.cfg)) is not None else {})})
             if p == ["v1", "capacity"]:  # admission inputs for go-max fillers (hyvv.capacity/1)
@@ -3803,13 +4080,15 @@ def serve(cfg, backend_name="cua"):
         if not ipaddress.ip_address(extra).is_loopback: raise SystemExit(f"extra_binds allows loopback only, got {extra}")
         xs = ThreadingHTTPServer((extra, cfg["port"]), handler)
         threading.Thread(target=xs.serve_forever, daemon=True).start()
-    print(f"orbit-launcher {VERSION} on http://{cfg['bind']}:{cfg['port']} max_concurrent={cfg['max_concurrent']} model={cfg['model']}", flush=True)
+    print(f"orbit-launcher {build_version()} on http://{cfg['bind']}:{cfg['port']} max_concurrent={cfg['max_concurrent']} model={cfg['model']}", flush=True)
     srv.serve_forever()
 
 def doctor(cfg):
     ok = True
     def line(name, good, info=""):
         nonlocal ok; ok &= bool(good); print(f"[{'ok' if good else 'FAIL'}] {name} {info}")
+    ident = build_identity(cfg=cfg)
+    line("build", True, f"{ident['version']} ({ident['describe'] or ident['sha'] or 'no build identity'})")
     try: check_bind(cfg["bind"]); line("bind", True, cfg["bind"])
     except SystemExit as e: line("bind", False, str(e))
     line("deepseek key present (value not shown)", bool(provider_key(cfg, "deepseek")))

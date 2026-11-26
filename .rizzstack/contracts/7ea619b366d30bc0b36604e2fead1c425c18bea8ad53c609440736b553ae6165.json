@@ -1,0 +1,185 @@
+{
+  "contract_version": "acdd/1",
+  "id": "wave-c-c2-pkg",
+  "title": "Ship schemas/rizzstack-ticket.schema.json in every hyvv install artifact",
+  "outcome": {
+    "summary": "The runtime ticket schema C2 reads is carried by every hyvv installation path. The sdist include list and the wheel force-include map both name schemas/rizzstack-ticket.schema.json at the path launcher.py resolves it from, the Windows $payload copies the schemas directory so a fresh install and an -Update both keep it, and install.sh fails closed when the installed launcher cannot load it. No product code changes: launcher.py, the schema and the C2 test surface are untouched, and the existing provisioning/Rails payload stays green.",
+    "observable_behavior": [
+      "A wheel built from this tree contains schemas/rizzstack-ticket.schema.json at the wheel root, so `import launcher; launcher._ticket_schema()` succeeds from an extracted wheel with the checkout absent and returns a schema titled rizzstack.ticket/1.",
+      "A materialised copy of install.ps1's $payload contains schemas/rizzstack-ticket.schema.json beside launcher.py and the launcher loads it from that root, not from the checkout.",
+      "The sdist include list names the schemas directory (or the schema file) so the source distribution can build the same payload.",
+      "install.sh's post-install probe loads the ticket schema from the installed venv and exits 1 with an explicit message when it cannot, instead of leaving a launcher that fails at request time.",
+      "The existing payload guarantees are unchanged: tests/test_install_artifacts.py still passes, including its real-artifact identity checks when uv is available."
+    ]
+  },
+  "interfaces": [
+    {
+      "name": "pyproject.toml [tool.hatch.build.targets.sdist].include",
+      "kind": "other",
+      "change": "modify",
+      "notes": "Adds schemas/** so the sdist carries the runtime schema at schemas/rizzstack-ticket.schema.json."
+    },
+    {
+      "name": "pyproject.toml [tool.hatch.build.targets.wheel.force-include]",
+      "kind": "other",
+      "change": "modify",
+      "notes": "Maps schemas/rizzstack-ticket.schema.json to schemas/rizzstack-ticket.schema.json so it lands at the site-packages root LAUNCHER_DIR resolves against."
+    },
+    {
+      "name": "scripts/install.ps1 $payload",
+      "kind": "cli",
+      "change": "modify",
+      "notes": "Adds the schemas directory; Copy-Payload already recurses into directory entries."
+    },
+    {
+      "name": "scripts/install.sh post-install probe",
+      "kind": "cli",
+      "change": "modify",
+      "notes": "Adds a fail-closed `import launcher; launcher._ticket_schema()` probe after the existing module-import probe."
+    },
+    {
+      "name": "tests/test_ticket_schema_payload.py",
+      "kind": "file",
+      "change": "add",
+      "notes": "Approved RED specification; read-only for the implementer."
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC-001",
+      "statement": "the sdist include list names the schemas directory or the runtime schema file, so a source distribution can carry it",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_schema_payload.py::Declarations::test_sdist_include_carries_the_runtime_schema"
+      ]
+    },
+    {
+      "id": "AC-002",
+      "statement": "the wheel force-include maps schemas/rizzstack-ticket.schema.json to the same path, which is where launcher.py resolves it after installation",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_schema_payload.py::Declarations::test_wheel_force_include_maps_the_runtime_schema"
+      ]
+    },
+    {
+      "id": "AC-003",
+      "statement": "install.ps1's payload names the schemas directory and a materialised copy of that payload contains the schema beside launcher.py, from which the launcher loads it",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_schema_payload.py::Declarations::test_windows_payload_copies_the_schemas_directory",
+        "tests/test_ticket_schema_payload.py::CopiedPayload::test_a_copied_install_contains_the_schema_and_launcher_loads_it"
+      ]
+    },
+    {
+      "id": "AC-004",
+      "statement": "install.sh probes the installed launcher's ticket-schema load and fails closed with exit 1 instead of installing a runtime that raises at request time",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_schema_payload.py::Declarations::test_install_sh_fails_closed_when_the_ticket_schema_cannot_load"
+      ]
+    },
+    {
+      "id": "AC-005",
+      "statement": "regression: the existing provisioning and Rails payload guarantees still hold (tests/test_install_artifacts.py green, unchanged)",
+      "verification": "test",
+      "tests": [
+        "tests/test_install_artifacts.py::PayloadDefinitions::test_pyproject_sdist_and_wheel_include_both_modules",
+        "tests/test_install_artifacts.py::RailsPayload::test_payload_rails_runtime_imports_from_a_copied_install"
+      ],
+      "regression": true
+    }
+  ],
+  "dependencies": [
+    "C2 (hyvv #83) at head 708df906e6b9402c537fb51f7ea42c183dc35aad supplies schemas/rizzstack-ticket.schema.json and launcher._ticket_schema(); this slice is cut from that head",
+    "C2's frozen lease prohibits pyproject.toml, uv.lock and CHANGELOG.md, so the packaging change is a follow-up slice, not an amendment",
+    "#83 merges only after this slice is approved and verified; both land before the hyvv deploy"
+  ],
+  "assumptions": [
+    "hatchling's force-include places entries at the wheel root, so LAUNCHER_DIR / 'schemas' / 'rizzstack-ticket.schema.json' resolves inside site-packages",
+    "install.ps1 Copy-Payload already recurses into directory payload entries, so a 'schemas' entry needs no new copy code",
+    "the uv-built-wheel class skips when no build tool is installed; the declaration and copied-payload classes run everywhere"
+  ],
+  "scope": {
+    "assigned_files": [
+      "pyproject.toml",
+      "scripts/install.sh",
+      "scripts/install.ps1"
+    ],
+    "test_files": [
+      "tests/test_ticket_schema_payload.py",
+      "tests/test_install_artifacts.py"
+    ],
+    "read_only": [],
+    "prohibited": [
+      "tests/test_ticket_schema_payload.py",
+      "launcher.py",
+      "schemas/**",
+      "tests/test_ticket_surface.py",
+      ".github/workflows/**",
+      "CHANGELOG.md",
+      "uv.lock"
+    ]
+  },
+  "source_rev": "aec63b18c40387bce61f4f128b489a335e25e731",
+  "tdd": {
+    "applicable": true,
+    "test_first": true
+  },
+  "verification": {
+    "independent": true,
+    "commands": [
+      "env -u PYTHONPATH python3 -m unittest -v tests.test_ticket_schema_payload",
+      "env -u PYTHONPATH python3 -m unittest tests.test_install_artifacts"
+    ],
+    "integration": false
+  },
+  "evidence_required": [
+    "red",
+    "green",
+    "review"
+  ],
+  "authorization": {
+    "human_gates": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish"
+    ],
+    "authorized": [
+      "edit the three packaging/installer files inside the declared scope",
+      "build a wheel and sdist locally as test output"
+    ],
+    "not_authorized": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish",
+      "restart",
+      "force-push",
+      "branch deletion",
+      "edit launcher.py or schemas/**"
+    ]
+  },
+  "risk": {
+    "tier": "high",
+    "reasons": [
+      "changes what every hyvv install artifact ships (wheel, sdist, Windows payload) and how install.sh decides an install is complete",
+      "a wrong force-include path installs a launcher that fails at request time instead of at install time",
+      "the installer probe can refuse an otherwise healthy install if it is written too broadly"
+    ],
+    "blast_radius": "every hyvv wheel, sdist, install.sh run and install.ps1 fresh/Update copy"
+  },
+  "review": {
+    "status": "approved",
+    "approved_by": "Kyle (owner), typed approval in chat, 2026-11-26",
+    "approved_at": "2026-11-26T17:28:44Z",
+    "contract_sha256": "7ea619b366d30bc0b36604e2fead1c425c18bea8ad53c609440736b553ae6165",
+    "test_collection": {
+      "manifest_sha256": "dd7024489e2a46fb9787a5d9f69886593d3249879450b50490b5e1cc3b5760b3",
+      "source_rev": "aec63b18c40387bce61f4f128b489a335e25e731",
+      "collected": 20
+    }
+  }
+}
