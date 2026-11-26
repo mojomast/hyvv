@@ -3122,8 +3122,15 @@ class Launcher:
         manifest = await self._manifest(a, res)
         (self.dir / "attempts" / f"{a['attempt_id']}.result.json").write_text(json.dumps(manifest, indent=1), "utf-8")
         ok = e.get("stop_reason") in ("end_turn", None) and not res.get("error") and e["kind"] == "turn_ended"
-        self._set(a, "succeeded" if ok else "failed", f"turn ended: {e.get('stop_reason') or e['kind']}")
+        # Tear the sandbox down before publishing the terminal state: a reader that observes
+        # "succeeded"/"failed" must never see the recorded sandbox still alive. _set's terminal
+        # write (journal save + landed-event publication) can stall on a contended runner, and
+        # the retry-resume tests synchronise on the terminal state - with the old order they
+        # could observe a finished attempt whose teardown had not run yet (the 3.13 red run
+        # saw cleaned == [] instead of ["sb-1"]). Teardown is idempotent, so the controller's
+        # finally call stays a no-op.
         await self._cleanup_once(a)
+        self._set(a, "succeeded" if ok else "failed", f"turn ended: {e.get('stop_reason') or e['kind']}")
 
     async def _manifest(self, a, res):
         b = a["brief"]; files = []
