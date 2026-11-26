@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mojomast/workflow/schemas/rizzstack-ticket.schema.json",
+  "title": "rizzstack.ticket/1",
+  "description": "The twelve claims of a signed dispatch ticket from hyvv ADR 0002. This contract validates claims only; it does not sign or verify tokens.",
+  "type": "object",
+  "required": [
+    "brief_sha256",
+    "project",
+    "source_rev",
+    "assigned_files_sha256",
+    "risk_tier",
+    "contract_sha256",
+    "assignment",
+    "aud",
+    "iat",
+    "exp",
+    "jti",
+    "kid"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "brief_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "project": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_rev": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "assigned_files_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "risk_tier": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "contract_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "assignment": {
+      "type": "null"
+    },
+    "aud": {
+      "type": "string",
+      "minLength": 1
+    },
+    "iat": {
+      "type": "integer"
+    },
+    "exp": {
+      "type": "integer"
+    },
+    "jti": {
+      "type": "string",
+      "minLength": 1
+    },
+    "kid": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}
