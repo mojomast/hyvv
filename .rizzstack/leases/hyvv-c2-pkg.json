@@ -1,0 +1,40 @@
+{
+  "id": "wave-c-c2-pkg",
+  "lease_version": "rizzstack.lease/1",
+  "slice": "wave-c-c2-pkg",
+  "branch": "feat/c2-pkg",
+  "contract_id": "wave-c-c2-pkg",
+  "contract_sha256": "7ea619b366d30bc0b36604e2fead1c425c18bea8ad53c609440736b553ae6165",
+  "source_rev": "aec63b18c40387bce61f4f128b489a335e25e731",
+  "scope": {
+    "assigned_files": [
+      "pyproject.toml",
+      "scripts/install.sh",
+      "scripts/install.ps1"
+    ],
+    "test_files": [
+      "tests/test_ticket_schema_payload.py",
+      "tests/test_install_artifacts.py"
+    ],
+    "prohibited": [
+      "tests/test_ticket_schema_payload.py",
+      "launcher.py",
+      "schemas/**",
+      "tests/test_ticket_surface.py",
+      ".github/workflows/**",
+      "CHANGELOG.md",
+      "uv.lock"
+    ],
+    "read_only": []
+  },
+  "derived_from": {
+    "contract": "rizzstack-t1634/contracts/wave-bc/C2-PKG.contract.json",
+    "approved_by": "Kyle (owner), typed approval in chat, 2026-11-26",
+    "approved_at": "2026-11-26T17:28:44Z"
+  },
+  "review": {
+    "status": "frozen",
+    "approved_by": "Kyle (owner), typed approval in chat, 2026-11-26",
+    "approved_at": "2026-11-26T17:28:44Z"
+  }
+}

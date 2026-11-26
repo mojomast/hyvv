@@ -344,7 +344,7 @@ paths:
             never from a request field.
       responses:
         "200":
-          description: `hyvv.worker-artifact/1`
+          description: "`hyvv.worker-artifact/1`"
           content:
             application/json:
               schema:

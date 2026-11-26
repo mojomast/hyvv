@@ -1,0 +1,251 @@
+{
+  "contract_version": "acdd/1",
+  "id": "wave-c-C4",
+  "title": "Verify the signed dispatch ticket in hyvv (verifier only)",
+  "outcome": {
+    "summary": "hyvv/ticket_verify.py verifies the compact Ed25519 JWS that C3 mints. verify_ticket checks the header alg/kid, the signature against a configured public key, the audience, the ten-minute lifetime, the RFC 8785 digest of the received brief (minus ticket) and the single-use jti through an on-disk ReplayCache; it returns the twelve claims or raises a TicketError whose code is ticket_invalid, ticket_expired, ticket_replayed or ticket_brief_mismatch. load_public_keys reads ticket_public_keys as kid -> base64url raw 32-byte Ed25519 key and fails closed with TicketKeyConfigError on a missing, empty, malformed or private-key-shaped value. cryptography is an optional 'tickets' extra: the module loads without it and fails closed with the named TicketCryptoUnavailable. The verifier policy defaults to report and this slice wires no launcher path, so ticket_mode cannot become enforce here and C2's launcher default stays off.",
+    "observable_behavior": [
+      "verify_ticket(ticket, *, brief, public_keys, audience, now=None, replay) returns the decoded twelve claims for a valid test-key JWS.",
+      "brief_digest(brief) is SHA-256 over the JCS form of the brief without its ticket key, stable under key order and a stale ticket.",
+      "A tampered payload, a tampered signature, a ticket signed by another key, an unknown kid, a malformed or non-compact ticket, a non-EdDSA alg and a payload missing a claim are refused with code ticket_invalid.",
+      "A wrong audience is refused with ticket_invalid; an expired ticket is refused with ticket_expired; an exp more than 600 seconds after iat is refused with ticket_invalid.",
+      "A second verification of the same jti raises ticket_replayed; ReplayCache.prune drops expired entries so the cache stays bounded by exp.",
+      "A ticket whose brief_sha256 does not match the received brief raises ticket_brief_mismatch.",
+      "load_public_keys({ticket_public_keys: {kid: base64url(raw 32-byte key)}}) returns the raw bytes; a missing/empty mapping, bad base64, wrong length or PEM private key material raises TicketKeyConfigError.",
+      "TicketCryptoUnavailable is a TicketError; with the cryptography import blocked the module still loads and verification fails closed with that named error.",
+      "DEFAULT_TICKET_MODE is report, load_ticket_policy({}).mode is report, off/report/enforce are accepted and an unknown mode raises ValueError; launcher.load_config still defaults ticket_mode to off until C5."
+    ]
+  },
+  "interfaces": [
+    {
+      "name": "hyvv.ticket_verify.verify_ticket",
+      "kind": "function",
+      "change": "add",
+      "notes": "verify_ticket(ticket, *, brief, public_keys: Mapping[str, bytes], audience: str, now: int | None = None, replay: ReplayCache) -> dict. Signature, aud, exp/ttl, JCS brief digest and jti replay are all mandatory; nothing is optional except now."
+    },
+    {
+      "name": "hyvv.ticket_verify.brief_digest",
+      "kind": "function",
+      "change": "add",
+      "notes": "SHA-256 hex of the RFC 8785 canonical JSON of the brief without its ticket key."
+    },
+    {
+      "name": "hyvv.ticket_verify.load_public_keys",
+      "kind": "function",
+      "change": "add",
+      "notes": "Reads config['ticket_public_keys'] only; kid -> base64url raw 32-byte Ed25519 public key. Missing, empty, malformed or private material raises TicketKeyConfigError."
+    },
+    {
+      "name": "hyvv.ticket_verify.ReplayCache",
+      "kind": "class",
+      "change": "add",
+      "notes": "ReplayCache(directory); consume(jti, exp, now) refuses a live duplicate with ticket_replayed and writes a 0600 file; prune(now) removes entries whose exp has passed."
+    },
+    {
+      "name": "hyvv.ticket_verify.load_ticket_policy",
+      "kind": "function",
+      "change": "add",
+      "notes": "load_ticket_policy(config) -> TicketPolicy(mode); default report, accepts off|report|enforce, unknown raises ValueError. Reads config only, never the environment."
+    },
+    {
+      "name": "hyvv.ticket_verify.TicketError",
+      "kind": "class",
+      "change": "add",
+      "notes": "Base refusal with a .code attribute; TicketKeyConfigError, TicketExpired, TicketReplayed, TicketBriefMismatch and TicketCryptoUnavailable derive from it and are importable without cryptography."
+    },
+    {
+      "name": "pyproject.toml",
+      "kind": "file",
+      "change": "modify",
+      "notes": "Add optional-dependencies.tickets carrying cryptography; core dependencies stay empty of it."
+    },
+    {
+      "name": "launcher.py",
+      "kind": "file",
+      "change": "modify",
+      "notes": "One line in load_config: cfg.setdefault(\"ticket_mode\", \"off\") so the C2 default that AC-009 pins exists. No verification call, no 403 path, no enforcement and no environment read in this file."
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC-001",
+      "statement": "a valid test-key JWS is accepted and the JCS brief digest matches",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_verify.py::ValidTicket::test_a_valid_test_key_jws_is_accepted",
+        "tests/test_ticket_verify.py::ValidTicket::test_brief_digest_is_jcs_and_ignores_the_ticket_key"
+      ]
+    },
+    {
+      "id": "AC-002",
+      "statement": "tampered payloads/signatures, another key, unknown kid, malformed tickets, a non-EdDSA alg and missing claims are refused with ticket_invalid",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_verify.py::Refusals::test_a_tampered_payload_is_refused",
+        "tests/test_ticket_verify.py::Refusals::test_a_tampered_signature_is_refused",
+        "tests/test_ticket_verify.py::Refusals::test_a_ticket_signed_by_another_key_is_refused",
+        "tests/test_ticket_verify.py::Refusals::test_an_unknown_kid_is_refused",
+        "tests/test_ticket_verify.py::Refusals::test_a_malformed_ticket_is_refused",
+        "tests/test_ticket_verify.py::Refusals::test_a_payload_missing_a_claim_is_refused",
+        "tests/test_ticket_verify.py::Refusals::test_an_alg_other_than_eddsa_is_refused"
+      ]
+    },
+    {
+      "id": "AC-003",
+      "statement": "a wrong audience is refused with ticket_invalid",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_verify.py::Refusals::test_a_wrong_audience_is_refused"
+      ]
+    },
+    {
+      "id": "AC-004",
+      "statement": "an expired ticket is ticket_expired and a lifetime over 600 seconds is ticket_invalid",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_verify.py::Refusals::test_an_expired_ticket_is_refused",
+        "tests/test_ticket_verify.py::Refusals::test_a_ticket_lifetime_over_ten_minutes_is_refused"
+      ]
+    },
+    {
+      "id": "AC-005",
+      "statement": "a reused jti is ticket_replayed and the cache prunes at expiry",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_verify.py::Refusals::test_a_reused_jti_is_refused",
+        "tests/test_ticket_verify.py::ReplayCacheUnit::test_consume_refuses_a_second_use_and_prune_keeps_it_bounded"
+      ]
+    },
+    {
+      "id": "AC-006",
+      "statement": "a ticket bound to another brief is refused with ticket_brief_mismatch",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_verify.py::Refusals::test_a_ticket_for_another_brief_is_refused"
+      ]
+    },
+    {
+      "id": "AC-007",
+      "statement": "public keys load from config and a missing, malformed or private-key configuration fails closed",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_verify.py::KeyConfig::test_a_valid_public_key_mapping_loads",
+        "tests/test_ticket_verify.py::KeyConfig::test_missing_empty_or_malformed_keys_fail_closed",
+        "tests/test_ticket_verify.py::KeyConfig::test_private_key_material_in_config_is_refused"
+      ]
+    },
+    {
+      "id": "AC-008",
+      "statement": "cryptography is an optional extra and absence fails closed with the named TicketCryptoUnavailable",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_verify.py::OptionalCryptography::test_cryptography_stays_an_optional_extra",
+        "tests/test_ticket_verify.py::OptionalCryptography::test_missing_cryptography_fails_closed_with_a_named_error"
+      ]
+    },
+    {
+      "id": "AC-009",
+      "statement": "the verifier policy defaults to report, accepts off/report/enforce and leaves the C2 launcher default at off",
+      "verification": "test",
+      "tests": [
+        "tests/test_ticket_verify.py::Policy::test_ticket_mode_stays_report_by_default",
+        "tests/test_ticket_verify.py::Policy::test_the_c2_launcher_default_is_unchanged"
+      ]
+    }
+  ],
+  "dependencies": [
+    "wave-c-C2: ticket_mode and the report surface the launcher keeps; the C4 branch is cut from the C2 RED revision and the GREEN must merge C2 GREEN first",
+    "wave-c-C3: the compact JWS header/payload shape and the twelve claims this verifier consumes",
+    "owner answer 2026-11-25: cryptography is an optional extra, hyvv holds only public keys, production key generation waits for the owner"
+  ],
+  "assumptions": [
+    "public keys reach hyvv as base64url raw 32-byte Ed25519 keys in the ticket_public_keys mapping; no PEM parsing and no private key ever appears in config",
+    "C4 is the verifier only: beyond the single load_config ticket_mode default, it adds no 403 path, does not edit launcher.py and cannot turn enforcement on; C5 wires it",
+    "the verifier policy default of report is the slice's own default; the launcher's ticket_mode default stays off until C5, which keeps C2's frozen contract green",
+    "tests generate throwaway keys in memory and never write key material to disk or the repository",
+    "r1 diagnosis (att_f71f9fc2d1d14ccb, scope_violation on launcher.py): the approved AC-009 case tests/test_ticket_verify.py::Policy::test_the_c2_launcher_default_is_unchanged asserts launcher.load_config({}).get('ticket_mode') == 'off' and source_rev c160339 has no ticket_mode default, so the r1 contract could never go green without that one line; the bee added exactly cfg.setdefault('ticket_mode', 'off') in load_config and verify refused the whole patch for touching a prohibited path.",
+    "launcher.py is leased for that single default line only: no verification call, no 403 path, no enforcement switch, no environment read and no other change may land there in this slice; everything else listed under scope.prohibited stays prohibited.",
+    "The retry also needs the tickets extra pre-provisioned in the verification interpreter: 9 of the 22 approved cases raise TicketCryptoUnavailable without cryptography (offline sandbox), and r1's patch passes 22/22 wherever the extra imports (proven with uv run --with cryptography)."
+  ],
+  "scope": {
+    "assigned_files": [
+      "hyvv/ticket_verify.py",
+      "launcher.py",
+      "pyproject.toml"
+    ],
+    "test_files": [
+      "tests/test_ticket_verify.py"
+    ],
+    "read_only": [
+      "schemas/rizzstack-ticket.schema.json",
+      "tests/test_ticket_surface.py"
+    ],
+    "prohibited": [
+      "tests/test_ticket_verify.py",
+      "CHANGELOG.md",
+      ".github/workflows/**",
+      "uv.lock",
+      "contract/**",
+      "evidence/**"
+    ]
+  },
+  "source_rev": "c16033918f42552a0e9c239d3d94b861730fc8d5",
+  "tdd": {
+    "applicable": true,
+    "test_first": true
+  },
+  "verification": {
+    "independent": true,
+    "commands": [
+      "python3 -m unittest tests.test_ticket_verify -v"
+    ],
+    "integration": false
+  },
+  "evidence_required": [
+    "red",
+    "green",
+    "review"
+  ],
+  "authorization": {
+    "human_gates": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish"
+    ],
+    "not_authorized": [
+      "merge",
+      "deploy",
+      "restart",
+      "tag",
+      "release",
+      "publish",
+      "production key generation",
+      "key storage",
+      "key rotation",
+      "branch deletion",
+      "live canary"
+    ]
+  },
+  "risk": {
+    "tier": "high",
+    "reasons": [
+      "this is the security boundary that decides whether a dispatch ticket is authentic",
+      "a verifier that fails open, or silently skips replay/aud/expiry, would admit any create the moment C5 enforces",
+      "introduces the first cryptography dependency path in hyvv, even as an optional extra"
+    ],
+    "blast_radius": "every POST /v1/attempts once C5 enables enforce; the replay cache on the worker host"
+  },
+  "review": {
+    "status": "approved",
+    "approved_by": "owner answers 2026-11-25: approve WAVE-C C4 v2 88b56bea; condition - launcher.py hunk must be exactly the one cfg.setdefault(ticket_mode, off) line",
+    "approved_at": "2026-11-25T20:59:30Z",
+    "contract_sha256": "88b56bead47d50e54b613d0acf03316e065a242116e3be01f2ec023b7b7ef88e",
+    "test_collection": {
+      "manifest_sha256": "6e341c1ce203fd24f11e2e64f3bb8f82ccffbaf0ddd6e294aeb2ea798f208334",
+      "source_rev": "c16033918f42552a0e9c239d3d94b861730fc8d5",
+      "collected": 22
+    }
+  }
+}
