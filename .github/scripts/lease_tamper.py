@@ -41,6 +41,18 @@ review whose first line starts ``APPROVE`` and names an ``independent review``,
 with ``commit_id`` equal to the head.  Without one the gate fails closed with
 the named reason ``non_slice_requires_independent_review``.
 
+**A review at an earlier head is carried forward** when, and only when, the
+branch moved by merging the base into it and nothing else changed: every commit
+in ``review_sha..<head>`` that is not already on the base is a merge commit
+whose non-first parents are on the base, and the pull request's diff against
+the base (``base...<head>``) is byte-identical to the diff the review saw
+(``base...review_sha``) under per-file blob equality.  Updating a branch with
+the base therefore does not demand a fresh review just to move ``commit_id``,
+while an authored commit, a merge of any other branch, or any content change
+still does.  A rejected carry names its reason: ``review_not_ancestor``,
+``review_carry_authored_commit``, ``review_carry_unrelated_merge``,
+``review_carry_content_changed`` or ``review_carry_unreadable``.
+
 The verify boundary is, in order: ``--verify-sha`` (a local/test argument, never
 a pull-request input), the base-branch lease's
 ``verify_sha``/``verified_sha``/``verification.sha``, then the contract's
@@ -124,6 +136,21 @@ DEFAULT_API_URL = "https://api.github.com"
 LEASE_JOB_NAME = "lease-tamper"
 MERGE_GROUP_REASON = "merge_group_pr_unresolved"
 
+#: How an independent review matches a head: at the head itself, or carried
+#: from an earlier head by a base-merge-only update with an unchanged diff.
+REVIEW_MATCH_EXACT = "exact"
+REVIEW_MATCH_CARRIED = "carried"
+
+#: Named reasons a review at an earlier head is NOT carried forward. They are
+#: stable codes, always printed with the refusal, so a re-review loop can be
+#: diagnosed from the log without guessing.
+CARRY_OK = "review_carry_ok"
+CARRY_NOT_ANCESTOR = "review_not_ancestor"
+CARRY_AUTHORED_COMMIT = "review_carry_authored_commit"
+CARRY_UNRELATED_MERGE = "review_carry_unrelated_merge"
+CARRY_CONTENT_CHANGED = "review_carry_content_changed"
+CARRY_UNREADABLE = "review_carry_unreadable"
+
 
 class GateError(RuntimeError):
     """The lease/contract could not be resolved or applied (fail closed).
@@ -180,6 +207,13 @@ def _exists(repo, revision):
 
 def _is_ancestor(repo, older, newer):
     return _run(repo, "merge-base", "--is-ancestor", older, newer, check=False).returncode == 0
+
+
+def _merge_base(repo, base, head):
+    """The common ancestor of ``base`` and ``head`` (``base`` if git cannot say)."""
+    proc = _run(repo, "merge-base", base, head, check=False)
+    value = proc.stdout.strip()
+    return value if proc.returncode == 0 and value else base
 
 
 def _file_at(repo, revision, path):
@@ -542,8 +576,9 @@ def _is_independent_approval(body, head):
 def independent_review_at_head(reviews, head):
     """The review that proves a non-slice pull request was reviewed at ``head``.
 
-    The review's ``commit_id`` must be the exact head: a review at an older
-    head proves nothing about the code being merged.
+    The review's ``commit_id`` must be the exact head.  This is the strict
+    form; ``independent_review()`` adds the owner's base-merge carry-forward
+    on top of it and is what a pull-request check uses.
     """
     wanted = str(head or "").strip().lower()
     if not wanted:
@@ -559,6 +594,183 @@ def independent_review_at_head(reviews, head):
         if state == "COMMENTED" and _is_independent_approval(review.get("body"), wanted):
             return review
     return None
+
+
+def _diff_blobs(repo, older, newer):
+    """``{path: new blob sha or None}`` for one tree-to-tree diff.
+
+    ``--raw -z --no-renames`` reports one record per path as
+    ``:<oldmode> <newmode> <oldsha> <newsha> <status> NUL <path> NUL``; the new
+    sha is all zeros when the path is deleted.  Renames are split into a delete
+    and an add, like every other path check in this gate, so a rename cannot
+    hide a changed blob behind a new name.
+    """
+    proc = _run(repo, "diff", "--raw", "-z", "--no-renames", "--no-abbrev", older, newer)
+    fields = proc.stdout.split("\0")
+    blobs = {}
+    index = 0
+    while index + 1 < len(fields):
+        header, path = fields[index], fields[index + 1]
+        index += 2
+        if not header.startswith(":"):
+            continue
+        parts = header[1:].split()
+        if len(parts) < 5:
+            continue
+        new_sha = parts[3]
+        blobs[_normalise(path)] = None if set(new_sha) == {"0"} else new_sha
+    return blobs
+
+
+def reviewed_diff_blobs(repo, base, revision):
+    """The pull request's diff at ``revision`` as ``{path: blob sha or None}``.
+
+    ``base...revision`` is the diff from the merge-base of the base and the
+    revision to the revision -- the change a review at ``revision`` judged.
+    Per-file blob equality of this map at the review sha and at the head is the
+    "byte-identical diff" test: the same paths carry the same bytes.
+    """
+    return _diff_blobs(repo, _merge_base(repo, base, revision), revision)
+
+
+def _review_commit(review):
+    """The full commit a review records, or ``None`` when it names none."""
+    value = str((review or {}).get("commit_id") or "").strip().lower()
+    return value if HEX_REV.match(value) else None
+
+
+def _is_approval(review, commit):
+    """True when ``review`` is an independent approval of ``commit``."""
+    state = str(review.get("state") or "").strip().upper()
+    if state == "APPROVED":
+        return True
+    if state == "COMMENTED":
+        return _is_independent_approval(review.get("body"), commit)
+    return False
+
+
+def review_carry_forward(repo, review_sha, base, head):
+    """``(ok, reason, detail)``: may a review at ``review_sha`` judge ``head``?
+
+    The owner's rule (2026-11-25): an independent review of an earlier head
+    still counts when the branch only moved by merging the base into it and the
+    pull request's content did not change.  All three must hold:
+
+    1. ``review_sha`` is an ancestor of ``head``.  A review whose commit was
+       rewritten away judged different code and never carries.
+    2. every commit in ``review_sha..head`` that is not already on the base is
+       a merge commit whose non-first parents are on the base.  Merging the
+       base in is bookkeeping; an authored commit or any other merge is not.
+    3. the pull request's diff against the base is byte-identical at ``head``
+       and at ``review_sha``: the same paths with the same blob shas.
+
+    Anything else fails closed with one of the named reasons.  Nothing here is
+    a shortcut to merging changed code without a review of that code.
+    """
+    if not review_sha or not HEX_REV.match(str(review_sha).strip().lower()):
+        return False, CARRY_NOT_ANCESTOR, "the review names no full commit sha"
+    review_sha = str(review_sha).strip().lower()
+    try:
+        if not _exists(repo, review_sha):
+            return (
+                False,
+                CARRY_NOT_ANCESTOR,
+                "review commit %s is not in this history" % review_sha[:12],
+            )
+        if review_sha != head and not _is_ancestor(repo, review_sha, head):
+            return (
+                False,
+                CARRY_NOT_ANCESTOR,
+                "review commit %s is not an ancestor of head %s; the reviewed history was "
+                "rewritten away" % (review_sha[:12], head[:12]),
+            )
+
+        commits = [
+            line
+            for line in _out(
+                repo, "rev-list", "%s..%s" % (review_sha, head), "--not", base
+            ).splitlines()
+            if line
+        ]
+        for sha in commits:
+            parents = _parents(repo, sha)
+            subject = _subject(repo, sha)
+            if len(parents) < 2:
+                return (
+                    False,
+                    CARRY_AUTHORED_COMMIT,
+                    "commit %s (\"%s\") was authored after the review; only merges of the base "
+                    "may follow a review" % (sha[:12], subject),
+                )
+            for parent in parents[1:]:
+                if not _is_ancestor(repo, parent, base):
+                    return (
+                        False,
+                        CARRY_UNRELATED_MERGE,
+                        "merge %s (\"%s\") brings in %s, which is not on base %s; only a merge "
+                        "of the base may follow a review"
+                        % (sha[:12], subject, parent[:12], base[:12]),
+                    )
+
+        reviewed = reviewed_diff_blobs(repo, base, review_sha)
+        current = reviewed_diff_blobs(repo, base, head)
+        if reviewed != current:
+            changed = sorted(
+                path
+                for path in set(reviewed) | set(current)
+                if reviewed.get(path) != current.get(path)
+            )
+            detail = ", ".join(changed[:8]) + (" ..." if len(changed) > 8 else "")
+            return (
+                False,
+                CARRY_CONTENT_CHANGED,
+                "the diff against base %s is not byte-identical to the reviewed diff: %s"
+                % (base[:12], detail or "<trees differ>"),
+            )
+    except GateError as exc:
+        return False, CARRY_UNREADABLE, "cannot read the review history: %s" % exc
+    return (
+        True,
+        CARRY_OK,
+        "every commit after review %s is a merge of base %s and the diff is byte-identical"
+        % (review_sha[:12], base[:12]),
+    )
+
+
+def independent_review(repo, reviews, base, head):
+    """``(review, match, refusal)`` for the non-slice review rule.
+
+    The exact-head approval is preferred.  Otherwise the newest approval at an
+    earlier head is offered to ``review_carry_forward`` and the first that
+    carries wins.  ``refusal`` describes the newest rejected candidate -- its
+    named reason and detail -- so the failure says why the review did not
+    carry, not merely that it was not at the head.
+    """
+    wanted = str(head or "").strip().lower()
+    if not wanted:
+        return None, None, None
+    exact = independent_review_at_head(reviews, wanted)
+    if exact is not None:
+        return exact, REVIEW_MATCH_EXACT, None
+
+    refusal = None
+    candidates = [review for review in (reviews or []) if isinstance(review, dict)]
+    for review in reversed(candidates):
+        commit = _review_commit(review)
+        if commit is None or commit == wanted:
+            continue
+        if not _is_approval(review, commit):
+            continue
+        ok, reason, detail = review_carry_forward(repo, commit, base, wanted)
+        if ok:
+            return (
+                review,
+                REVIEW_MATCH_CARRIED,
+                {"reason": reason, "detail": detail, "review_sha": commit},
+            )
+        if refusal is None:
+            refusal = {"reason": reason, "detail": detail, "review_sha": commit}
+    return None, None, refusal
 
 
 def check_non_slice(repo, target, environ, quiet=False, http=None, detail=None):
@@ -584,8 +796,28 @@ def check_non_slice(repo, target, environ, quiet=False, http=None, detail=None):
             reason="non_slice_requires_independent_review",
         )
     reviews = _pull_reviews(name, target.number, token, _api_url(environ), http)
-    review = independent_review_at_head(reviews, head)
+    review, match, carry_info = independent_review(repo, reviews, target.base, head)
     if review is None:
+        if carry_info is not None:
+            raise GateError(
+                "PR #%s is not a slice (%s). A non-slice pull request passes only with an "
+                "independent review at its exact head %s, or with one at an earlier head that "
+                "carries forward. The newest approval (commit %s) does not carry: [%s] %s. "
+                "A review at an earlier head counts only when every commit after it is a merge "
+                "of the base and the pull request's diff against the base is byte-identical to "
+                "the reviewed one. If the change is intentional, post the review at %s and "
+                "re-run."
+                % (
+                    target.number,
+                    why,
+                    head[:12],
+                    str(carry_info.get("review_sha") or "?")[:12],
+                    carry_info.get("reason") or CARRY_UNREADABLE,
+                    carry_info.get("detail") or "",
+                    head[:12],
+                ),
+                reason="non_slice_requires_independent_review",
+            )
         raise GateError(
             "PR #%s is not a slice (%s). A non-slice pull request passes only with an "
             "independent review at its exact head %s: an APPROVED review, or a COMMENTED "
@@ -595,16 +827,26 @@ def check_non_slice(repo, target, environ, quiet=False, http=None, detail=None):
             reason="non_slice_requires_independent_review",
         )
     if not quiet:
-        print(
-            "lease-tamper: OK: PR #%s is not a slice (%s) and carries an independent "
-            "review (%s) at head %s."
-            % (
-                target.number,
-                why,
-                str(review.get("state") or "COMMENTED").upper(),
-                head[:12],
+        state = str(review.get("state") or "COMMENTED").upper()
+        if match == REVIEW_MATCH_CARRIED:
+            print(
+                "lease-tamper: OK: PR #%s is not a slice (%s) and its independent review "
+                "(%s) at %s carries forward to head %s: [%s] %s"
+                % (
+                    target.number,
+                    why,
+                    state,
+                    str(review.get("commit_id") or "")[:12],
+                    head[:12],
+                    CARRY_OK,
+                    (carry_info or {}).get("detail") or "base-merge-only update, diff byte-identical",
+                )
             )
-        )
+        else:
+            print(
+                "lease-tamper: OK: PR #%s is not a slice (%s) and carries an independent "
+                "review (%s) at head %s." % (target.number, why, state, head[:12])
+            )
     return 0
 
 

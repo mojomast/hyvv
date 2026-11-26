@@ -776,6 +776,206 @@ class SliceClassificationTests(unittest.TestCase):
         self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
 
 
+# -- base-merge review carry-forward ---------------------------------------
+
+
+class BaseMergeReviewCarryTests(unittest.TestCase):
+    """Owner rule: a review at an earlier head carries over a base-merge-only update.
+
+    Accepted only when (a) the review commit is an ancestor of the head, (b)
+    every commit after it that is not on the base is a merge whose non-first
+    parents are on the base, and (c) the pull request's diff against the base is
+    byte-identical (same paths, same blob shas) to the reviewed diff. The four
+    refusal cases are asserted with their named reason.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="lease-tamper-carry-"))
+        self.api = FakeGitHubApi()
+        self.api.pulls[12] = {"number": 12, "head": {}, "base": {}, "labels": [], "body": ""}
+
+    def tearDown(self):
+        self.api.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # -- fixtures ---------------------------------------------------------
+
+    def build(self):
+        """A non-slice pull request: the base lease names a different slice.
+
+        Returns ``(repo, base, reviewed_head)``.  The review is posted at
+        ``reviewed_head``; a later update is what the carry-forward rule judges.
+        """
+        repo = new_git_repo(self.tmp / "carry")
+        repo.write("src/slice.py", "base\n")
+        repo.write("src/unleased.py", "base\n")
+        repo.write("tests/test_frozen.py", "base\n")
+        source_rev = repo.commit("base")
+        document = contract_document(source_rev, ["src/slice.py"], ["tests/test_frozen.py"])
+        sha = contract_hash(document)
+        repo.write(
+            ".rizzstack/contracts/%s.json" % sha,
+            json.dumps(document, indent=2, sort_keys=True) + "\n",
+        )
+        lease = lease_document(document, sha, source_rev, branch="feat/wave-x-x1")
+        lease["id"] = "wave-other-slice"
+        lease["pull_request"] = 99
+        lease["branch"] = "feat/other"
+        repo.write(".rizzstack/leases/slice.json", json.dumps(lease, indent=2) + "\n")
+        base = repo.commit("land the contract and another slice's lease on main")
+        repo.checkout("-b", "feat/wave-x-x1")
+        repo.write("src/slice.py", "reviewed implementation\n")
+        reviewed = repo.commit("implement the slice")
+        return repo, base, reviewed
+
+    def review_at(self, sha):
+        self.api.reviews[12] = [
+            {
+                "state": "COMMENTED",
+                "commit_id": sha,
+                "body": "APPROVE (independent review at %s)\n\nVERDICT: approve" % sha,
+            }
+        ]
+
+    def advance_base(self, repo, name="src/base_only.py", text="base advance\n"):
+        """Commit on main, then return to the pull-request branch."""
+        repo.checkout("main")
+        repo.write(name, text)
+        tip = repo.commit("main advances: " + name)
+        repo.checkout("feat/wave-x-x1")
+        return tip
+
+    def merge(self, repo, ref="main", message="merge main into the branch"):
+        repo.git("merge", "--no-ff", "-m", message, ref)
+        return repo.rev()
+
+    def run_gate(self, repo, base, head, env=None):
+        command = [
+            sys.executable,
+            str(SCRIPT),
+            "--repo", str(repo.path),
+            "--base", base,
+            "--head", head,
+            "--branch", "feat/wave-x-x1",
+            "--pull-request", "12",
+        ]
+        run_env = dict(os.environ)
+        run_env.pop("GITHUB_REPOSITORY", None)
+        run_env.pop("GITHUB_TOKEN", None)
+        run_env.update(env or {})
+        return subprocess.run(command, capture_output=True, text=True, env=run_env)
+
+    def api_env(self):
+        return {
+            "GITHUB_REPOSITORY": QUEUE_REPO,
+            "GITHUB_API_URL": self.api.url,
+            "GITHUB_TOKEN": "test-token",
+        }
+
+    # -- the rule ---------------------------------------------------------
+
+    def test_base_merge_only_update_after_review_passes(self):
+        repo, _base, reviewed = self.build()
+        self.review_at(reviewed)
+        new_base = self.advance_base(repo)
+        head = self.merge(repo)
+
+        proc = self.run_gate(repo, new_base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("carries forward to head " + head[:12], proc.stdout)
+        self.assertIn("review_carry_ok", proc.stdout)
+        self.assertIn(reviewed[:12], proc.stdout)
+
+    def test_two_base_merges_in_a_row_still_pass(self):
+        # The base may advance more than once; each merge's second parent is an
+        # ancestor of the current base tip, so the review still carries.
+        repo, _base, reviewed = self.build()
+        self.review_at(reviewed)
+        self.advance_base(repo, "src/base_one.py")
+        self.merge(repo)
+        new_base = self.advance_base(repo, "src/base_two.py")
+        head = self.merge(repo)
+
+        proc = self.run_gate(repo, new_base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("carries forward", proc.stdout)
+
+    def test_authored_commit_after_review_fails_named(self):
+        repo, base, reviewed = self.build()
+        self.review_at(reviewed)
+        repo.write("src/slice.py", "changed after the review\n")
+        head = repo.commit("change the code after the review")
+
+        proc = self.run_gate(repo, base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
+        self.assertIn("review_carry_authored_commit", proc.stdout)
+        self.assertIn("was authored after the review", proc.stdout)
+
+    def test_content_change_resolved_into_a_base_merge_fails_named(self):
+        # Every commit after the review is a merge of the base, but the conflict
+        # resolution changes the pull request's diff: the reviewed bytes are not
+        # the bytes that would merge, so the review cannot carry.
+        repo, _base, reviewed = self.build()
+        self.review_at(reviewed)
+        repo.checkout("main")
+        repo.write("src/slice.py", "main side\n")
+        new_base = repo.commit("main edits the same line")
+        repo.checkout("feat/wave-x-x1")
+        conflicted = subprocess.run(
+            ["git", "-C", str(repo.path), "merge", "main"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(conflicted.returncode, 0, "the fixture must produce a conflict")
+        repo.write("src/slice.py", "resolution neither side reviewed\n")
+        head = repo.commit("resolve the conflict with content nobody reviewed")
+
+        proc = self.run_gate(repo, new_base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
+        self.assertIn("review_carry_content_changed", proc.stdout)
+        self.assertIn("src/slice.py", proc.stdout)
+
+    def test_merge_of_an_unrelated_branch_fails_named(self):
+        repo, base, reviewed = self.build()
+        self.review_at(reviewed)
+        repo.checkout("-b", "side", "main")
+        repo.write("src/side.py", "side work\n")
+        repo.commit("work on a branch that is not the base")
+        repo.checkout("feat/wave-x-x1")
+        head = self.merge(repo, "side", "merge an unrelated branch")
+
+        proc = self.run_gate(repo, base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
+        self.assertIn("review_carry_unrelated_merge", proc.stdout)
+        self.assertIn("which is not on base", proc.stdout)
+
+    def test_force_pushed_away_review_fails_named(self):
+        # The reviewed commit exists but is not in the head's history: the
+        # reviewed code was rewritten, so nothing carries.
+        repo, base, _reviewed = self.build()
+        repo.checkout("-b", "stale", "main")
+        repo.write("src/slice.py", "a variant that is later dropped\n")
+        stale = repo.commit("a reviewed variant that is later dropped")
+        repo.checkout("feat/wave-x-x1")
+        repo.write("src/slice.py", "a rewritten implementation\n")
+        head = repo.commit("rewrite the branch after the review")
+        self.review_at(stale)
+
+        proc = self.run_gate(repo, base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
+        self.assertIn("review_not_ancestor", proc.stdout)
+
+
 # -- lease hardening -------------------------------------------------------
 
 
