@@ -211,8 +211,9 @@ those hosts can reach.
    journal kept.
 4. Flip `current` to the new version and restart through the service manager.
 5. Health gate: within 60 s, `/v1/health` is ok, `/v1/version` reports the new
-   version and all previously advertised capabilities, the sandbox engine
-   answers, and one no-op sandbox starts.
+   build (`build.sha` / `build.describe` matching the deployed commit, not merely
+   the release string) and all previously advertised capabilities, the sandbox
+   engine answers, and one no-op sandbox starts.
 6. If any check fails: flip `current` back, restart, report `rolled_back` with
    the reason to the coordinator and the log.
 7. Keep the previous 2 versions; `hyvv rollback` flips to the last good one.
@@ -223,6 +224,9 @@ Version skew:
   `/v1` for at least one minor release.
 - Coordinators feature-detect through `GET /v1/version` capabilities, never by
   comparing version strings.
+- A bare release string is not build evidence: `/v1/version` reports the build
+  (`0.1.19+25.g7f73b7c`, `build.sha`) and `/v1/health` republishes the
+  `deployment_receipt`, so a host 25 commits past a tag cannot look like the tag.
 - Coordinators support hosts up to 2 minor versions behind (the Kubernetes
   model lets kubelets lag up to 3 minors). A coordinator may set a minimum
   version floor for security fixes and stop scheduling onto older hosts, the way
