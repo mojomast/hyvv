@@ -7,6 +7,8 @@
     "source": {"type": "object", "description": "project, repo_rev, input_manifest_sha256, image digest, harness, model, launcher version"},
     "observed": {"type": "object", "description": "measured by the launcher: run_id, status, stop_reason, tool_calls, usage, files[{path,size,sha256,change:changed|deleted,in_assigned_scope}], error"},
     "worker_claims": {"type": "object", "description": "the model's self-reported JSON block; never trusted as evidence"},
+    "cleanup_status": {"type": "string", "enum": ["cleaned", "skipped", "failed", "timed_out"],
+                       "description": "teardown outcome measured by the launcher; 'timed_out' or 'failed' means the sandbox teardown was bounded and did not confirm"},
     "checks": {"type": "array", "items": {"type": "object", "properties": {"name": {}, "command": {}, "passed": {}}}}
   }
 }

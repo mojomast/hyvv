@@ -27,7 +27,14 @@ state='failed' with detail='budget timeout: worker outlived brief.budget.timeout
 stopped the run after 2s)' and no result manifest; SuccessPathCleanupCount FAILED - the
 budget-stop success path tore the worker down twice; RestoreVerdictMatchesTerminalWriteRule
 FAILED - a status completed / stop_reason max_tokens manifest restored as succeeded while the
-live terminal write lands the same shape failed."""
+live terminal write lands the same shape failed.
+
+RED-first record for the #66 followup (unmodified tree at f8c4ca2b):
+HangingCleanupAfterBudgetStop FAILED - a run that finished inside its budget whose sandbox
+teardown never returned was cut off by the finish wait and landed state='failed' with detail
+'budget timeout: brief.budget.timeout_s=2s reached; the run finished but collecting its result
+failed (TimeoutError)' instead of succeeded with its result.
+"""
 import asyncio, json, os, sys, tempfile, time, unittest
 from pathlib import Path
 from unittest import mock
@@ -401,6 +408,48 @@ class HangingResultCollectionAfterBudgetStop(unittest.TestCase):
                 self.assertTrue(a.get("budget_stop"), "the stop was not marked budget_stop")
                 self.assertEqual(len(be.cleaned), 1, f"teardown cleaned up {len(be.cleaned)} times, not exactly once")
                 self.assertGreaterEqual(len(kicks), 1, "the slot kick never happened after the stop")
+                self.assertEqual(L._active(), [], "budget-stop attempt still holds the worker slot")
+            finally:
+                L.loop.close()
+
+
+class _HangCleanupBackend(_CountingBackend):
+    """The run finished and collection works, but the sandbox teardown never returns: the shape
+    that wedged the budget stop between the collected result and the terminal write."""
+
+    async def cleanup(self, a):
+        self.cleaned.append(a.get("run_id"))
+        await asyncio.Future()
+
+
+class HangingCleanupAfterBudgetStop(unittest.TestCase):
+    """Follow-up to #66: the teardown now runs above the terminal write, so an unbounded
+    backend.cleanup there left the attempt budget_stop-marked and non-terminal forever, holding
+    the worker slot. Bound the teardown at 2*GRACE, land the run with its result anyway, and say
+    in the journal + manifest that the teardown timed out."""
+
+    def test_hanging_cleanup_still_lands_the_run_with_its_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = _cfg(d); be = _HangCleanupBackend(cfg)
+            L = launcher.Launcher(cfg, be); L.kick = lambda: None
+            grace = getattr(launcher, "BUDGET_STOP_GRACE_S", 15)
+            with mock.patch.dict(os.environ, {"ORBIT_WORKER_GO_KEY": "fixture-value-not-a-real-key"}):
+                with mock.patch.object(launcher, "BUDGET_STOP_GRACE_S", 1):  # 1s teardown bound in-test
+                    a, _ = L.submit("att_bud00000022", {"objective": "x", "budget": {"timeout_s": BUDGET},
+                                                        "fake": {"delay": 1.5}})
+                    man = Path(d, "attempts", "att_bud00000022.result.json")
+                    journal = Path(d, "attempts", "att_bud00000022.json")
+                    _, elapsed = asyncio.run(_run_control_until_terminal(L, a, WINDOW, settle=1.0))
+            try:
+                self.assertEqual(a["state"], "succeeded",
+                                 f"a hung cleanup wedged the budget stop: {a.get('detail')!r}")
+                self.assertIsNotNone(elapsed, "attempt never reached a terminal state inside the window")
+                assert elapsed is not None
+                self.assertLessEqual(elapsed, BUDGET + 2 * grace + 5, f"budget stop unbounded: terminal after {elapsed:.1f}s")
+                self.assertEqual(a.get("cleanup_status"), "timed_out")
+                self.assertEqual(json.loads(journal.read_text("utf-8"))["cleanup_status"], "timed_out")
+                self.assertEqual(json.loads(man.read_text("utf-8"))["cleanup_status"], "timed_out")
+                self.assertEqual(len(be.cleaned), 1, f"teardown cleaned up {len(be.cleaned)} times, not exactly once")
                 self.assertEqual(L._active(), [], "budget-stop attempt still holds the worker slot")
             finally:
                 L.loop.close()
