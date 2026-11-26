@@ -137,6 +137,82 @@ jobs:
       - name: Host and tailnet grep
         run: bash scripts/scan-secrets.sh
 
+  contract-yaml:
+    name: contract-yaml
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.12"
+
+      - name: Parse contract/v1/openapi.yaml
+        run: uv run --with pyyaml==6.0.2 python -c "import pathlib, yaml; yaml.safe_load(pathlib.Path('contract/v1/openapi.yaml').read_text(encoding='utf-8'))"
+
+      - name: API surface unchanged
+        run: |
+          uv run --with pyyaml==6.0.2 python - <<'PY'
+          import json
+          import pathlib
+          import yaml
+
+          root = pathlib.Path(".")
+          document = yaml.safe_load((root / "contract/v1/openapi.yaml").read_text(encoding="utf-8"))
+          status = json.loads((root / "contract/v1/STATUS.json").read_text(encoding="utf-8"))
+          methods = {"get", "put", "post", "delete", "options", "head", "patch", "trace"}
+          operations = {
+              (method.upper(), path)
+              for path, path_item in document["paths"].items()
+              for method in methods
+              if method in path_item
+          }
+          expected_operations = {
+              tuple(endpoint.split(" ", 1)) for endpoint in status["endpoints"]
+          }
+          if len(expected_operations) != len(status["endpoints"]):
+              raise SystemExit(f"STATUS.json has {len(expected_operations)} endpoints, expected {len(status['endpoints'])}")
+          if operations != expected_operations:
+              raise SystemExit(
+                  "API operations mismatch; "
+                  f"missing={sorted(expected_operations - operations)}, "
+                  f"added={sorted(operations - expected_operations)}"
+              )
+
+          expected_refs = {
+              "schemas/artifact.json",
+              "schemas/attempt.json",
+              "schemas/error.json",
+              "schemas/lease-create.json",
+              "schemas/lease.json",
+              "schemas/lease-list.json",
+              "schemas/lease-renew.json",
+              "schemas/version.json",
+          }
+          refs = set()
+          nodes = [document]
+          while nodes:
+              node = nodes.pop()
+              if isinstance(node, dict):
+                  refs.update(
+                      value for key, value in node.items()
+                      if key == "$ref" and isinstance(value, str) and not value.startswith("#")
+                  )
+                  nodes.extend(node.values())
+              elif isinstance(node, list):
+                  nodes.extend(node)
+          if refs != expected_refs:
+              raise SystemExit(
+                  "External schema refs mismatch; "
+                  f"missing={sorted(expected_refs - refs)}, added={sorted(refs - expected_refs)}"
+              )
+          print(f"API surface unchanged: {len(operations)} operations, {len(refs)} external schema refs")
+          PY
+
   bee-ci-unit:
     name: bee-ci/unit
     if: always()
@@ -244,6 +320,14 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
+      - name: Lease/tamper gate unit tests
+        run: python3 -m unittest tests.test_lease_tamper -v
+      - name: Lease/tamper bypass regression (all five cases must fail closed)
+        run: python3 .github/scripts/lease_tamper_poc.py --expect fail-closed
+      - name: Lease/tamper adversarial reproduction v2 (13 cases must fail closed)
+        run: |
+          bash .github/scripts/lease_tamper_poc_v2.sh .github/scripts/lease_tamper.py | tee "$RUNNER_TEMP/lease_tamper_poc_v2.txt"
+          grep -q '^13 cases, 0 unexpected$' "$RUNNER_TEMP/lease_tamper_poc_v2.txt"
       - name: Enforce the slice lease and frozen tests
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -260,6 +344,7 @@ jobs:
       - windows-provisioning
       - test
       - scan
+      - contract-yaml
       - bee-ci-unit
       - bee-ci-contract
       - bee-ci-release-assets
