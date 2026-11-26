@@ -23,6 +23,7 @@ dependencies = []
 [project.optional-dependencies]
 cua = ["cua==0.5.0"]
 dev = []
+tickets = ["cryptography>=42,<51"]
 
 [project.scripts]
 hyvv = "hyvv.cli:main"

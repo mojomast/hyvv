@@ -76,10 +76,11 @@ jobs:
       - name: Sync and unit tests
         run: |
           uv sync --frozen --no-dev || uv sync --no-dev
-          # PyYAML is a CI-only lift: the OpenAPI parse test uses the ambient
-          # loader when present, and this uv overlay is its fallback, so the
-          # repo keeps no runtime or dev dependency on it.
-          uv run --with pyyaml==6.0.2 python -m unittest discover -s tests -v
+          # PyYAML and cryptography are both CI-only overlays: the extras stay
+          # optional at install time. The overlay is hash-pinned so every
+          # matrix leg resolves the same build the verify interpreter carries.
+          uv pip install --require-hashes -r .github/requirements/cryptography.txt
+          uv run --no-sync --with pyyaml==6.0.2 python -m unittest discover -s tests -v
 
       - name: Contract tests (/v1, in-process hyvv)
         # Same command a reviewer runs locally. Point it at a live host with
