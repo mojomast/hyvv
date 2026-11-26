@@ -1079,22 +1079,34 @@ def _ticket_shape_violations(ticket, schema):
     return violations
 
 
-def _ticket_claim_violations(claim, value, rules):
+def _ticket_string_violations(claim, value, rules):
     violations = []
+    if "minLength" in rules and len(value) < rules["minLength"]:
+        violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} is shorter than minLength"})
+    if "pattern" in rules and re.search(rules["pattern"], value) is None:
+        violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} does not match the required pattern"})
+    return violations
+
+
+def _ticket_allowed_value_violations(claim, value, rules):
+    violations = []
+    if "enum" in rules and value not in rules["enum"]:
+        violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} is not an allowed value"})
+    if "const" in rules and value != rules["const"]:
+        violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} does not equal the required constant"})
+    return violations
+
+
+def _ticket_claim_violations(claim, value, rules):
     expected = rules.get("type")
     if expected is not None:
         kinds = expected if isinstance(expected, list) else [expected]
         if not any(_ticket_matches_type(value, kind) for kind in kinds):
             return [{"code": "ticket_invalid", "detail": f"ticket claim {claim} has the wrong type"}]
+    violations = []
     if isinstance(value, str):
-        if "minLength" in rules and len(value) < rules["minLength"]:
-            violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} is shorter than minLength"})
-        if "pattern" in rules and re.search(rules["pattern"], value) is None:
-            violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} does not match the required pattern"})
-    if "enum" in rules and value not in rules["enum"]:
-        violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} is not an allowed value"})
-    if "const" in rules and value != rules["const"]:
-        violations.append({"code": "ticket_invalid", "detail": f"ticket claim {claim} does not equal the required constant"})
+        violations.extend(_ticket_string_violations(claim, value, rules))
+    violations.extend(_ticket_allowed_value_violations(claim, value, rules))
     return violations
 
 
