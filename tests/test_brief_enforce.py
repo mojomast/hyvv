@@ -1,14 +1,18 @@
-"""RED: hyvv refuses an invalid rizzstack.brief/1 only when ticket_mode=enforce.
+"""RED: hyvv refuses an invalid rizzstack.brief/1 only when brief_mode=enforce.
 
-The default stays off. `off` and `report` keep B4's report-only behaviour exactly;
-`enforce` refuses an invalid v1 brief with 400 invalid_brief, the validator's
-problems, and no attempt row. An unversioned brief is still accepted and recorded
-as unversioned. The mode is validated at load_config, so a typo cannot silently
-arm or disarm enforcement.
+B6 gets its OWN switch. `brief_mode` is separate from the ticket surface's
+`ticket_mode`, which stays untouched (default off, accepts off|report, refuses
+enforce) exactly as C2/C4 shipped it. `brief_mode` defaults to `report`, so the
+B4 behaviour is what a host gets without configuring anything; `off` records no
+brief validation; `enforce` refuses an invalid v1 brief with 400 invalid_brief,
+the validator's problems, and no attempt row. An unversioned brief is still
+accepted and recorded as unversioned. `brief_mode` is validated at load_config,
+so a typo cannot silently arm or disarm enforcement.
 
 This file is the specification for the slice; the implementer must not edit it.
-It is stacked on B4's RED commit (the vendored validator and schemas are there);
-the branch must merge current main after B4 lands before implementing.
+It is stacked on B4's RED commit and on current main (C4's ticket_mode default),
+so the ticket_mode regression pin passes at source_rev while every brief_mode
+behaviour fails.
 """
 from __future__ import annotations
 
@@ -37,7 +41,7 @@ def _v1_brief(**overrides):
         "project": "demo",
         "source_rev": "a" * 40,
         "assigned_files": ["launcher.py"],
-        "acceptance": {"criteria": ["ticket_mode decides whether an invalid brief is refused"]},
+        "acceptance": {"criteria": ["brief_mode decides whether an invalid brief is refused"]},
         "risk": {"tier": "low"},
     }
     brief.update(overrides)
@@ -45,7 +49,7 @@ def _v1_brief(**overrides):
 
 
 class _LauncherServer:
-    def __init__(self, mode):
+    def __init__(self, brief_mode):
         tmp = tempfile.mkdtemp(prefix="hyvv-b6-")
         for name in ("go.key", "deepseek.key"):
             (Path(tmp) / name).write_text("fake-key-not-real", encoding="utf-8")
@@ -53,7 +57,7 @@ class _LauncherServer:
             "bind": "127.0.0.1", "port": 0, "max_concurrent": 1, "data_dir": tmp,
             "backoff_s": [0.2], "model": "deepseek-v4.1-flash", "base_url": "http://x",
             "wire": "openai", "image": "cua-bee:test", "runtime": "runc", "memory_mb": 512,
-            "projects": {"demo": {}}, "ticket_mode": mode,
+            "projects": {"demo": {}}, "brief_mode": brief_mode,
         }
         self.la = L.Launcher(cfg, L.FakeBackend(cfg))
         from http.server import ThreadingHTTPServer
@@ -78,13 +82,27 @@ class _LauncherServer:
         self.srv.server_close()
 
 
-class TicketModeConfig(unittest.TestCase):
-    def test_ticket_mode_defaults_off_and_refuses_unknown_values(self):
+class BriefModeConfig(unittest.TestCase):
+    def test_brief_mode_defaults_report_and_refuses_unknown_values(self):
         with tempfile.TemporaryDirectory(prefix="hyvv-b6-cfg-") as tmp:
             path = Path(tmp) / "config.json"
             path.write_text("{}", encoding="utf-8")
+            self.assertEqual(L.load_config(path).get("brief_mode"), "report")
+            for mode in ("off", "report", "enforce"):
+                path.write_text(json.dumps({"brief_mode": mode}), encoding="utf-8")
+                self.assertEqual(L.load_config(path).get("brief_mode"), mode)
+            path.write_text('{"brief_mode": "banana"}', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                L.load_config(path)
+
+
+class TicketModeUntouched(unittest.TestCase):
+    def test_ticket_mode_still_defaults_off_and_refuses_enforce(self):
+        with tempfile.TemporaryDirectory(prefix="hyvv-b6-ticket-") as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text("{}", encoding="utf-8")
             self.assertEqual(L.load_config(path).get("ticket_mode"), "off")
-            path.write_text('{"ticket_mode": "banana"}', encoding="utf-8")
+            path.write_text('{"ticket_mode": "enforce"}', encoding="utf-8")
             with self.assertRaises(ValueError):
                 L.load_config(path)
 
@@ -100,7 +118,7 @@ class EnforceMode(unittest.TestCase):
                 brief = _v1_brief()
                 brief.pop("risk")
                 status, body = server.post(brief, f"att_b6_accept_{mode}")
-                self.assertEqual(status, 201, f"ticket_mode={mode} is report-only: {body}")
+                self.assertEqual(status, 201, f"brief_mode={mode} is report-only: {body}")
                 self.assertIn(f"att_b6_accept_{mode}", server.la.attempts)
             finally:
                 server.close()
