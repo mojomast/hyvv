@@ -27,16 +27,20 @@ $payload = @(
   "launcher.py",
   "provisioning.py",
   "landing_export.py",
+  "rails_emitter.py",
+  "rails_log_source.py",
+  "rails_export.py",
+  "contrib/rizzstack_rails/__init__.py",
+  "contrib/rizzstack_rails/contracts.py",
+  "contrib/rizzstack_rails/ledger.py",
+  "contrib/rizzstack_rails/privacy.py",
   "agy_cua_mcp.py",
   "brief.schema.json",
   "result.schema.json",
   "config.example.json"
 )
 
-if (-not (Test-Path (Join-Path $Source "launcher.py"))) {
-  throw "Source $Source does not contain launcher.py"
-}
-foreach ($required in @("provisioning.py", "landing_export.py")) {
+foreach ($required in $payload) {
   if (-not (Test-Path (Join-Path $Source $required))) {
     throw "Source $Source does not contain $required"
   }
@@ -92,6 +96,8 @@ function Copy-Payload {
   foreach ($rel in $payload) {
     $from = Join-Path $Source $rel
     $to = Join-Path $Prefix $rel
+    $dstDir = Split-Path -Parent $to
+    New-Item -ItemType Directory -Force $dstDir | Out-Null
     Copy-Item -Force $from $to
   }
   Get-ChildItem (Join-Path $Source "scripts") -Filter *.ps1 | ForEach-Object {
