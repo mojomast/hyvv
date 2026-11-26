@@ -5,6 +5,7 @@ the checks are proven against git history rather than mocked diffs.
 """
 
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -18,6 +19,31 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / ".github" / "scripts" / "lease_tamper.py"
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+#: sha256 of the shared policy block and the shared fixtures.  Both repositories
+#: that vendor this gate (workflow and hyvv) and the merge lane (rizzstack)
+#: assert the same values, so the copies cannot drift silently.
+SHARED_POLICY_SHA256 = "f749821a6170379743a7e440edcb0d90141de8d04bf22ef9a3b6d28a78b83ec8"
+REVIEW_LINES_SHA256 = "ac2de684dd22fceed5aa2f18ac6d7d6f8c101c0fd67a619d2a2c6a663642311b"
+CARRY_FIXTURES_SHA256 = "33435d738b84742c8e2b5cfa3e153cf20921fb7a1985f808bbde68603941165e"
+SHARED_BLOCK_BEGIN = "# --- BEGIN SHARED GATE POLICY"
+SHARED_BLOCK_END = "# --- END SHARED GATE POLICY -------------------------------------------------"
+
+
+def load_gate_module():
+    """Import the gate script as a module (it has no import-time side effects)."""
+    spec = importlib.util.spec_from_file_location("lease_tamper_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def shared_policy_block():
+    text = SCRIPT.read_text(encoding="utf-8")
+    start = text.index(SHARED_BLOCK_BEGIN)
+    end = text.index(SHARED_BLOCK_END) + len(SHARED_BLOCK_END)
+    return text[start:end]
 
 
 class GitRepo:
@@ -776,6 +802,291 @@ class SliceClassificationTests(unittest.TestCase):
         self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
 
 
+# -- base-merge review carry-forward ---------------------------------------
+
+
+class CarryFixtureTests(unittest.TestCase):
+    """Temporary repositories for the carry-forward and rejection tests."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="lease-tamper-carry-"))
+        self.api = FakeGitHubApi()
+        self.api.pulls[12] = {"number": 12, "head": {}, "base": {}, "labels": [], "body": ""}
+
+    def tearDown(self):
+        self.api.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # -- fixtures ---------------------------------------------------------
+
+    def build(self):
+        """A non-slice pull request: the base lease names a different slice.
+
+        Returns ``(repo, base, reviewed_head)``.  The review is posted at
+        ``reviewed_head``; a later update is what the carry-forward rule judges.
+        """
+        repo = new_git_repo(self.tmp / "carry")
+        repo.write("src/slice.py", "base\n")
+        repo.write("src/unleased.py", "base\n")
+        repo.write("tests/test_frozen.py", "base\n")
+        source_rev = repo.commit("base")
+        document = contract_document(source_rev, ["src/slice.py"], ["tests/test_frozen.py"])
+        sha = contract_hash(document)
+        repo.write(
+            ".rizzstack/contracts/%s.json" % sha,
+            json.dumps(document, indent=2, sort_keys=True) + "\n",
+        )
+        lease = lease_document(document, sha, source_rev, branch="feat/wave-x-x1")
+        lease["id"] = "wave-other-slice"
+        lease["pull_request"] = 99
+        lease["branch"] = "feat/other"
+        repo.write(".rizzstack/leases/slice.json", json.dumps(lease, indent=2) + "\n")
+        base = repo.commit("land the contract and another slice's lease on main")
+        repo.checkout("-b", "feat/wave-x-x1")
+        repo.write("src/slice.py", "reviewed implementation\n")
+        reviewed = repo.commit("implement the slice")
+        return repo, base, reviewed
+
+    def review_at(self, sha):
+        self.api.reviews[12] = [
+            {
+                "state": "COMMENTED",
+                "commit_id": sha,
+                "body": "APPROVE (independent review at %s)\n\nVERDICT: approve" % sha,
+            }
+        ]
+
+    def advance_base(self, repo, name="src/base_only.py", text="base advance\n"):
+        """Commit on main, then return to the pull-request branch."""
+        repo.checkout("main")
+        repo.write(name, text)
+        tip = repo.commit("main advances: " + name)
+        repo.checkout("feat/wave-x-x1")
+        return tip
+
+    def merge(self, repo, ref="main", message="merge main into the branch"):
+        repo.git("merge", "--no-ff", "-m", message, ref)
+        return repo.rev()
+
+    def run_gate(self, repo, base, head, env=None):
+        command = [
+            sys.executable,
+            str(SCRIPT),
+            "--repo", str(repo.path),
+            "--base", base,
+            "--head", head,
+            "--branch", "feat/wave-x-x1",
+            "--pull-request", "12",
+        ]
+        run_env = dict(os.environ)
+        run_env.pop("GITHUB_REPOSITORY", None)
+        run_env.pop("GITHUB_TOKEN", None)
+        run_env.update(env or {})
+        return subprocess.run(command, capture_output=True, text=True, env=run_env)
+
+    def api_env(self):
+        return {
+            "GITHUB_REPOSITORY": QUEUE_REPO,
+            "GITHUB_API_URL": self.api.url,
+            "GITHUB_TOKEN": "test-token",
+        }
+
+
+class BaseMergeReviewCarryTests(CarryFixtureTests):
+    """Owner rule: a review at an earlier head carries over a base-merge-only update.
+
+    Accepted only when (a) the review commit is an ancestor of the head, (b)
+    every commit after it that is not on the base is a merge whose non-first
+    parents are on the base, and (c) the pull request's diff against the base is
+    byte-identical (same paths, same blob shas) to the reviewed diff. The four
+    refusal cases are asserted with their named reason.
+    """
+
+    # -- the rule ---------------------------------------------------------
+
+    def test_base_merge_only_update_after_review_passes(self):
+        repo, _base, reviewed = self.build()
+        self.review_at(reviewed)
+        new_base = self.advance_base(repo)
+        head = self.merge(repo)
+
+        proc = self.run_gate(repo, new_base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("carries forward to head " + head[:12], proc.stdout)
+        self.assertIn("review_carry_ok", proc.stdout)
+        self.assertIn(reviewed[:12], proc.stdout)
+
+    def test_two_base_merges_in_a_row_still_pass(self):
+        # The base may advance more than once; each merge's second parent is an
+        # ancestor of the current base tip, so the review still carries.
+        repo, _base, reviewed = self.build()
+        self.review_at(reviewed)
+        self.advance_base(repo, "src/base_one.py")
+        self.merge(repo)
+        new_base = self.advance_base(repo, "src/base_two.py")
+        head = self.merge(repo)
+
+        proc = self.run_gate(repo, new_base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("carries forward", proc.stdout)
+
+    def test_authored_commit_after_review_fails_named(self):
+        repo, base, reviewed = self.build()
+        self.review_at(reviewed)
+        repo.write("src/slice.py", "changed after the review\n")
+        head = repo.commit("change the code after the review")
+
+        proc = self.run_gate(repo, base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
+        self.assertIn("review_carry_authored_commit", proc.stdout)
+        self.assertIn("was authored after the review", proc.stdout)
+
+    def test_content_change_resolved_into_a_base_merge_fails_named(self):
+        # Every commit after the review is a merge of the base, but the conflict
+        # resolution changes the pull request's diff: the reviewed bytes are not
+        # the bytes that would merge, so the review cannot carry.
+        repo, _base, reviewed = self.build()
+        self.review_at(reviewed)
+        repo.checkout("main")
+        repo.write("src/slice.py", "main side\n")
+        new_base = repo.commit("main edits the same line")
+        repo.checkout("feat/wave-x-x1")
+        conflicted = subprocess.run(
+            ["git", "-C", str(repo.path), "merge", "main"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(conflicted.returncode, 0, "the fixture must produce a conflict")
+        repo.write("src/slice.py", "resolution neither side reviewed\n")
+        head = repo.commit("resolve the conflict with content nobody reviewed")
+
+        proc = self.run_gate(repo, new_base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
+        self.assertIn("review_carry_content_changed", proc.stdout)
+        self.assertIn("src/slice.py", proc.stdout)
+
+    def test_merge_of_an_unrelated_branch_fails_named(self):
+        repo, base, reviewed = self.build()
+        self.review_at(reviewed)
+        repo.checkout("-b", "side", "main")
+        repo.write("src/side.py", "side work\n")
+        repo.commit("work on a branch that is not the base")
+        repo.checkout("feat/wave-x-x1")
+        head = self.merge(repo, "side", "merge an unrelated branch")
+
+        proc = self.run_gate(repo, base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
+        self.assertIn("review_carry_unrelated_merge", proc.stdout)
+        self.assertIn("which is not on base", proc.stdout)
+
+    def test_force_pushed_away_review_fails_named(self):
+        # The reviewed commit exists but is not in the head's history: the
+        # reviewed code was rewritten, so nothing carries.
+        repo, base, _reviewed = self.build()
+        repo.checkout("-b", "stale", "main")
+        repo.write("src/slice.py", "a variant that is later dropped\n")
+        stale = repo.commit("a reviewed variant that is later dropped")
+        repo.checkout("feat/wave-x-x1")
+        repo.write("src/slice.py", "a rewritten implementation\n")
+        head = repo.commit("rewrite the branch after the review")
+        self.review_at(stale)
+
+        proc = self.run_gate(repo, base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
+        self.assertIn("review_not_ancestor", proc.stdout)
+
+
+# -- newest decisive review governs ----------------------------------------
+
+
+class RejectionGovernsTests(CarryFixtureTests):
+    """A rejection submitted after the approval being used refuses it.
+
+    The three reproduction cases from the Phase 2 review: a rejection at the
+    approved commit, a rejection at the new head after a base-merge update, and
+    a rejection at the same head as the approval.  A later re-approval
+    supersedes the rejection, so the rule is "newest decisive review", not
+    "any rejection ever".
+    """
+
+    def review(self, sha, state="COMMENTED", body=None, submitted_at="2026-11-26T00:00:00Z"):
+        return {
+            "state": state,
+            "commit_id": sha,
+            "body": body if body is not None else "APPROVE (independent review) at %s" % sha,
+            "submitted_at": submitted_at,
+        }
+
+    def test_rejection_at_the_approved_commit_refuses_the_carried_review(self):
+        repo, _base, reviewed = self.build()
+        self.api.reviews[12] = [
+            self.review(reviewed),
+            self.review(reviewed, state="CHANGES_REQUESTED", body="no",
+                        submitted_at="2026-11-26T01:00:00Z"),
+        ]
+        new_base = self.advance_base(repo)
+        head = self.merge(repo)
+
+        proc = self.run_gate(repo, new_base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
+        self.assertIn("review_changes_requested", proc.stdout)
+
+    def test_rejection_at_the_new_head_refuses_the_carried_review(self):
+        repo, _base, reviewed = self.build()
+        new_base = self.advance_base(repo)
+        head = self.merge(repo)
+        self.api.reviews[12] = [
+            self.review(reviewed),
+            self.review(head, body="CHANGES REQUESTED (the carry is unsound) at %s" % head,
+                        submitted_at="2026-11-26T01:00:00Z"),
+        ]
+
+        proc = self.run_gate(repo, new_base, head, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
+        self.assertIn("review_changes_requested", proc.stdout)
+
+    def test_rejection_at_the_same_head_refuses_the_exact_review(self):
+        repo, base, reviewed = self.build()
+        self.api.reviews[12] = [
+            self.review(reviewed),
+            self.review(reviewed, state="CHANGES_REQUESTED", body="no",
+                        submitted_at="2026-11-26T01:00:00Z"),
+        ]
+
+        proc = self.run_gate(repo, base, reviewed, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("reason=non_slice_requires_independent_review", proc.stdout)
+        self.assertIn("review_changes_requested", proc.stdout)
+
+    def test_a_later_reapproval_supersedes_the_rejection(self):
+        repo, base, reviewed = self.build()
+        self.api.reviews[12] = [
+            self.review(reviewed),
+            self.review(reviewed, state="CHANGES_REQUESTED", body="no",
+                        submitted_at="2026-11-26T01:00:00Z"),
+            self.review(reviewed, submitted_at="2026-11-26T02:00:00Z"),
+        ]
+
+        proc = self.run_gate(repo, base, reviewed, env=self.api_env())
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+
 # -- lease hardening -------------------------------------------------------
 
 
@@ -1248,6 +1559,100 @@ class MergeGroupTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("[no-credentials]", proc.stdout)
         self.assertIn("reason=merge_group_pr_unresolved", proc.stdout)
+
+
+# -- shared policy and fixtures --------------------------------------------
+
+
+class SharedPolicyContractTests(unittest.TestCase):
+    """The gate and the lane must run the same parser, carry and path rules."""
+
+    def test_shared_policy_block_is_byte_identical(self):
+        self.assertEqual(
+            hashlib.sha256(shared_policy_block().encode("utf-8")).hexdigest(),
+            SHARED_POLICY_SHA256,
+            "the shared policy block changed; vendor the identical block into "
+            "rizzstack scripts/merge_lane_v5.py and update the hash in both suites",
+        )
+        module = load_gate_module()
+        for name in (
+            "parse_review_line",
+            "review_form",
+            "governing_rejection",
+            "approval_chain",
+            "review_carry_forward",
+            "sensitive_paths",
+            "check_run_is_success",
+        ):
+            self.assertTrue(hasattr(module, name), name)
+
+    def test_shared_review_line_fixtures(self):
+        fixture = FIXTURES / "review_lines.json"
+        self.assertEqual(hashlib.sha256(fixture.read_bytes()).hexdigest(), REVIEW_LINES_SHA256)
+        module = load_gate_module()
+        document = json.loads(fixture.read_text(encoding="utf-8"))
+        for case in document["cases"]:
+            kind, sha = module.parse_review_line(case["body"])
+            self.assertEqual(kind, case["kind"], case["name"])
+            self.assertEqual(sha, case["sha"], case["name"])
+
+    def test_only_a_completed_success_is_green(self):
+        module = load_gate_module()
+        self.assertTrue(
+            module.check_run_is_success({"status": "completed", "conclusion": "success"})
+        )
+        for conclusion in ("neutral", "skipped", "failure", "cancelled", "stale", "action_required", ""):
+            self.assertFalse(
+                module.check_run_is_success({"status": "completed", "conclusion": conclusion}),
+                conclusion,
+            )
+        self.assertFalse(
+            module.check_run_is_success({"status": "in_progress", "conclusion": None})
+        )
+
+    def test_sensitive_paths_include_the_explicit_list(self):
+        module = load_gate_module()
+        required = {
+            "bundlebees_plugin/verify_local.py",
+            "bundlebees_plugin/contract.py",
+            "bundlebees_plugin/approval.py",
+            "bundlebees_plugin/tdd.py",
+            "bundlebees_plugin/acdd_cli.py",
+            "bundlebees_plugin/subversion_scan.py",
+            "bundlebees_plugin/test_receipts.py",
+            "bundlebees_plugin/transport.py",
+            "bundlebees_plugin/return_report.py",
+            "tests/test_lease_tamper.py",
+        }
+        self.assertLessEqual(required, set(module.SENSITIVE_PATHS))
+        for path in required:
+            self.assertEqual(module.sensitive_paths([path]), [path], path)
+        self.assertEqual(module.sensitive_paths(["bundlebees_plugin/delegate.py"]), [])
+
+
+class SharedCarryFixtureTests(unittest.TestCase):
+    """Both implementations must agree with one set of git fixtures."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="lease-tamper-shared-carry-"))
+        self.module = load_gate_module()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_shared_carry_scenarios(self):
+        fixture = FIXTURES / "carry_scenarios.py"
+        self.assertEqual(hashlib.sha256(fixture.read_bytes()).hexdigest(), CARRY_FIXTURES_SHA256)
+        spec = importlib.util.spec_from_file_location("carry_scenarios", fixture)
+        scenarios = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenarios)
+        for name, review_sha, base, head, reason, ok in scenarios.build_all(self.tmp):
+            got_ok, got_reason, detail = self.module.review_carry_forward(
+                str(self.tmp / name), review_sha, base, head
+            )
+            self.assertEqual(
+                (got_ok, got_reason), (ok, reason), "%s: %s" % (name, detail)
+            )
 
 
 if __name__ == "__main__":

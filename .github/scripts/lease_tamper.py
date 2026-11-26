@@ -37,9 +37,42 @@ grant itself a scope.
 A **non-slice** pull request -- a docs fix, a release chore, a gate change, a
 lease or contract landing -- passes only with an independent review recorded at
 its exact head commit: a review whose state is ``APPROVED``, or a ``COMMENTED``
-review whose first line starts ``APPROVE`` and names an ``independent review``,
-with ``commit_id`` equal to the head.  Without one the gate fails closed with
-the named reason ``non_slice_requires_independent_review``.
+review whose first line is the canonical attestation ``APPROVE (independent
+review) at <sha>`` (the pre-canonical ``APPROVE — independent review ...`` and
+``APPROVE (independent review at <sha>)`` forms are accepted by the same
+parser), with ``commit_id`` equal to the head and any named sha a prefix of it.
+Without one the gate fails closed with the named reason
+``non_slice_requires_independent_review``.
+
+**The newest decisive review governs.**  A rejection -- state
+``CHANGES_REQUESTED``, or a ``COMMENTED`` review whose first line starts
+``CHANGES REQUESTED`` -- submitted after the approval being used, at that
+approval's commit or at any later commit (the head counts), refuses it: the
+gate does not approve a pull request whose latest word is a rejection.  A later
+re-approval supersedes the rejection in its turn, and a rejection the approval
+itself supersedes (recorded at an earlier commit) does not block.  The
+canonical rejection line is ``CHANGES REQUESTED (<why>) at <sha>``.
+
+**A review at an earlier head is carried forward** when, and only when, the
+branch moved by merging the base into it and nothing else changed: every commit
+in ``review_sha..<head>`` that is not already on the base is a merge commit
+whose non-first parents are on the base, and the pull request's diff against
+the base (``base...<head>``) is byte-identical to the diff the review saw
+(``base...review_sha``) under per-file blob equality.  Updating a branch with
+the base therefore does not demand a fresh review just to move ``commit_id``,
+while an authored commit, a merge of any other branch, or any content change
+still does.  A rejected carry names its reason: ``review_not_ancestor``,
+``review_carry_authored_commit``, ``review_carry_unrelated_merge``,
+``review_carry_content_changed`` or ``review_carry_unreadable``.
+
+The review line, the rejection rule, the carry-forward predicate, the
+sensitive-path list and the only-green conclusion live in one shared policy
+block, vendored byte-identically here and in the merge lane
+(``scripts/merge_lane_v5.py``): two parsers would drift, and the lane must
+accept exactly what this gate accepts.  The gate prints a machine-readable
+``lease-tamper: class=slice`` / ``lease-tamper: class=non-slice`` line on a
+passing run so the lane takes the class from the trusted gate output instead of
+deriving it from a branch name.
 
 The verify boundary is, in order: ``--verify-sha`` (a local/test argument, never
 a pull-request input), the base-branch lease's
@@ -110,7 +143,6 @@ GATE_SCRIPT = ".github/scripts/lease_tamper.py"
 PR_NAME_KEYS = ("pull_request", "pull_requests", "pr", "prs")
 BRANCH_NAME_KEYS = ("branch", "branches")
 SLICE_NAME_KEYS = ("slice", "slice_name", "id")
-APPROVE_REVIEW_RE = re.compile(r"(?i)\bindependent\s+review\b")
 HEX_REV = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GLOB_CHARS = ("*", "?", "[")
@@ -123,6 +155,492 @@ MAX_GROUP_ENTRIES = 100
 DEFAULT_API_URL = "https://api.github.com"
 LEASE_JOB_NAME = "lease-tamper"
 MERGE_GROUP_REASON = "merge_group_pr_unresolved"
+
+# --- BEGIN SHARED GATE POLICY (vendored; keep byte-identical) ---------------
+# One implementation of the rules the lease/tamper gate and the merge lane both
+# apply: how a review attestation is parsed, which rejection overrides an
+# approval, the review carry-forward predicate, the sensitive-path list and the
+# only green conclusion.  The two repositories cannot import each other (the
+# gate must stay a single self-contained script), so this block is duplicated
+# verbatim and the tests prove the copies are byte-identical with a sha256.
+#
+# Canonical attestation line (first non-empty line of the review body):
+#     APPROVE (independent review) at <sha>
+#     APPROVE (owner) at <sha>
+#     CHANGES REQUESTED (<why>) at <sha>
+# The pre-canonical forms stay accepted by the same parser:
+#     APPROVE — independent review ... at <sha>
+#     APPROVE (independent review at <sha>)
+#     OWNER APPROVED
+
+REVIEW_APPROVE_INDEPENDENT = "approve_independent"
+REVIEW_APPROVE_OWNER = "approve_owner"
+REVIEW_CHANGES_REQUESTED = "changes_requested"
+REVIEW_APPROVAL_KINDS = (REVIEW_APPROVE_INDEPENDENT, REVIEW_APPROVE_OWNER)
+
+#: How a review matches the head: at the head itself, or carried from an
+#: earlier head by a base-merge-only update with an unchanged diff.
+REVIEW_MATCH_EXACT = "exact"
+REVIEW_MATCH_CARRIED = "carried"
+
+#: Named outcomes of the base-merge review carry-forward.  The refusal reasons
+#: are stable codes, so a lane decision and a gate log name the same condition.
+CARRY_OK = "review_carry_ok"
+CARRY_NOT_ANCESTOR = "review_not_ancestor"
+CARRY_AUTHORED_COMMIT = "review_carry_authored_commit"
+CARRY_UNRELATED_MERGE = "review_carry_unrelated_merge"
+CARRY_CONTENT_CHANGED = "review_carry_content_changed"
+CARRY_UNREADABLE = "review_carry_unreadable"
+
+#: Paths whose change makes a pull request a gate/lane change: it needs an
+#: explicit owner attestation in addition to the independent review, because a
+#: coordinator or a bee could otherwise relax the machinery that judges it.
+#: The explicit list is authoritative; the prefix and token rules below only
+#: catch new files in the same places.
+SENSITIVE_PATHS = frozenset((
+    "bundlebees_plugin/acdd_cli.py",
+    "bundlebees_plugin/approval.py",
+    "bundlebees_plugin/contract.py",
+    "bundlebees_plugin/return_report.py",
+    "bundlebees_plugin/subversion_scan.py",
+    "bundlebees_plugin/tdd.py",
+    "bundlebees_plugin/test_receipts.py",
+    "bundlebees_plugin/transport.py",
+    "bundlebees_plugin/verify_local.py",
+    "tests/test_lease_tamper.py",
+    "tests/test_merge_lane_v5.py",
+))
+SENSITIVE_PREFIXES = (".github/", ".rizzstack/", "gate/", "gates/", "policy/")
+SENSITIVE_TOKENS = frozenset(("gate", "gates", "lane", "lanes"))
+
+#: Only SUCCESS is green.  A skipped or neutral required check proves nothing
+#: about the change, so it is not evidence that a gate ran.
+CHECK_GREEN_CONCLUSION = "success"
+CHECK_RED_CONCLUSIONS = (
+    "failure",
+    "timed_out",
+    "cancelled",
+    "action_required",
+    "startup_failure",
+    "stale",
+    "error",
+)
+
+_POLICY_APPROVE = re.compile(r"(?i)^APPROVE\b(?!\?)")
+_POLICY_OWNER_WORD = re.compile(r"(?i)^OWNER\s+APPROVE[DS]?\b")
+_POLICY_CHANGES = re.compile(r"(?i)^CHANGES[\s_-]*REQUESTED\b")
+_POLICY_INDEPENDENT = re.compile(r"(?i)\bindependent\s+review\b")
+_POLICY_NEGATED = re.compile(
+    r"(?i)\b(?:not|no|never|without|isn'?t|is\s+not)\b[^.;:!?]{0,48}?\bindependent\s+review\b"
+)
+_POLICY_OWNER = re.compile(r"(?i)\bowner\b")
+_POLICY_SHA = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{7,64})(?![0-9a-fA-F])")
+_POLICY_LEAD = re.compile(r"^[\s>#•\-\u2013\u2014]+")
+_POLICY_EMPHASIS = re.compile(r"^(?:\*\*|__|`)+")
+_POLICY_TRAILING_SHA = re.compile(r"(?i)\s+at\s+[0-9a-f]{7,64}\s*$")
+_CARRY_HEX = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+
+
+def _policy_text(value):
+    return value if isinstance(value, str) else ""
+
+
+def _policy_first_line(body):
+    for line in _policy_text(body).splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def _policy_strip_markup(line):
+    line = _POLICY_LEAD.sub("", line)
+    line = _POLICY_EMPHASIS.sub("", line)
+    line = re.sub(
+        r"(?i)^(APPROVE|CHANGES[\s_-]*REQUESTED|OWNER\s+APPROVE[DS]?)(?:\*\*|__|`)",
+        lambda match: match.group(1),
+        line,
+    )
+    return line.strip()
+
+
+def _policy_descriptor(rest):
+    """The words that qualify an APPROVE: its first parenthetical or clause."""
+    rest = rest.strip()
+    while rest[:1] in ("*", "_", "`", " "):
+        rest = rest[1:]
+    if rest.startswith("("):
+        end = rest.find(")")
+        return rest[1:end] if end != -1 else rest[1:]
+    return _POLICY_TRAILING_SHA.sub("", rest).strip(" \t-–—:;,")
+
+
+def parse_review_line(body):
+    """``(kind, named_sha)`` for a review body's first non-empty line.
+
+    ``kind`` is ``approve_independent``, ``approve_owner``,
+    ``changes_requested`` or ``None``.  ``named_sha`` is the commit the line
+    names after ``at`` (a 7..64-hex prefix), or ``None``.  Every review line is
+    parsed here and nowhere else, so the gate and the lane cannot disagree
+    about what an approval is.
+    """
+    line = _policy_strip_markup(_policy_first_line(body))
+    if not line:
+        return None, None
+    named = None
+    found = _POLICY_SHA.findall(line)
+    if found:
+        named = found[-1].lower()
+    if _POLICY_CHANGES.search(line):
+        return REVIEW_CHANGES_REQUESTED, named
+    if _POLICY_OWNER_WORD.search(line):
+        return REVIEW_APPROVE_OWNER, named
+    match = _POLICY_APPROVE.search(line)
+    if not match:
+        return None, None
+    descriptor = _policy_descriptor(line[match.end():])
+    if _POLICY_INDEPENDENT.search(descriptor) and not _POLICY_NEGATED.search(descriptor):
+        return REVIEW_APPROVE_INDEPENDENT, named
+    if _POLICY_OWNER.search(descriptor):
+        return REVIEW_APPROVE_OWNER, named
+    return None, None
+
+
+def review_form(review):
+    """``(kind, named_sha)`` for one review, or ``(None, None)``.
+
+    GitHub's ``APPROVED`` state is an approval even with an empty body.  A body
+    that names the owner is an owner attestation only: an owner approval never
+    satisfies the independent-review rule, whatever state GitHub records.
+    """
+    if not isinstance(review, dict):
+        return None, None
+    state = _policy_text(review.get("state")).strip().upper()
+    kind, named = parse_review_line(review.get("body"))
+    if state == "CHANGES_REQUESTED":
+        return REVIEW_CHANGES_REQUESTED, named
+    if state not in ("APPROVED", "COMMENTED"):
+        return None, None
+    if kind == REVIEW_CHANGES_REQUESTED:
+        return REVIEW_CHANGES_REQUESTED, named
+    if kind is not None:
+        return kind, named
+    if state == "APPROVED":
+        return REVIEW_APPROVE_INDEPENDENT, named
+    return None, None
+
+
+def review_names_commit(named, commit):
+    """True when the line names no commit, or a prefix of ``commit``."""
+    if not named:
+        return True
+    commit = _policy_text(commit).strip().lower()
+    return bool(commit) and commit.startswith(named.lower())
+
+
+def review_is_approval(review, kind=None):
+    form, named = review_form(review)
+    if form not in REVIEW_APPROVAL_KINDS:
+        return False
+    if kind is not None and form != kind:
+        return False
+    return review_names_commit(named, (review or {}).get("commit_id"))
+
+
+def review_is_rejection(review):
+    return review_form(review)[0] == REVIEW_CHANGES_REQUESTED
+
+
+def review_chronology(reviews):
+    """Reviews in submission order.
+
+    GitHub returns reviews chronologically.  When every review carries a
+    ``submitted_at`` timestamp the list is sorted by it, so a facts file that
+    reorders reviews cannot reorder history; otherwise list order is used.
+    """
+    items = [item for item in (reviews or []) if isinstance(item, dict)]
+    stamps = [
+        _policy_text(item.get("submitted_at") or item.get("submittedAt")).strip()
+        for item in items
+    ]
+    if items and all(stamps):
+        order = sorted(range(len(items)), key=lambda index: stamps[index])
+        return [items[index] for index in order]
+    return items
+
+
+def governing_rejection(reviews, approval, head=None, ancestor=None):
+    """The rejection submitted after ``approval`` that overrides it, or None.
+
+    The newest decisive review governs: a rejection (state ``CHANGES_REQUESTED``
+    or a first line starting ``CHANGES REQUESTED``) submitted after the approval
+    refuses when it is recorded at the approval's commit, at the head, or at a
+    commit that descends from the approval's commit.  A rejection the approval
+    supersedes does not block, and a later approval supersedes the rejection in
+    its turn.  With no ``ancestor`` callable an unrelated commit is treated as
+    governing: failing closed beats ignoring a rejection whose history cannot be
+    read.
+    """
+    ordered = review_chronology(reviews)
+    index = next((position for position, item in enumerate(ordered) if item is approval), None)
+    if index is None:
+        return None
+    approval_commit = _policy_text((approval or {}).get("commit_id")).strip().lower()
+    head = _policy_text(head).strip().lower()
+    for candidate in ordered[index + 1:]:
+        if not review_is_rejection(candidate):
+            continue
+        commit = _policy_text(candidate.get("commit_id")).strip().lower()
+        if not commit or commit == approval_commit or (head and commit == head):
+            return candidate
+        if ancestor is None:
+            return candidate
+        if approval_commit and ancestor(approval_commit, commit):
+            return candidate
+    return None
+
+
+def approvals_at_head(reviews, head, kind):
+    """Approvals of ``kind`` recorded at exactly ``head``, oldest first."""
+    wanted = _policy_text(head).strip().lower()
+    found = []
+    if not wanted:
+        return found
+    for review in review_chronology(reviews):
+        form, named = review_form(review)
+        if form != kind:
+            continue
+        if _policy_text(review.get("commit_id")).strip().lower() != wanted:
+            continue
+        if not review_names_commit(named, wanted):
+            continue
+        found.append(review)
+    return found
+
+
+def newest_approval_at_head(reviews, head, kind, ancestor=None):
+    """The newest approval of ``kind`` at ``head`` no rejection overrides."""
+    for review in reversed(approvals_at_head(reviews, head, kind)):
+        if governing_rejection(reviews, review, head, ancestor) is None:
+            return review
+    return None
+
+
+def approval_chain(reviews, head, kind, ancestor=None):
+    """Approvals that may decide ``head``, newest first.
+
+    Each entry is ``(review, "exact"|"older")``.  An approval with a governing
+    rejection after it is dropped, so the newest decisive review governs: a
+    re-approval supersedes an earlier rejection, and a rejection supersedes the
+    approval it follows.
+    """
+    wanted = _policy_text(head).strip().lower()
+    chain = []
+    for review in reversed(approvals_at_head(reviews, wanted, kind)):
+        if governing_rejection(reviews, review, wanted, ancestor) is None:
+            chain.append((review, REVIEW_MATCH_EXACT))
+    seen = set()
+    for review in reversed(review_chronology(reviews)):
+        form, named = review_form(review)
+        if form != kind:
+            continue
+        commit = _policy_text(review.get("commit_id")).strip().lower()
+        if not commit or commit == wanted or commit in seen:
+            continue
+        if not review_names_commit(named, commit):
+            continue
+        if governing_rejection(reviews, review, wanted, ancestor) is not None:
+            continue
+        seen.add(commit)
+        chain.append((review, REVIEW_MATCH_CARRIED))
+    return chain
+
+
+def rejection_at_head(reviews, head):
+    """The newest rejection recorded at ``head`` (or naming no commit)."""
+    wanted = _policy_text(head).strip().lower()
+    for review in reversed(review_chronology(reviews)):
+        if not review_is_rejection(review):
+            continue
+        commit = _policy_text(review.get("commit_id")).strip().lower()
+        if not commit or commit == wanted:
+            return review
+    return None
+
+
+def _policy_path_tokens(path):
+    name = _policy_text(path).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+    return [token for token in re.split(r"[^a-z0-9]+", name) if token]
+
+
+def sensitive_paths(files):
+    """The changed paths that make a pull request a gate/lane change."""
+    found = []
+    if not isinstance(files, (list, tuple)):
+        return found
+    for item in files:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        path = item.replace("\\", "/")
+        normal = path.lower()
+        while normal.startswith("./"):
+            normal = normal[2:]
+        normal = normal.lstrip("/")
+        sensitive = normal in SENSITIVE_PATHS
+        if not sensitive:
+            sensitive = any(
+                normal == prefix.rstrip("/") or normal.startswith(prefix)
+                for prefix in SENSITIVE_PREFIXES
+            )
+        if not sensitive:
+            sensitive = bool(SENSITIVE_TOKENS.intersection(_policy_path_tokens(path)))
+        if sensitive and item not in found:
+            found.append(item)
+    return found
+
+
+def check_run_is_success(run):
+    """A check run proves a gate ran only when it completed with SUCCESS."""
+    if not isinstance(run, dict):
+        return False
+    status = _policy_text(run.get("status")).strip().lower()
+    conclusion = _policy_text(run.get("conclusion")).strip().lower()
+    return status in ("", "completed") and conclusion == CHECK_GREEN_CONCLUSION
+
+
+def check_run_is_red(run):
+    if not isinstance(run, dict):
+        return False
+    return _policy_text(run.get("conclusion")).strip().lower() in CHECK_RED_CONCLUSIONS
+
+
+def _carry_git(repo, *args, timeout=60):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=timeout
+    )
+
+
+def _carry_commit(repo, sha):
+    return _carry_git(repo, "cat-file", "-e", "%s^{commit}" % sha).returncode == 0
+
+
+def _carry_ancestor(repo, older, newer):
+    return _carry_git(repo, "merge-base", "--is-ancestor", older, newer).returncode == 0
+
+
+def _carry_merge_base(repo, base, head):
+    proc = _carry_git(repo, "merge-base", base, head)
+    value = proc.stdout.strip()
+    return value if proc.returncode == 0 and value else base
+
+
+def _carry_parents(repo, sha):
+    return _carry_git(repo, "rev-list", "--parents", "-n", "1", sha).stdout.split()[1:]
+
+
+def _carry_subject(repo, sha):
+    return _carry_git(repo, "log", "-1", "--format=%s", sha).stdout.strip()
+
+
+def carry_diff_blobs(repo, older, newer):
+    """``{path: new blob sha or None}`` for one tree-to-tree diff."""
+    proc = _carry_git(repo, "diff", "--raw", "-z", "--no-renames", "--no-abbrev", older, newer)
+    if proc.returncode != 0:
+        raise RuntimeError("git diff failed: " + (proc.stderr or "").strip()[-200:])
+    fields = proc.stdout.split("\0")
+    blobs = {}
+    index = 0
+    while index + 1 < len(fields):
+        header, path = fields[index], fields[index + 1]
+        index += 2
+        if not header.startswith(":"):
+            continue
+        parts = header[1:].split()
+        if len(parts) < 5:
+            continue
+        new_sha = parts[3]
+        blobs[path] = None if set(new_sha) == {"0"} else new_sha
+    return blobs
+
+
+def reviewed_diff_blobs(repo, base, revision):
+    """The pull request's diff at ``revision`` as ``{path: blob sha or None}``."""
+    return carry_diff_blobs(repo, _carry_merge_base(repo, base, revision), revision)
+
+
+def review_carry_forward(repo, review_sha, base, head, timeout=60):
+    """``(ok, reason, detail)``: may a review at ``review_sha`` judge ``head``?
+
+    Accept only when (1) the review commit is an ancestor of the head, (2)
+    every commit in ``review_sha..head`` that is not already on the base is a
+    merge whose non-first parents are on the base, and (3) the pull request's
+    diff against the base is byte-identical at ``head`` and at ``review_sha``.
+    """
+    if not isinstance(review_sha, str) or not _CARRY_HEX.fullmatch(review_sha.strip().lower()):
+        return False, CARRY_NOT_ANCESTOR, "the review names no full commit sha"
+    review_sha = review_sha.strip().lower()
+    try:
+        if not _carry_commit(repo, review_sha):
+            return (
+                False,
+                CARRY_NOT_ANCESTOR,
+                "review commit %s is not in this history" % review_sha[:12],
+            )
+        if review_sha != head and not _carry_ancestor(repo, review_sha, head):
+            return (
+                False,
+                CARRY_NOT_ANCESTOR,
+                "review commit %s is not an ancestor of head %s; the reviewed history was "
+                "rewritten away" % (review_sha[:12], head[:12]),
+            )
+
+        listed = _carry_git(repo, "rev-list", "%s..%s" % (review_sha, head), "--not", base, timeout=timeout)
+        if listed.returncode != 0:
+            raise RuntimeError("git rev-list failed: " + (listed.stderr or "").strip()[-200:])
+        commits = [line for line in listed.stdout.splitlines() if line]
+        for sha in commits:
+            parents = _carry_parents(repo, sha)
+            subject = _carry_subject(repo, sha)
+            if len(parents) < 2:
+                return (
+                    False,
+                    CARRY_AUTHORED_COMMIT,
+                    "commit %s (\"%s\") was authored after the review; only merges of the base "
+                    "may follow a review" % (sha[:12], subject),
+                )
+            for parent in parents[1:]:
+                if not _carry_ancestor(repo, parent, base):
+                    return (
+                        False,
+                        CARRY_UNRELATED_MERGE,
+                        "merge %s (\"%s\") brings in %s, which is not on base %s; only a merge "
+                        "of the base may follow a review"
+                        % (sha[:12], subject, parent[:12], base[:12]),
+                    )
+
+        reviewed = reviewed_diff_blobs(repo, base, review_sha)
+        current = reviewed_diff_blobs(repo, base, head)
+        if reviewed != current:
+            changed = sorted(
+                path for path in set(reviewed) | set(current) if reviewed.get(path) != current.get(path)
+            )
+            detail = ", ".join(changed[:8]) + (" ..." if len(changed) > 8 else "")
+            return (
+                False,
+                CARRY_CONTENT_CHANGED,
+                "the diff against base %s is not byte-identical to the reviewed diff: %s"
+                % (base[:12], detail or "<trees differ>"),
+            )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, CARRY_UNREADABLE, "cannot read the review history: %s" % type(exc).__name__
+    except RuntimeError as exc:
+        return False, CARRY_UNREADABLE, str(exc)
+    return (
+        True,
+        CARRY_OK,
+        "every commit after review %s is a merge of base %s and the diff is byte-identical"
+        % (review_sha[:12], base[:12]),
+    )
+# --- END SHARED GATE POLICY -------------------------------------------------
 
 
 class GateError(RuntimeError):
@@ -336,9 +854,9 @@ def _lease_green_at(repo, sha, token, api_url=DEFAULT_API_URL, http=None):
             continue
         if str(run.get("name") or "") != LEASE_JOB_NAME:
             continue
-        if str(run.get("status") or "") not in ("", "completed"):
-            continue
-        if str(run.get("conclusion") or "") == "success":
+        # Only a completed SUCCESS proves the gate ran: a neutral or skipped
+        # required check is not evidence (shared policy).
+        if check_run_is_success(run):
             return True
     return False
 
@@ -524,41 +1042,86 @@ def _pull_reviews(name, number, token, api_url=DEFAULT_API_URL, http=None):
 
 
 def _is_independent_approval(body, head):
-    """A COMMENTED review in the repository's independent-review convention."""
-    lines = [line.strip() for line in str(body or "").splitlines() if line.strip()]
-    if not lines:
+    """A COMMENTED review in the repository's independent-review convention.
+
+    The line is parsed by the shared policy parser, so this gate and the merge
+    lane accept exactly the same attestations.
+    """
+    kind, named = parse_review_line(body)
+    if kind != REVIEW_APPROVE_INDEPENDENT:
         return False
-    first = lines[0]
-    if not first.upper().startswith("APPROVE"):
-        return False
-    if not APPROVE_REVIEW_RE.search(first):
-        return False
-    named = re.findall(r"\b[0-9a-fA-F]{7,40}\b", first)
-    if named and not any(head.lower().startswith(item.lower()) for item in named):
-        return False
-    return True
+    return review_names_commit(named, head)
 
 
-def independent_review_at_head(reviews, head):
+def independent_review_at_head(reviews, head, repo=None):
     """The review that proves a non-slice pull request was reviewed at ``head``.
 
-    The review's ``commit_id`` must be the exact head: a review at an older
-    head proves nothing about the code being merged.
+    The review's ``commit_id`` must be the exact head and no rejection may have
+    been submitted after it: the newest decisive review governs.  This is the
+    strict form; ``independent_review()`` adds the owner's base-merge
+    carry-forward on top of it and is what a pull-request check uses.
+    """
+    ancestor = (lambda older, newer: _is_ancestor(repo, older, newer)) if repo else None
+    return newest_approval_at_head(reviews, head, REVIEW_APPROVE_INDEPENDENT, ancestor)
+
+
+def _review_commit(review):
+    """The full commit a review records, or ``None`` when it names none."""
+    value = str((review or {}).get("commit_id") or "").strip().lower()
+    return value if HEX_REV.match(value) else None
+
+
+def independent_review(repo, reviews, base, head):
+    """``(review, match, refusal)`` for the non-slice review rule.
+
+    The exact-head approval is preferred.  Otherwise the newest approval at an
+    earlier head is offered to ``review_carry_forward`` and the first that
+    carries wins.  An approval a later rejection overrides is dropped before
+    either test: the newest decisive review governs, so a CHANGES_REQUESTED
+    review (or a COMMENTED review whose first line starts CHANGES REQUESTED)
+    submitted after the approval refuses it.  ``refusal`` describes the newest
+    rejected candidate -- its named reason and detail -- so the failure says
+    why the review did not carry, not merely that it was not at the head.
     """
     wanted = str(head or "").strip().lower()
     if not wanted:
-        return None
-    for review in reviews or []:
-        if not isinstance(review, dict):
-            continue
-        if str(review.get("commit_id") or "").strip().lower() != wanted:
-            continue
-        state = str(review.get("state") or "").strip().upper()
-        if state == "APPROVED":
-            return review
-        if state == "COMMENTED" and _is_independent_approval(review.get("body"), wanted):
-            return review
-    return None
+        return None, None, None
+    ancestor = lambda older, newer: _is_ancestor(repo, older, newer)
+    refusal = None
+    for review, match in approval_chain(reviews, wanted, REVIEW_APPROVE_INDEPENDENT, ancestor):
+        if match == REVIEW_MATCH_EXACT:
+            return review, REVIEW_MATCH_EXACT, None
+        commit = _review_commit(review)
+        ok, reason, detail = review_carry_forward(repo, commit, base, wanted)
+        if ok:
+            return (
+                review,
+                REVIEW_MATCH_CARRIED,
+                {"reason": reason, "detail": detail, "review_sha": commit},
+            )
+        if refusal is None:
+            refusal = {"reason": reason, "detail": detail, "review_sha": commit}
+    if refusal is None:
+        rejection = rejection_at_head(reviews, wanted)
+        if rejection is None:
+            # The approval may have been recorded at an earlier head and
+            # overridden there; the rejection at that commit is still why the
+            # carry fails, so name it instead of saying no review exists.
+            for candidate in reversed(review_chronology(reviews)):
+                if not review_is_approval(candidate, REVIEW_APPROVE_INDEPENDENT):
+                    continue
+                rejection = governing_rejection(reviews, candidate, wanted, ancestor)
+                if rejection is not None:
+                    break
+        if rejection is not None:
+            refusal = {
+                "reason": "review_changes_requested",
+                "detail": "a CHANGES REQUESTED review was submitted after the approval at head "
+                "%s; the newest decisive review governs, so the approval no longer counts"
+                % wanted[:12],
+                "review_sha": str(rejection.get("commit_id") or "")[:12],
+            }
+    return None, None, refusal
 
 
 def check_non_slice(repo, target, environ, quiet=False, http=None, detail=None):
@@ -584,8 +1147,44 @@ def check_non_slice(repo, target, environ, quiet=False, http=None, detail=None):
             reason="non_slice_requires_independent_review",
         )
     reviews = _pull_reviews(name, target.number, token, _api_url(environ), http)
-    review = independent_review_at_head(reviews, head)
+    review, match, carry_info = independent_review(repo, reviews, target.base, head)
     if review is None:
+        if carry_info is not None and carry_info.get("reason") == "review_changes_requested":
+            raise GateError(
+                "PR #%s is not a slice (%s). A non-slice pull request passes only with an "
+                "independent review at its exact head %s. The newest decisive review is a "
+                "rejection, not an approval: [%s] %s. Post a new APPROVE after the rejection "
+                "at %s and re-run."
+                % (
+                    target.number,
+                    why,
+                    head[:12],
+                    "review_changes_requested",
+                    carry_info.get("detail") or "",
+                    head[:12],
+                ),
+                reason="non_slice_requires_independent_review",
+            )
+        if carry_info is not None:
+            raise GateError(
+                "PR #%s is not a slice (%s). A non-slice pull request passes only with an "
+                "independent review at its exact head %s, or with one at an earlier head that "
+                "carries forward. The newest approval (commit %s) does not carry: [%s] %s. "
+                "A review at an earlier head counts only when every commit after it is a merge "
+                "of the base and the pull request's diff against the base is byte-identical to "
+                "the reviewed one. If the change is intentional, post the review at %s and "
+                "re-run."
+                % (
+                    target.number,
+                    why,
+                    head[:12],
+                    str(carry_info.get("review_sha") or "?")[:12],
+                    carry_info.get("reason") or CARRY_UNREADABLE,
+                    carry_info.get("detail") or "",
+                    head[:12],
+                ),
+                reason="non_slice_requires_independent_review",
+            )
         raise GateError(
             "PR #%s is not a slice (%s). A non-slice pull request passes only with an "
             "independent review at its exact head %s: an APPROVED review, or a COMMENTED "
@@ -595,16 +1194,27 @@ def check_non_slice(repo, target, environ, quiet=False, http=None, detail=None):
             reason="non_slice_requires_independent_review",
         )
     if not quiet:
-        print(
-            "lease-tamper: OK: PR #%s is not a slice (%s) and carries an independent "
-            "review (%s) at head %s."
-            % (
-                target.number,
-                why,
-                str(review.get("state") or "COMMENTED").upper(),
-                head[:12],
+        state = str(review.get("state") or "COMMENTED").upper()
+        if match == REVIEW_MATCH_CARRIED:
+            print(
+                "lease-tamper: OK: PR #%s is not a slice (%s) and its independent review "
+                "(%s) at %s carries forward to head %s: [%s] %s"
+                % (
+                    target.number,
+                    why,
+                    state,
+                    str(review.get("commit_id") or "")[:12],
+                    head[:12],
+                    CARRY_OK,
+                    (carry_info or {}).get("detail") or "base-merge-only update, diff byte-identical",
+                )
             )
-        )
+        else:
+            print(
+                "lease-tamper: OK: PR #%s is not a slice (%s) and carries an independent "
+                "review (%s) at head %s." % (target.number, why, state, head[:12])
+            )
+    print("lease-tamper: class=non-slice")
     return 0
 
 
@@ -1284,6 +1894,7 @@ def main(argv=None, environ=None):
             return 1
         if not args.quiet:
             print(render_success(contract, contract_path, boundary, boundary_kind, commits, scope, target.head))
+        print("lease-tamper: class=slice")
         return 0
     except GateError as exc:
         if exc.reason:
