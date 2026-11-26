@@ -4,52 +4,54 @@
 The gate answers one question for a pull request: **after the verify boundary,
 did any commit touch a path the slice does not own, or a frozen test file?**
 
-A slice contract is an ``acdd/1`` contract (``scope.assigned_files``,
-``scope.test_files``, ``scope.prohibited``, ``scope.read_only`` and
-``source_rev``) or a lease record with the same ``scope`` shape plus a
-``source_rev``/``verify_sha``.  The contract path is resolved, in order, from:
+A slice lease is a record with ``scope.assigned_files`` / ``scope.test_files`` /
+``scope.prohibited`` / ``scope.read_only``, a ``source_rev`` and a
+``contract_sha256`` that names an approved frozen contract committed under
+``.rizzstack/contracts/<contract_sha256>.json`` on the **base** branch.  The
+lease itself must be committed to the frozen store ``.rizzstack/leases/*.json``
+on the base branch; there is no other source.  A lease is accepted only when:
 
-1. ``--contract`` (used by tests and local runs);
-2. a pull-request label ``lease-contract:<path>`` (``lease:<path>`` also works);
-3. a pull-request body line ``Lease-Contract: <path>`` (``Contract-Path:`` also
-   works);
-4. the frozen slice store ``.rizzstack/leases/*.json`` on the **base** branch
-   (never the pull-request head), matched to the pull request by the lease's
-   ``pull_request``/``pr``, ``branch`` or ``slice``/``id`` field;
-5. the repository convention ``.rizzstack/lease.json`` (base revision first,
-   then the head revision).
+1. it declares ``review.status`` ``approved`` or ``frozen`` -- a lease without a
+   review block is **not** frozen (the default is fail-closed);
+2. it declares ``contract_sha256``;
+3. ``.rizzstack/contracts/<contract_sha256>.json`` exists at the base tip, its
+   own ``review.status`` is ``approved``/``frozen`` with a non-empty
+   ``review.approved_by``, the file's canonical hash (compact, key-sorted JSON
+   with the ``review`` block removed) equals the hash in its file name and in
+   the lease, and the contract's ``source_rev`` and four scope lists equal the
+   lease's.
 
 **Slice or non-slice.**  A pull request is a *slice* pull request exactly when
-a frozen lease/contract committed on the **base** branch names it -- by number
-(``pull_request``), by branch (``branch``), by slice name (``slice``/``id``
-against the branch's last path segment), or by a coordinator-controlled
-``lease-contract:`` label / ``Lease-Contract:`` body line naming a lease that
-already exists on the base branch.  The shape of the branch name is never a
-classifier, and a lease that exists only on the pull-request branch never
-classifies it: a pull request may not supply the lease it is judged by.
+such a lease on the **base** branch names it -- by number (``pull_request``),
+by branch (``branch``), or by slice name (``slice``/``id`` against the branch's
+last path segment).  Nothing on the pull request itself selects or supplies the
+lease: there is no ``lease-contract:`` label, no ``Lease-Contract:`` body line,
+no ``.rizzstack/lease.json`` on the head, and no lease file from the head.
 
-A slice pull request is judged against that lease.  A **non-slice** pull
-request -- a docs fix, a release chore, a gate change with no slice lease --
-passes only with an independent review recorded at its exact head commit: a
-review whose state is ``APPROVED``, or a ``COMMENTED`` review whose first line
-starts ``APPROVE`` and names an ``independent review``, with ``commit_id``
-equal to the head.  Without one the gate fails closed with the named reason
-``non_slice_requires_independent_review``.
+**Any change to the lease or contract store** (``.rizzstack/leases/**``,
+``.rizzstack/contracts/**`` or ``.rizzstack/lease.json``) in the pull request's
+own commits makes it a **non-slice** pull request: landing a lease or a contract
+always needs an independent review at the head, so a pull request can never
+grant itself a scope.
 
-A ``.rizzstack/lease.json`` file may be a pointer::
+A **non-slice** pull request -- a docs fix, a release chore, a gate change, a
+lease or contract landing -- passes only with an independent review recorded at
+its exact head commit: a review whose state is ``APPROVED``, or a ``COMMENTED``
+review whose first line starts ``APPROVE`` and names an ``independent review``,
+with ``commit_id`` equal to the head.  Without one the gate fails closed with
+the named reason ``non_slice_requires_independent_review``.
 
-    {"contract_path": ".rizzstack/contracts/slice.json", "verify_sha": "<40-hex>"}
-
-or the lease/contract object itself.  The verify boundary is, in order:
-``--verify-sha``, the ``lease-verify:<sha>`` label, a ``Lease-Verify: <sha>``
-body line, the lease file's ``verify_sha``/``verified_sha``/``verification.sha``,
-then the contract's ``source_rev``.
+The verify boundary is, in order: ``--verify-sha`` (a local/test argument, never
+a pull-request input), the base-branch lease's
+``verify_sha``/``verified_sha``/``verification.sha``, then the contract's
+``source_rev``.  Labels and the pull-request body are never read as a boundary.
 
 Every non-merge commit in ``<boundary>..<head>`` that is not reachable from the
 PR base is checked.  Merge commits are not authored changes: a merge whose
 parent is on the base is ignored, and only conflict resolutions that differ
-from both parents are checked.  The contract file itself (and
-``.rizzstack/lease.json``) is metadata and is exempt.
+from both parents are checked.  The lease/contract store and
+``.rizzstack/lease.json`` are metadata, and a commit that changes them makes the
+pull request non-slice before any scope check runs.
 
 Exit status: 0 = clean or no pull request in the event; 1 = tamper, an invalid
 lease, an unresolvable contract, or a merge_group whose pull-request context
@@ -90,6 +92,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
 import os
 import posixpath
@@ -102,20 +105,16 @@ import urllib.request
 
 LEASE_FILE = ".rizzstack/lease.json"
 LEASES_DIR = ".rizzstack/leases"
+CONTRACTS_DIR = ".rizzstack/contracts"
 GATE_SCRIPT = ".github/scripts/lease_tamper.py"
 PR_NAME_KEYS = ("pull_request", "pull_requests", "pr", "prs")
 BRANCH_NAME_KEYS = ("branch", "branches")
 SLICE_NAME_KEYS = ("slice", "slice_name", "id")
 APPROVE_REVIEW_RE = re.compile(r"(?i)\bindependent\s+review\b")
-LABEL_CONTRACT_PREFIXES = ("lease-contract:", "lease:")
-LABEL_VERIFY_PREFIX = "lease-verify:"
-BODY_CONTRACT = re.compile(
-    r"(?im)^[ \t]*(?:<!--[ \t]*)?(?:lease-contract|contract-path)[ \t]*:[ \t]*`?([^`\s]+)`?"
-)
-BODY_VERIFY = re.compile(
-    r"(?im)^[ \t]*(?:<!--[ \t]*)?(?:lease-verify|verify-sha)[ \t]*:[ \t]*`?([0-9a-fA-F]{40,64})`?"
-)
 HEX_REV = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+GLOB_CHARS = ("*", "?", "[")
+FROZEN_STATUSES = ("approved", "frozen")
 # refs/heads/gh-readonly-queue/<base>/pr-<number>-<sha>
 QUEUE_REF = re.compile(r"/pr-(\d+)-([0-9a-fA-F]{7,64})")
 HTTP_TIMEOUT_SECONDS = 20
@@ -562,54 +561,46 @@ def independent_review_at_head(reviews, head):
     return None
 
 
-def check_non_slice(repo, target, environ, quiet=False, http=None):
+def check_non_slice(repo, target, environ, quiet=False, http=None, detail=None):
     """A pull request no frozen base lease names passes only on review at head."""
     head = target.head
+    why = detail or "no frozen lease on base %s names it" % target.base[:12]
     if target.number is None:
         raise GateError(
-            "no frozen lease on base %s names this pull request (head %s), so it is not a "
-            "slice and needs an independent review at its head; a local run without "
-            "--pull-request cannot prove that review. Pass --pull-request <N> with "
-            "GITHUB_REPOSITORY and GITHUB_TOKEN." % (target.base[:12], head[:12]),
+            "this pull request is not a slice (%s; head %s) and needs an independent "
+            "review at its head; a local run without --pull-request cannot prove that "
+            "review. Pass --pull-request <N> with GITHUB_REPOSITORY and GITHUB_TOKEN."
+            % (why, head[:12]),
             reason="non_slice_requires_independent_review",
         )
     name = (environ.get("GITHUB_REPOSITORY") or "").strip()
     token = (environ.get("GITHUB_TOKEN") or environ.get("GH_TOKEN") or "").strip()
     if not name or not token:
         raise GateError(
-            "PR #%s is not a slice: no frozen lease on base %s names it (by pull_request, "
-            "branch or slice). A non-slice pull request passes only with an independent "
-            "review at head %s, and GITHUB_REPOSITORY/GITHUB_TOKEN are required to read the "
-            "reviews; failing closed without them."
-            % (target.number, target.base[:12], head[:12]),
+            "PR #%s is not a slice (%s). A non-slice pull request passes only with an "
+            "independent review at head %s, and GITHUB_REPOSITORY/GITHUB_TOKEN are "
+            "required to read the reviews; failing closed without them."
+            % (target.number, why, head[:12]),
             reason="non_slice_requires_independent_review",
         )
     reviews = _pull_reviews(name, target.number, token, _api_url(environ), http)
     review = independent_review_at_head(reviews, head)
     if review is None:
         raise GateError(
-            "PR #%s is not a slice: no frozen lease on base %s names it (no pull_request, "
-            "branch or slice match in %s/*.json, and no coordinator lease-contract pointer). "
-            "A non-slice pull request passes only with an independent review at its exact "
-            "head %s: an APPROVED review, or a COMMENTED review whose first line starts "
-            "'APPROVE' and names an independent review, with commit_id equal to the head. "
-            "None found. Post the review at %s (or land a frozen lease on base that names "
-            "the PR) and re-run." % (
-                target.number,
-                target.base[:12],
-                LEASES_DIR,
-                head[:12],
-                head[:12],
-            ),
+            "PR #%s is not a slice (%s). A non-slice pull request passes only with an "
+            "independent review at its exact head %s: an APPROVED review, or a COMMENTED "
+            "review whose first line starts 'APPROVE' and names an independent review, "
+            "with commit_id equal to the head. None found. Post the review at %s and "
+            "re-run." % (target.number, why, head[:12], head[:12]),
             reason="non_slice_requires_independent_review",
         )
     if not quiet:
         print(
-            "lease-tamper: OK: PR #%s is not a slice (no frozen lease on base %s names it) "
-            "and carries an independent review (%s) at head %s."
+            "lease-tamper: OK: PR #%s is not a slice (%s) and carries an independent "
+            "review (%s) at head %s."
             % (
                 target.number,
-                target.base[:12],
+                why,
                 str(review.get("state") or "COMMENTED").upper(),
                 head[:12],
             )
@@ -659,36 +650,114 @@ def _valid_lease_path(path):
     return normal != "." and normal != ".." and not normal.startswith("../")
 
 
-def _contract_path(target, explicit):
-    if explicit:
-        return _normalise(explicit), "--contract"
-
-    for label in target.labels:
-        lowered = label.lower()
-        for prefix in LABEL_CONTRACT_PREFIXES:
-            if lowered.startswith(prefix) and len(label.strip()) > len(prefix):
-                return _normalise(label.strip()[len(prefix):]), "label %r" % label
-
-    match = BODY_CONTRACT.search(target.body)
-    if match:
-        return _normalise(match.group(1)), "PR body"
-
-    return None, None
+def _has_glob(path):
+    """True when a path is a wildcard pattern rather than one concrete file."""
+    return any(char in str(path) for char in GLOB_CHARS)
 
 
-def _verify_sha(explicit, target, lease_doc, contract):
+def _contract_sha256(document):
+    """The bundlebees contract identity: canonical JSON without ``review``.
+
+    Compact, key-sorted, ASCII JSON of the contract body with the ``review``
+    block removed -- byte-identical to ``bundlebees_plugin.contract`` so a hash
+    computed by the plugin, by a lease author or by this gate is the same value.
+    """
+    body = {key: value for key, value in document.items() if key != "review"}
+    text = json.dumps(body, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _scope_lists(document):
+    scope = document.get("scope") if isinstance(document.get("scope"), dict) else {}
+    out = {}
+    for key in ("assigned_files", "test_files", "prohibited", "read_only"):
+        value = scope.get(key)
+        if value is None:
+            out[key] = []
+        elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+            out[key] = sorted(_normalise(item) for item in value)
+        else:
+            out[key] = None
+    return out
+
+
+def approved_contract(repo, revision, lease_doc):
+    """The approved frozen contract a lease is derived from, or a hard failure.
+
+    A lease is only usable when it names an approved contract that is already
+    committed on the base branch: the contract's own canonical hash must equal
+    the ``contract_sha256`` in both the lease and the file name, its review must
+    be approved/frozen with an approver, and its ``source_rev`` and four scope
+    lists must equal the lease's.  That makes a widened or self-issued lease
+    unusable: the hash pins the exact approved text, and the field comparison
+    refuses any drift from it.
+    """
+    sha = str((lease_doc or {}).get("contract_sha256") or "").strip().lower()
+    if not SHA256_RE.match(sha):
+        raise GateError(
+            "lease %r does not declare a 64-hex contract_sha256; a lease is only usable "
+            "when it names an approved frozen contract."
+            % (lease_doc.get("id") if isinstance(lease_doc, dict) else "<no id>"),
+            reason="lease_contract_missing",
+        )
+    path = "%s/%s.json" % (CONTRACTS_DIR, sha)
+    document = _read_contract_object(repo, revision, path)
+    if document is None:
+        raise GateError(
+            "lease declares contract_sha256 %s but %s does not exist on base %s; only a "
+            "contract already committed to the base branch is approved. Land the contract "
+            "on base in a reviewed non-slice pull request first."
+            % (sha, path, revision[:12]),
+            reason="lease_contract_not_approved",
+        )
+    if not isinstance(document, dict):
+        raise GateError("contract %r is not a JSON object" % path, reason="lease_contract_not_approved")
+    review = document.get("review") if isinstance(document.get("review"), dict) else {}
+    status = str(review.get("status") or "").strip().lower()
+    approver = str(review.get("approved_by") or "").strip()
+    if status not in FROZEN_STATUSES or not approver:
+        raise GateError(
+            "contract %r is not an approved frozen contract (review.status=%r, "
+            "review.approved_by=%r); a lease may only name an approved frozen contract."
+            % (path, status or "<absent>", approver or "<absent>"),
+            reason="lease_contract_not_approved",
+        )
+    computed = _contract_sha256(document)
+    if computed != sha:
+        raise GateError(
+            "contract %r hashes to %s, not to the name/lease hash %s; the approved text "
+            "changed after it was frozen." % (path, computed, sha),
+            reason="lease_contract_hash_mismatch",
+        )
+    if str(document.get("source_rev") or "").strip().lower() != str(
+        lease_doc.get("source_rev") or ""
+    ).strip().lower():
+        raise GateError(
+            "lease source_rev %r does not match contract %r source_rev %r."
+            % (lease_doc.get("source_rev"), path, document.get("source_rev")),
+            reason="lease_contract_mismatch",
+        )
+    lease_scope, contract_scope = _scope_lists(lease_doc), _scope_lists(document)
+    for key in ("assigned_files", "test_files", "prohibited", "read_only"):
+        if lease_scope[key] != contract_scope[key]:
+            raise GateError(
+                "lease scope.%s differs from the approved contract %r; a lease may not "
+                "widen or narrow the contract it names (lease=%r contract=%r)."
+                % (key, path, lease_scope[key], contract_scope[key]),
+                reason="lease_contract_mismatch",
+            )
+    return document, path
+
+
+def _verify_sha(explicit, lease_doc, contract):
+    """The verify boundary: a local flag, then the base lease, then ``source_rev``.
+
+    Labels and the pull-request body are deliberately unreadable here: a pull
+    request that could set its own boundary (for example ``Lease-Verify: <head>``)
+    would move it to the head and have zero commits checked.
+    """
     if explicit:
         return explicit.strip().lower(), "verify sha"
-
-    for label in target.labels:
-        if label.lower().startswith(LABEL_VERIFY_PREFIX):
-            value = label.strip()[len(LABEL_VERIFY_PREFIX):].strip().lower()
-            if value:
-                return value, "verify sha"
-
-    match = BODY_VERIFY.search(target.body)
-    if match:
-        return match.group(1).lower(), "verify sha"
 
     if isinstance(lease_doc, dict):
         for key in ("verify_sha", "verified_sha"):
@@ -779,13 +848,18 @@ def _names_target(doc, target):
 
 
 def _is_frozen(doc):
-    """A base-store lease is frozen unless it declares a non-approved review."""
+    """A base-store lease is frozen only when it says so, with an approver.
+
+    Fail-closed by design: a missing or non-committal ``review`` block does not
+    make a lease frozen, so a lease cannot become usable by omitting the field.
+    """
     review = doc.get("review") if isinstance(doc, dict) else None
-    if isinstance(review, dict):
-        status = str(review.get("status") or "").strip().lower()
-        if status:
-            return status in ("approved", "frozen")
-    return True
+    if not isinstance(review, dict):
+        return False
+    status = str(review.get("status") or "").strip().lower()
+    if status not in FROZEN_STATUSES:
+        return False
+    return bool(str(review.get("approved_by") or "").strip())
 
 
 def _store_lease_paths(repo, revision):
@@ -820,131 +894,70 @@ def _named_lease_at(repo, target):
     return None, None
 
 
-def _gate_on_base(repo, target):
-    """True when the base branch already carries this gate (no bootstrap)."""
-    return _file_at(repo, target.base, GATE_SCRIPT) is not None
+def metadata_changes(repo, target):
+    """Store paths the pull request's own commits change.
 
-
-def _branch_only_lease(repo, target):
-    """A store lease that names the target but exists only on the head."""
-    for path in _store_lease_paths(repo, target.head):
-        if _file_at(repo, target.base, path) is not None:
-            continue
-        doc = _lease_json_at(repo, target.head, path)
-        if isinstance(doc, dict) and _names_target(doc, target):
-            return path
-    return None
+    ``.rizzstack/leases/**``, ``.rizzstack/contracts/**`` and
+    ``.rizzstack/lease.json`` are the gate's input.  A pull request that writes
+    them is landing gate metadata, never a slice: it must pass the
+    independent-review rule at its head, so a pull request can never grant
+    itself a lease or an approved contract.  Only non-merge commits are scanned,
+    so merging the base into a slice does not make the slice a metadata change.
+    """
+    found = []
+    proc = _run(repo, "rev-list", "--no-merges", target.head, "--not", target.base, check=False)
+    if proc.returncode != 0:
+        raise GateError("cannot list the pull request's own commits")
+    for sha in proc.stdout.split():
+        for path in _commit_paths(repo, sha):
+            normal = _normalise(path)
+            if (
+                normal == LEASE_FILE
+                or normal.startswith(LEASES_DIR + "/")
+                or normal.startswith(CONTRACTS_DIR + "/")
+            ) and normal not in found:
+                found.append(normal)
+    return found
 
 
 def resolve_contract(repo, target, explicit_path=None):
     """Return (contract, contract_path, lease_doc, source_revision).
 
-    ``source_revision`` is the revision the contract document was read from
-    (head or base), so later checks know whether it is branch-controlled.
-
-    Raises ``NoSliceLease`` when nothing on the base branch names the pull
-    request: that is a non-slice pull request, and the caller applies the
-    independent-review rule instead of a lease.
+    The contract is the approved frozen contract named by a base-branch lease's
+    ``contract_sha256``; nothing is read from the pull request's head.  Raises
+    ``NoSliceLease`` when no frozen base lease names the pull request: that is a
+    non-slice pull request, and the caller applies the independent-review rule.
     """
-    path, origin = _contract_path(target, explicit_path)
-    lease_doc = None
-    contract_revision = target.head
-    named = None
-
-    if not path:
-        named_path, named_doc = _named_lease_at(repo, target)
-        if named_doc is not None:
-            path = named_path
-            origin = "%s at base (frozen slice lease)" % named_path
-            named = (named_doc, target.base)
-        else:
-            branch_lease = _branch_only_lease(repo, target)
-            if branch_lease:
-                raise GateError(
-                    "the lease %r names this pull request only on head %s, not on base %s. "
-                    "A pull request may not supply the lease it is judged by; land the lease "
-                    "on the base branch first."
-                    % (branch_lease, target.head[:12], target.base[:12]),
-                    reason="lease_not_on_base",
-                )
-
-    if named is not None:
-        lease_doc, contract_revision = named
-    elif path:
-        # The lease is read from the base branch, never from the pull request:
-        # a branch that adds or edits its own lease cannot be judged by it.  The
-        # single exception is a repository whose base does not carry this gate
-        # yet (the pull request that introduces it).
-        revisions = (target.base, target.head) if not _gate_on_base(repo, target) else (target.base,)
-        for revision in revisions:
-            doc = _read_contract_object(repo, revision, path)
-            if doc is not None:
-                lease_doc = doc
-                contract_revision = revision
-                break
-        else:
-            branch_copy = _file_at(repo, target.head, path) is not None
-            if branch_copy and not _gate_on_base(repo, target):
-                branch_copy = False
-            if branch_copy:
-                raise GateError(
-                    "contract %r (from %s) exists only on PR head %s, not on base %s. A pull "
-                    "request may not supply or edit the lease it is judged by; land the lease "
-                    "on the base branch first."
-                    % (path, origin, target.head[:12], target.base[:12]),
-                    reason="lease_not_on_base",
-                )
+    if explicit_path:
+        path = _normalise(explicit_path)
+        lease_doc = _read_contract_object(repo, target.base, path)
+        if lease_doc is None:
             raise GateError(
-                "contract %r (from %s) does not exist at base %s; only a lease already "
-                "committed to the base branch is accepted."
-                % (path, origin, target.base[:12])
+                "--contract %r does not exist at base %s; only a lease committed to the "
+                "base branch is accepted." % (path, target.base[:12]),
+                reason="lease_not_on_base",
             )
     else:
-        path = LEASE_FILE
-        # The convention file may live on the base branch (a coordinator-owned
-        # lease) or be introduced by the slice itself (a first-slice lease).
-        for revision in (target.base, target.head):
-            doc = _read_contract_object(repo, revision, path)
-            if doc is not None:
-                lease_doc = doc
-                contract_revision = revision
-                origin = "%s at %s" % (LEASE_FILE, "base" if revision == target.base else "head")
-                break
+        path, lease_doc = _named_lease_at(repo, target)
         if lease_doc is None:
             raise NoSliceLease(
                 "no frozen lease on base %s names %s (head %s, branch %s): no "
-                "'pull_request'/'branch'/'slice' match in %s/*.json, no lease-contract "
-                "label or body line, and no %s at head or base."
+                "'pull_request'/'branch'/'slice' match in %s/*.json. A label, a body "
+                "line and a head-branch lease are never read as one."
                 % (
                     target.base[:12],
                     ("PR #%s" % target.number) if target.number else "this pull request",
                     target.head[:12],
                     target.branch or "<unknown>",
                     LEASES_DIR,
-                    LEASE_FILE,
                 )
             )
 
     if not isinstance(lease_doc, dict):
         raise GateError("contract %r is not a JSON object" % path)
 
-    pointer = lease_doc.get("contract_path") or lease_doc.get("contract")
-    if isinstance(pointer, str) and pointer.strip():
-        contract_path = _normalise(pointer)
-        contract = _read_contract_object(repo, contract_revision, contract_path)
-        if contract is None:
-            raise GateError(
-                "contract %r points at %r, which does not exist at %s"
-                % (path, contract_path, contract_revision[:12])
-            )
-        if not isinstance(contract, dict):
-            raise GateError("contract %r is not a JSON object" % contract_path)
-        return contract, contract_path, lease_doc, contract_revision
-
-    if isinstance(pointer, dict):
-        return pointer, path, lease_doc, contract_revision
-
-    return lease_doc, path, lease_doc, contract_revision
+    contract, contract_path = approved_contract(repo, target.base, lease_doc)
+    return contract, contract_path, lease_doc, target.base
 
 
 def _scope(contract):
@@ -957,6 +970,17 @@ def _scope(contract):
     if not all(isinstance(item, str) and _valid_lease_path(item) for item in assigned):
         raise GateError(
             "contract scope.assigned_files contains an invalid repository-relative path"
+        )
+    globbed = sorted(item for item in assigned if _has_glob(item))
+    if globbed:
+        # assigned_files is an ALLOW-list: a wildcard there grants an unbounded
+        # scope ("*" or "**" reaches every file).  Deny patterns in
+        # test_files/prohibited/read_only are still matched with fnmatch.
+        raise GateError(
+            "contract scope.assigned_files must enumerate concrete files; wildcard "
+            "entries are rejected (%s). Lease the exact paths instead."
+            % ", ".join(repr(item) for item in globbed),
+            reason="lease_glob_scope",
         )
     out = {"assigned_files": [_normalise(item) for item in assigned]}
     for key in ("test_files", "prohibited", "read_only"):
@@ -1009,7 +1033,7 @@ def check(repo, target, contract, contract_path, lease_doc, verify_sha):
     """Return (findings, boundary, boundary_kind, commits_checked, scope)."""
     scope = _scope(contract)
 
-    boundary, boundary_kind = _verify_sha(verify_sha, target, lease_doc, contract)
+    boundary, boundary_kind = _verify_sha(verify_sha, lease_doc, contract)
     if not boundary or not HEX_REV.match(boundary):
         raise GateError(
             "contract %r has no usable verify_sha/source_rev (40 or 64 lowercase hex)" % contract_path
@@ -1034,10 +1058,16 @@ def check(repo, target, contract, contract_path, lease_doc, verify_sha):
     contract_file = _normalise(contract_path)
 
     def exempt(path):
-        # The lease store is the gate's input, and the gate reads it from the
-        # base branch: a branch that edits a lease there does not change this
-        # verdict.  Both the contract file and the store are metadata, not code.
-        return path in (contract_file, LEASE_FILE) or path.startswith(LEASES_DIR + "/")
+        # The lease/contract store is the gate's input, and the gate reads it
+        # from the base branch.  A pull request that changes it never reaches
+        # this function (metadata changes are classified non-slice first); the
+        # exemption keeps base-merge history from raising a false violation.
+        return (
+            path == contract_file
+            or path == LEASE_FILE
+            or path.startswith(LEASES_DIR + "/")
+            or path.startswith(CONTRACTS_DIR + "/")
+        )
     if target.base == target.head:
         return [], boundary, boundary_kind, 0, scope
 
@@ -1184,8 +1214,8 @@ def main(argv=None, environ=None):
     parser.add_argument("--verify-sha", default=None)
     parser.add_argument("--base", default=None)
     parser.add_argument("--head", default=None)
-    parser.add_argument("--labels", default=None, help="comma-separated label names (local runs)")
-    parser.add_argument("--body", default=None, help="pull-request body text (local runs)")
+    parser.add_argument("--labels", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--body", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--pull-request", default=None, type=int, help="pull-request number")
     parser.add_argument("--branch", default=None, help="pull-request head branch (local runs)")
     parser.add_argument("--quiet", action="store_true")
@@ -1228,6 +1258,14 @@ def main(argv=None, environ=None):
 
         target.base = _resolve_rev(args.repo, target.base)
         target.head = _resolve_rev(args.repo, target.head)
+
+        changes = metadata_changes(args.repo, target)
+        if changes and not args.contract:
+            detail = "it changes gate metadata (%s), which is landed only through a " \
+                     "reviewed non-slice pull request" % ", ".join(changes)
+            if not args.quiet:
+                print("lease-tamper: NOT A SLICE: %s." % detail)
+            return check_non_slice(args.repo, target, environ, quiet=args.quiet, detail=detail)
 
         try:
             contract, contract_path, lease_doc, _revision = resolve_contract(

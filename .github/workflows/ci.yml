@@ -317,6 +317,12 @@ jobs:
           python-version: "3.12"
       - name: Lease/tamper gate unit tests
         run: python3 -m unittest tests.test_lease_tamper -v
+      - name: Lease/tamper bypass regression (all five cases must fail closed)
+        run: python3 .github/scripts/lease_tamper_poc.py --expect fail-closed
+      - name: Lease/tamper adversarial reproduction v2 (13 cases must fail closed)
+        run: |
+          bash .github/scripts/lease_tamper_poc_v2.sh .github/scripts/lease_tamper.py | tee "$RUNNER_TEMP/lease_tamper_poc_v2.txt"
+          grep -q '^13 cases, 0 unexpected$' "$RUNNER_TEMP/lease_tamper_poc_v2.txt"
       - name: Enforce the slice lease and frozen tests
         env:
           GITHUB_TOKEN: ${{ github.token }}
