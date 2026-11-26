@@ -72,14 +72,19 @@ class VersionEndpoint(unittest.TestCase):
             body = {}
         return r.status, body
 
-    def test_version_returns_package_and_contract_versions(self):
+    def test_version_returns_build_and_contract_versions(self):
         st, b = self._req()
         self.assertEqual(st, 200)
         self.assertEqual(_schema_errors(b), [])
         self.assertEqual(b["api_version"], "v1")
-        self.assertEqual(b["version"], L.VERSION)
+        # `version` is the build actually running (git describe based); `release` is the tag base.
+        self.assertEqual(b["version"], L.build_version())
+        self.assertEqual(b["release"], L.VERSION)
+        self.assertEqual(b["build"], L.build_identity(cfg=self.la.cfg))
         from hyvv import __version__
-        self.assertEqual(b["version"], __version__)
+        self.assertEqual(b["release"], __version__)
+        if b["build"]["commits_past_tag"] or b["build"]["dirty"]:
+            self.assertNotEqual(b["version"], b["release"], "a build off the tag claimed the tag")
         # Honest advertisement: only capabilities the launcher actually has.
         caps = set(b["capabilities"])
         self.assertTrue({"priority_routing", "go_fallback"} <= caps)
