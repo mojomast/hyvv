@@ -5,6 +5,11 @@ on:
     # `labeled`/`unlabeled` re-evaluate the owner-held hold: adding the label
     # fails the required ci-gate check, removing it lets the pull request pass.
     types: [opened, synchronize, reopened, labeled, unlabeled]
+  # A submitted review can flip the gate's answer (an approval or a rejection is
+  # judged at the head), so the same required checks re-run on it. The gate reads
+  # the head from pull_request.head.sha, never from the review commit_id.
+  pull_request_review:
+    types: [submitted]
   # Main keeps its push run. Feature branches are covered by their PR, so a
   # feature-branch push must not start a second identical matrix.
   push:
@@ -79,7 +84,12 @@ jobs:
           # PyYAML is a CI-only lift: the OpenAPI parse test uses the ambient
           # loader when present, and this uv overlay is its fallback, so the
           # repo keeps no runtime or dev dependency on it.
-          uv run --with pyyaml==6.0.2 python -m unittest discover -s tests -v
+          # cryptography is the optional `tickets` extra's dependency and the
+          # ticket verifier imports it lazily (the product must load without it),
+          # so a --no-dev sync never provides it. This overlay is how the suite
+          # gets it; it is pinned like the pyyaml overlay so resolution stays
+          # deterministic on every matrix platform.
+          uv run --with pyyaml==6.0.2 --with cryptography==44.0.0 python -m unittest discover -s tests -v
 
       - name: Contract tests (/v1, in-process hyvv)
         # Same command a reviewer runs locally. Point it at a live host with

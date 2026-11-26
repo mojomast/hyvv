@@ -76,6 +76,26 @@ class ReceiptReader(_ReceiptCase):
         self.write({**GOOD, "version": "0.1.16"})
         self.assertEqual(L.deployment_receipt(self.cfg)["version"], "0.1.16")
 
+    def test_a_describe_derived_build_identity_is_published(self):
+        describe = f"v{L.VERSION}-25-g7f73b7c"
+        self.write({"deployed_at": GOOD["deployed_at"], "version": f"{L.VERSION}+25.g7f73b7c",
+                    "sha": REV, "describe": describe})
+        self.assertEqual(L.deployment_receipt(self.cfg),
+                         {"deployed_at": GOOD["deployed_at"], "version": f"{L.VERSION}+25.g7f73b7c",
+                          "rev": REV, "describe": describe})
+
+    def test_describe_alone_is_a_complete_identity(self):
+        describe = f"v{L.VERSION}-25-g7f73b7c"
+        self.write({"deployed_at": GOOD["deployed_at"], "describe": describe})
+        self.assertEqual(L.deployment_receipt(self.cfg),
+                         {"deployed_at": GOOD["deployed_at"], "describe": describe})
+
+    def test_a_bad_describe_is_malformed(self):
+        for bad in ("not a build", f"v{L.VERSION}-25", "0.1.19-25-gzzzzzzz"):
+            self.write({"deployed_at": GOOD["deployed_at"], "describe": bad})
+            self.assertEqual(L.deployment_receipt(self.cfg),
+                             {"status": "invalid", "reason": "receipt_malformed"}, bad)
+
     def test_receipt_file_is_bounded(self):
         self.write({**GOOD, "pad": "x" * 70_000})
         self.assertEqual(L.deployment_receipt(self.cfg), {"status": "invalid", "reason": "receipt_unreadable"})
@@ -151,7 +171,11 @@ class HealthReceipt(unittest.TestCase):
             st, body = get(srv, "/v1/health")
             self.assertEqual(st, 200)
             self.assertEqual(body["deployment_receipt"], GOOD)
-            self.assertEqual(body["version"], body["deployment_receipt"]["version"])
+            # The receipt records the release; `version` is the build running. With no git metadata
+            # and no baked describe, the fallback names the receipt's SHA and never the bare tag.
+            self.assertEqual(body["release"], body["deployment_receipt"]["version"])
+            self.assertEqual(body["build"]["source"], "receipt")
+            self.assertTrue(body["version"].startswith(L.VERSION + "+g"), body["version"])
             self.assertNotIn(self.tmp, json.dumps(body["deployment_receipt"]))
         finally:
             srv.shutdown(); la.loop.call_soon_threadsafe(la.loop.stop)
