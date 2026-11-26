@@ -84,7 +84,12 @@ jobs:
           # PyYAML is a CI-only lift: the OpenAPI parse test uses the ambient
           # loader when present, and this uv overlay is its fallback, so the
           # repo keeps no runtime or dev dependency on it.
-          uv run --with pyyaml==6.0.2 python -m unittest discover -s tests -v
+          # cryptography is the optional `tickets` extra's dependency and the
+          # ticket verifier imports it lazily (the product must load without it),
+          # so a --no-dev sync never provides it. This overlay is how the suite
+          # gets it; it is pinned like the pyyaml overlay so resolution stays
+          # deterministic on every matrix platform.
+          uv run --with pyyaml==6.0.2 --with cryptography==44.0.0 python -m unittest discover -s tests -v
 
       - name: Contract tests (/v1, in-process hyvv)
         # Same command a reviewer runs locally. Point it at a live host with

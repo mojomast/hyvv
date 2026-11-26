@@ -1,0 +1,13 @@
+{
+  "id": "hyvv-ci-cryptography-overlay",
+  "lease_version": "rizzstack.lease/1",
+  "source_rev": "1bd13fb9e8293bb3670d18aa1a2d44b6cea15fbc",
+  "scope": {
+    "assigned_files": [
+      ".github/workflows/ci.yml",
+      ".rizzstack/leases/hyvv-ci-cryptography-overlay.json"
+    ],
+    "test_files": [],
+    "prohibited": []
+  }
+}
