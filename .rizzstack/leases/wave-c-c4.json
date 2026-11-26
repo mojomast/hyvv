@@ -33,5 +33,11 @@
     "contract": "rizzstack-t1634/contracts/wave-bc/C4.contract.json",
     "approved_by": "owner answers 2026-11-25: approve WAVE-C C4 v2 88b56bea; condition - launcher.py hunk must be exactly the one cfg.setdefault(ticket_mode, off) line",
     "approved_at": "2026-11-25T20:59:30Z"
+  },
+  "review": {
+    "status": "frozen",
+    "approved_by": "owner answers 2026-11-25: approve WAVE-C C4 v2 88b56bea; condition - launcher.py hunk must be exactly the one cfg.setdefault(ticket_mode, off) line",
+    "approved_at": "2026-11-25T20:59:30Z",
+    "note": "verbatim derivation of the contract named by contract_sha256; the contract hash is the approval record"
   }
 }

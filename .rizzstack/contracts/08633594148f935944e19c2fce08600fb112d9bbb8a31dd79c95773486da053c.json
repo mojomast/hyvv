@@ -1,0 +1,140 @@
+{
+ "contract_version": "acdd/1",
+ "id": "wave-b-b1",
+ "title": "Repair the /v1 OpenAPI document's unparsable scalar and gate it with a CI parse check",
+ "outcome": {
+  "summary": "contract/v1/openapi.yaml currently cannot be loaded by any YAML parser: the 200-response description at line 347 is an unquoted plain scalar that begins with a backtick, so yaml.safe_load stops with ScannerError \"found character '`' that cannot start any token\" at line 347, column 24. This slice quotes that one scalar and leaves every other byte of the document alone. It also adds one CI job, contract-yaml, that obtains PyYAML only for its own steps (uv run --with pyyaml==6.0.2), parses the document and fails on any parse error, and compares the parsed API surface with the pre-fix surface recorded in contract/v1/STATUS.json and the pre-fix external $ref set. No runtime dependency is added: pyproject.toml keeps dependencies = [], uv.lock is untouched, no shipped module imports yaml, and no other job installs it. The new job is listed in ci-gate.needs so .github/scripts/check_ci_gate.py keeps the required ci-gate check covering every job.",
+  "observable_behavior": [
+   "the parse command exits 1 at origin/main with ScannerError at line 347, column 24, and exits 0 on the branch file",
+   "the parsed document yields exactly the 20 (METHOD, path) pairs in contract/v1/STATUS.json endpoints",
+   "the parsed document yields the same eight external schemas/*.json $ref targets as origin/main",
+   "the only parsed difference is that the GET /v1/attempts/{attempt_id}/artifact 200 description is now a string with unchanged text",
+   ".github/workflows/ci.yml has one contract-yaml job that obtains pyyaml==6.0.2 only for its own steps and fails on any parse error",
+   "python3 .github/scripts/check_ci_gate.py .github/workflows/ci.yml exits 0 with contract-yaml in ci-gate.needs",
+   "git grep -nE \"import yaml|from yaml import\" matches only .github/workflows/ci.yml; pyproject.toml and uv.lock are unchanged"
+  ]
+ },
+ "interfaces": [
+  {
+   "name": "contract/v1/openapi.yaml",
+   "kind": "file",
+   "change": "modify",
+   "notes": "line 347 description: `hyvv.worker-artifact/1` becomes a quoted scalar; the description text, and every path, method, status label, parameter, response and $ref, is unchanged"
+  },
+  {
+   "name": ".github/workflows/ci.yml",
+   "kind": "other",
+   "change": "modify",
+   "notes": "add one contract-yaml job (ubuntu-latest, permissions contents: read) that reuses the existing pinned checkout and setup-uv actions, runs uv run --with pyyaml==6.0.2 for its parse and surface checks, and is added to ci-gate.needs; no other job changes"
+  }
+ ],
+ "acceptance_criteria": [
+  {
+   "id": "AC-001",
+   "statement": "contract/v1/openapi.yaml loads with yaml.safe_load; the contract-yaml job runs the same parse and fails on any parse error (at origin/main the command exits 1 with ScannerError at line 347, column 24)",
+   "verification": "test",
+   "tests": [
+    "tests/test_openapi_document.py::OpenApiDocumentParses::test_the_document_parses_with_a_yaml_loader"
+   ]
+  },
+  {
+   "id": "AC-002",
+   "statement": "the parsed document yields exactly the 20 (METHOD, path) pairs in contract/v1/STATUS.json endpoints and the same eight external schemas/*.json $ref targets as origin/main; no operation is added, removed, renamed or re-scoped",
+   "verification": "review"
+  },
+  {
+   "id": "AC-003",
+   "statement": "ci.yml contains exactly one contract-yaml job; it obtains pyyaml==6.0.2 only inside its own steps via uv run --with, runs the parse and surface checks, and appears in ci-gate.needs; no other job installs pyyaml and uv.lock/pyproject.toml are unchanged",
+   "verification": "review"
+  },
+  {
+   "id": "AC-004",
+   "statement": "no shipped or runtime module imports yaml: pyproject.toml dependencies stays [], uv.lock is unchanged, and the only yaml import in the tree is inside the contract-yaml steps in .github/workflows/ci.yml",
+   "verification": "review"
+  }
+ ],
+ "assumptions": [
+  "hyvv has no runtime-dependency policy document: pyproject.toml declares dependencies = [] and dev = [], and docs/CI.md covers CI/CD triggers, permissions and supply-chain practice only. The owner approved PyYAML for the CI job only, recorded in the PR, so this slice changes neither pyproject.toml nor uv.lock.",
+  "docs/STACK-PINS.md records only the cua==0.5.0 optional pin and the workflow action SHAs; a job-local uv run --with pyyaml==6.0.2 is not a project pin and does not belong there.",
+  "the pre-fix API surface is contract/v1/STATUS.json endpoints, which contract/v1/tests/test_status_labels.py already asserts against a line-oriented scan of openapi.yaml; the parsed document must yield exactly that set.",
+  "no repo test module can carry AC-001/AC-002 without either adding PyYAML to the default matrix or skipping where it matters, so the contract-yaml job is the test. tdd.applicable is false with that reason, and tests is empty by design.",
+  ".github/scripts/check_ci_gate.py fails closed when any job is missing from ci-gate.needs, so the new job must be listed there or the required check fails.",
+  "the repaired construct is a description only; it is not a path, method, schema or status label, so the parsed API surface is expected to be byte-identical in meaning."
+ ],
+ "scope": {
+  "assigned_files": [
+   "contract/v1/openapi.yaml",
+   ".github/workflows/ci.yml"
+  ],
+  "test_files": [
+   "tests/test_openapi_document.py"
+  ],
+  "read_only": [
+   "docs/CI.md",
+   "docs/STACK-PINS.md"
+  ],
+  "prohibited": [
+   "tests/test_openapi_document.py",
+   "pyproject.toml",
+   "uv.lock",
+   "contract/v1/STATUS.json",
+   "contract/v1/tests/**",
+   ".github/scripts/check_ci_gate.py",
+   "CHANGELOG.md"
+  ]
+ },
+ "source_rev": "0914d329496d25ea74c0515d6a29878948e12877",
+ "tdd": {
+  "applicable": true,
+  "test_first": true
+ },
+ "verification": {
+  "independent": true,
+  "commands": [
+   "uv run --with pyyaml==6.0.2 python -c \"import pathlib, yaml; yaml.safe_load(pathlib.Path('contract/v1/openapi.yaml').read_text(encoding='utf-8'))\"",
+   "python3 .github/scripts/check_ci_gate.py .github/workflows/ci.yml",
+   "git grep -nE \"import yaml|from yaml import\"",
+   "git diff --stat"
+  ],
+  "integration": false
+ },
+ "evidence_required": [
+  "red",
+  "green",
+  "review"
+ ],
+ "authorization": {
+  "human_gates": [
+   "merge",
+   "tag",
+   "release",
+   "deploy",
+   "publish"
+  ],
+  "not_authorized": [
+   "merge",
+   "tag",
+   "release",
+   "deploy",
+   "publish",
+   "restart",
+   "force-push",
+   "branch deletion"
+  ]
+ },
+ "risk": {
+  "tier": "high",
+  "reasons": [
+   ".github/workflows/ci.yml is a high-tier path and its ci-gate job must keep needing every job in the file",
+   "contract/v1/openapi.yaml is the published /v1 surface that bundlebees and Orbit read",
+   "the slice introduces a third-party parser (PyYAML) that must stay CI-only and never become a runtime dependency"
+  ],
+  "blast_radius": "hyvv's /v1 consumers that read contract/v1/openapi.yaml, and the required ci-gate check"
+ },
+ "review": {
+  "status": "approved",
+  "approved_by": "Kyle (owner) clarify round 6: CI-only pyyaml; test made ambient-loader first after sandbox uv fetch failure, 2026-11-25",
+  "approved_at": "2026-11-25T17:30:00Z",
+  "contract_sha256": "08633594148f935944e19c2fce08600fb112d9bbb8a31dd79c95773486da053c"
+ }
+}

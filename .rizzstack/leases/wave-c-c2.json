@@ -27,5 +27,11 @@
     "contract": "rizzstack-t1634/contracts/wave-bc/C2.contract.json",
     "approved_by": "owner standing approval for waves B/C and Part 2 (2026-11-25)",
     "approved_at": "2026-11-25T17:12:00Z"
+  },
+  "review": {
+    "status": "frozen",
+    "approved_by": "owner standing approval for waves B/C and Part 2 (2026-11-25)",
+    "approved_at": "2026-11-25T17:12:00Z",
+    "note": "verbatim derivation of the contract named by contract_sha256; the contract hash is the approval record"
   }
 }
