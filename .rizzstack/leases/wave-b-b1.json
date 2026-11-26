@@ -1,0 +1,37 @@
+{
+  "id": "wave-b-b1",
+  "lease_version": "rizzstack.lease/1",
+  "slice": "wave-b-b1",
+  "pull_request": 64,
+  "branch": "feat/wave-b-b1",
+  "contract_id": "wave-b-b1",
+  "contract_sha256": "08633594148f935944e19c2fce08600fb112d9bbb8a31dd79c95773486da053c",
+  "source_rev": "0914d329496d25ea74c0515d6a29878948e12877",
+  "scope": {
+    "assigned_files": [
+      "contract/v1/openapi.yaml",
+      ".github/workflows/ci.yml"
+    ],
+    "test_files": [
+      "tests/test_openapi_document.py"
+    ],
+    "prohibited": [
+      "tests/test_openapi_document.py",
+      "pyproject.toml",
+      "uv.lock",
+      "contract/v1/STATUS.json",
+      "contract/v1/tests/**",
+      ".github/scripts/check_ci_gate.py",
+      "CHANGELOG.md"
+    ],
+    "read_only": [
+      "docs/CI.md",
+      "docs/STACK-PINS.md"
+    ]
+  },
+  "derived_from": {
+    "contract": "rizzstack-t1634/contracts/wave-bc/B1.contract.json",
+    "approved_by": "Kyle (owner) clarify round 6: CI-only pyyaml; test made ambient-loader first after sandbox uv fetch failure, 2026-11-25",
+    "approved_at": "2026-11-25T17:30:00Z"
+  }
+}
