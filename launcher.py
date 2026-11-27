@@ -35,6 +35,18 @@ if _landing_export is None:  # pragma: no cover - loaded from a sibling copy
     except Exception:
         _landing_export = None
 
+try:  # the vendored standard-library brief/attempt validator (B3)
+    from hyvv import rizzstack_validators as _rizzstack_validators
+except ImportError:  # pragma: no cover - loaded from the sibling hyvv/ package
+    try:
+        import importlib.util as _validators_util
+        _validators_spec = _validators_util.spec_from_file_location(
+            "rizzstack_validators", Path(__file__).with_name("hyvv") / "rizzstack_validators.py")
+        _rizzstack_validators = _validators_util.module_from_spec(_validators_spec)
+        _validators_spec.loader.exec_module(_rizzstack_validators)
+    except Exception:
+        _rizzstack_validators = None
+
 # The release base this source tree sits on (pyproject.toml is the single source). What a running
 # launcher reports is build_version(): `git describe` adds the commits past the tag, so a build off
 # a tag can never answer the bare release (see the build identity section below).
@@ -2223,6 +2235,53 @@ def validate_brief(b, cfg=None):
         if k in b and not (isinstance(b[k], list) and all(isinstance(x, str) for x in b[k])): return f"brief.{k} must be a list of strings"
     return _budget_requirement_error(cfg, b)
 
+_BRIEF_SCHEMA_DIR = Path(__file__).resolve().parent / "schemas"
+#: Brief keys the launcher's pre-v1 path reads; an unversioned brief reports the ones it carries.
+_LEGACY_BRIEF_FIELDS = frozenset({
+    "objective", "project", "branch", "source_rev", "assigned_files", "read_only",
+    "acceptance", "tests", "commands", "deliverables", "deps", "findings", "budget",
+    "risk", "contract", "wave", "kind", "mode", "model", "tier", "priority", "label",
+    "title", "security_profile", "workdir", "verify_of", "reset_time", "coordinator",
+    "coordinator_id", "coordinator_session", "session", "session_id", "lease", "task_id",
+    "attempt_id", "transition", "transition_id", "terminal_transition_id", "fake",
+    "bbs_test_token", "input_manifest_sha256", "ticket", "run_id", "retry_of",
+})
+
+def _brief_schema_properties():
+    try:
+        with (_BRIEF_SCHEMA_DIR / "rizzstack-brief.schema.json").open(encoding="utf-8") as handle:
+            properties = json.load(handle).get("properties")
+    except (OSError, ValueError, TypeError):
+        return {}
+    return properties if isinstance(properties, dict) else {}
+
+def brief_validation(brief):
+    """Report what the vendored rizzstack.brief/1 validator saw; never refuses a brief.
+
+    A brief without a ``schema`` key is unversioned: it keeps the launcher's pre-v1 path and
+    records the legacy fields it consumes. A versioned brief is validated against the frozen
+    schema in ``schemas/``; unknown top-level keys are reported alongside the validator problems.
+    """
+    report = {"status": "unversioned", "problems": [], "unknown_fields": [], "legacy_fields": []}
+    if not isinstance(brief, dict):
+        return report
+    if "schema" not in brief:
+        report["legacy_fields"] = sorted(key for key in brief if key in _LEGACY_BRIEF_FIELDS)
+        return report
+    properties = _brief_schema_properties()
+    report["unknown_fields"] = sorted(key for key in brief if key not in properties)
+    if _rizzstack_validators is None:  # pragma: no cover - the vendored module ships in-repo
+        report["status"] = "invalid"
+        report["problems"] = ["$: vendored rizzstack validator is unavailable"]
+        return report
+    try:
+        problems = list(_rizzstack_validators.validate_brief(brief, schema_dir=_BRIEF_SCHEMA_DIR))
+    except Exception as ex:  # report-only: a validator failure must not refuse the attempt
+        problems = [f"$: validator error: {ex}"]
+    report["problems"] = problems
+    report["status"] = "valid" if not problems else "invalid"
+    return report
+
 # Same text rule as contract/v1/project_state.py SAFE_PATH: relative, no empty,
 # "." or ".." segment, no backslash, no trailing slash after normalize, <= 244.
 _SCOPE_PATH = re.compile(r"^(?!/)(?!.*(?:^|/)[.]{1,2}(?:/|$))(?!.*//)(?!.*/$)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
@@ -2608,6 +2667,8 @@ class Launcher:
         d = {k: a.get(k) for k in keys}
         if "ticket_report" in a:
             d["ticket_report"] = a["ticket_report"]
+        if "brief_validation" in a:
+            d["brief_validation"] = a["brief_validation"]
         if a.get("workspace_error"):
             d["workspace_error"] = a["workspace_error"]
         if d["state"] == "queued": q = self._queue(); d["queue_position"] = q.index(a["attempt_id"]) + 1 if a["attempt_id"] in q else None  # one snapshot: a second _queue() call could race the .index()
@@ -2645,7 +2706,7 @@ class Launcher:
             raise ValueError("verify_of attempt has a different project or source_rev")
         if not (self.dir / "attempts" / f"{vid}.result.json").exists(): raise ValueError("verify_of attempt has no result")
 
-    def submit(self, aid, brief, model=None, kind=None, mode=None):
+    def submit(self, aid, brief, model=None, kind=None, mode=None, validation=None):
         with self.lock:
             if aid in self.attempts: return self.attempts[aid], False  # idempotent: never a second controller
             report = ticket_report(self.cfg, brief) if self.cfg.get("ticket_mode", "off") == "report" else None
@@ -2661,6 +2722,7 @@ class Launcher:
                 if report is not None: a["ticket_report"] = report
                 self.attempts[aid] = a; self._save(a)
                 self.kick(); return a, True
+            if validation is None: validation = brief_validation(brief)
             if kind == "agy-cua":
                 sel = model or brief.get("tier") or brief.get("model") or AGY_DEFAULT_TIER
                 m = AGY_TIERS.get(sel, sel)
@@ -2671,7 +2733,8 @@ class Launcher:
             if brief.get("verify_of") is not None: self._check_verify_of(brief, kind)
             now = time.time()
             a = {"attempt_id": aid, "kind": kind, "brief": brief, "state": "queued", "detail": "waiting for a worker slot", "created_at": now,
-                 "updated_at": now, "lseq": 0, "cursor": 0, "rate_limited": 0, "model": None if spec.get("pool") else spec["name"]}
+                 "updated_at": now, "lseq": 0, "cursor": 0, "rate_limited": 0, "model": None if spec.get("pool") else spec["name"],
+                 "brief_validation": validation}
             if report is not None: a["ticket_report"] = report
             if spec.get("pool"): a.update(pool=spec["pool"], tried=[], model_history=[])
             if kind == "agy-cua":
@@ -3812,11 +3875,12 @@ def make_handler(L, token):
                     aid = "att_" + uuid.uuid4().hex[:16]  # 0.1.13: mint when omitted (bundlebees client does not send one)
                 elif not re.fullmatch(r"[A-Za-z0-9_\-]{8,64}", aid):
                     return self._send(400, {"error": "attempt_id required"})
+                validation = brief_validation(b.get("brief")) if isinstance(b.get("brief"), dict) else None
                 if isinstance(b.get("brief"), dict): b["brief"] = normalize_brief(b["brief"])
                 err = validate_brief(b.get("brief"), L.cfg)
                 if err: return self._send(400, {"error": err})
                 if b["brief"].get("project") and b["brief"]["project"] not in L.cfg["projects"]: return self._send(403, {"error": "project not authorized on this PC"})
-                try: a, created = L.submit(aid, b["brief"], b.get("model") or b.get("tier"), b.get("kind"), b.get("mode"))
+                try: a, created = L.submit(aid, b["brief"], b.get("model") or b.get("tier"), b.get("kind"), b.get("mode"), validation)
                 except ValueError as ex: return self._send(400, {"error": str(ex)})
                 return self._send(201 if created else 200, L.public(a))
             if p == ["v1", "route"]:  # preview: what this request would resolve to; no run is started
