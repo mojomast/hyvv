@@ -2492,10 +2492,8 @@ class Launcher:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(json.dumps(a, indent=1))
-            try:
+            if os.name != "nt":
                 os.chmod(tmp, 0o644)  # mkstemp is 0600; readers saw 0644 before
-            except OSError:
-                pass
             last = None
             delays = _save_replace_delays()
             for i in range(SAVE_REPLACE_TRIES):
