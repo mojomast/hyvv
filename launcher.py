@@ -2269,18 +2269,32 @@ def brief_validation(brief):
         report["legacy_fields"] = sorted(key for key in brief if key in _LEGACY_BRIEF_FIELDS)
         return report
     properties = _brief_schema_properties()
-    report["unknown_fields"] = sorted(key for key in brief if key not in properties)
-    if _rizzstack_validators is None:  # pragma: no cover - the vendored module ships in-repo
-        report["status"] = "invalid"
+    if _rizzstack_validators is None or not properties:  # pragma: no cover - ships in-repo; a broken deploy is the real case
+        report["status"] = "unavailable"
         report["problems"] = ["$: vendored rizzstack validator is unavailable"]
         return report
+    report["unknown_fields"] = sorted(key for key in brief if key not in properties)
     try:
         problems = list(_rizzstack_validators.validate_brief(brief, schema_dir=_BRIEF_SCHEMA_DIR))
-    except Exception as ex:  # report-only: a validator failure must not refuse the attempt
-        problems = [f"$: validator error: {ex}"]
-    report["problems"] = problems
+    except Exception:  # report-only: a validator failure must not refuse the attempt
+        report["status"] = "unavailable"
+        report["problems"] = ["$: vendored rizzstack validator is unavailable"]
+        return report
+    report["problems"] = [_problem_without_values(problem) for problem in problems]
     report["status"] = "valid" if not problems else "invalid"
     return report
+
+_ENUM_VALUE_ECHO = re.compile(r"^([^:]+): value .* is not in the allowed enum$")
+
+def _problem_without_values(problem):
+    """Validator problems are served on /v1/attempts: name the path, never echo the value.
+
+    The vendored validator's enum branch interpolates the offending value; strip it here so
+    the recorded problem names only the field. The vendored file stays byte-identical to the
+    frozen workflow original (its sha256 is pinned by the approved test).
+    """
+    match = _ENUM_VALUE_ECHO.match(str(problem))
+    return f"{match.group(1)}: value is not in the allowed enum" if match else problem
 
 # Same text rule as contract/v1/project_state.py SAFE_PATH: relative, no empty,
 # "." or ".." segment, no backslash, no trailing slash after normalize, <= 244.
