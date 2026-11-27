@@ -113,6 +113,13 @@
         "null"
       ]
     },
+    "brief_validation": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Report-only result of the vendored rizzstack.brief/1 validator: status, problems, unknown_fields and legacy_fields. Never a refusal."
+    },
     "project": {
       "type": [
         "string",
