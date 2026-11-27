@@ -2515,7 +2515,12 @@ class Launcher:
             self._append_events(a, [event])
         except OSError as exc:
             self.last_journal_error = str(exc)
-        self.attempts[aid] = current
+        live = self.attempts.get(aid)
+        if live is None:
+            self.attempts[aid] = dict(current)
+        else:
+            live.clear()
+            live.update(current)
 
     def _write_journal(self, p, a):
         fd, tmp_name = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=p.parent)

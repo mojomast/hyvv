@@ -55,6 +55,21 @@ class SaveOrdering(unittest.TestCase):
             self.assertEqual(refused[0]["state"], "cancel_requested")
             self.assertEqual(refused[0]["attempted_lseq"], 1)
 
+    def test_stale_reload_updates_the_same_object(self):
+        with tempfile.TemporaryDirectory() as d:
+            la, _ = _launcher(d)
+            aid = "att_dd00000004"
+            running = _attempt(aid=aid, state="running", lseq=1)
+            la.attempts[aid] = running
+            la._save(running)
+            la._save(dict(running, state="cancel_requested", lseq=2))
+
+            la._save(running)
+
+            self.assertIs(la.attempts[aid], running)
+            self.assertEqual(running["state"], "cancel_requested")
+            self.assertEqual(running["lseq"], 2)
+
     @unittest.skipIf(os.name == "nt", "POSIX mode bits")
     def test_saved_journal_keeps_the_previous_mode(self):
         with tempfile.TemporaryDirectory() as d:
