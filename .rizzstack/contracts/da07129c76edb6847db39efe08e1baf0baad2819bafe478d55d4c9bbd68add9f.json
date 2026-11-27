@@ -1,0 +1,184 @@
+{
+  "contract_version": "acdd/1",
+  "id": "wave-b-b6-enforce",
+  "title": "Enforce rizzstack.brief/1 in hyvv when brief_mode is enforce (separate from ticket_mode; owner-dated)",
+  "outcome": {
+    "summary": "The enforcement half of wave B on the hyvv side, shipped dark behind its own switch. A new `brief_mode` setting (off|report|enforce) governs rizzstack.brief/1 at POST /v1/attempts and defaults to `report`, which is B4's behaviour: validate, record brief_validation, always accept. `off` records no brief validation. `enforce` refuses a brief whose v1 validation fails or that carries an undeclared field, with 400 invalid_brief and the validator's problems in the error body, before any attempt row or sandbox is created. `ticket_mode` is NOT touched: it keeps its C2/C4 contract (default off, accepts off|report, refuses enforce at load). Switching brief_mode to enforce is a separate owner act, taken no earlier than 48 hours after B4, B5a and B5b are all on main with zero false positives in the report-only telemetry.",
+    "observable_behavior": [
+      "With brief_mode off or report, an invalid v1 brief is accepted exactly as B4 shipped the report path (no refusal, and off records no brief_validation).",
+      "With brief_mode enforce, an invalid v1 brief is refused with 400 invalid_brief, carries the validator problems, and creates no attempt row.",
+      "With brief_mode enforce, a valid v1 brief is accepted and records brief_validation.status valid.",
+      "With brief_mode enforce, an unversioned brief is accepted and recorded unversioned (B4's legacy path is not retroactively broken).",
+      "load_config defaults brief_mode to report, accepts off|report|enforce, and refuses any other value with ValueError.",
+      "ticket_mode is unchanged from C2/C4: it still defaults to off, accepts off|report, and refuses enforce at load_config."
+    ]
+  },
+  "interfaces": [
+    {
+      "name": "launcher.load_config brief_mode",
+      "kind": "function",
+      "change": "modify",
+      "notes": "New setting: accepts off|report|enforce; default report; any other value raises ValueError. ticket_mode is not modified."
+    },
+    {
+      "name": "POST /v1/attempts",
+      "kind": "http",
+      "change": "modify",
+      "notes": "New refusal 400 invalid_brief only when brief_mode is enforce; body carries problems from the vendored validator; no attempt row on refusal. report keeps B4's accept-and-record behaviour; off records no brief_validation."
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC-001",
+      "statement": "brief_mode off and report still accept an invalid v1 brief, unchanged from B4 (no refusal path)",
+      "verification": "test",
+      "tests": [
+        "tests/test_brief_enforce.py::EnforceMode::test_off_and_report_still_accept"
+      ],
+      "regression": true
+    },
+    {
+      "id": "AC-002",
+      "statement": "brief_mode enforce refuses an invalid v1 brief with 400 invalid_brief, the validator problems and no attempt row",
+      "verification": "test",
+      "tests": [
+        "tests/test_brief_enforce.py::EnforceMode::test_enforce_refuses_an_invalid_brief_without_creating_an_attempt"
+      ]
+    },
+    {
+      "id": "AC-003",
+      "statement": "brief_mode enforce accepts a valid v1 brief and records it valid",
+      "verification": "test",
+      "tests": [
+        "tests/test_brief_enforce.py::EnforceMode::test_enforce_accepts_a_valid_brief"
+      ],
+      "regression": true
+    },
+    {
+      "id": "AC-004",
+      "statement": "brief_mode enforce still accepts an unversioned brief and records it unversioned",
+      "verification": "test",
+      "tests": [
+        "tests/test_brief_enforce.py::EnforceMode::test_enforce_does_not_break_the_unversioned_path"
+      ],
+      "regression": true
+    },
+    {
+      "id": "AC-005",
+      "statement": "brief_mode defaults to report, accepts off|report|enforce, and refuses an unknown value at load_config",
+      "verification": "test",
+      "tests": [
+        "tests/test_brief_enforce.py::BriefModeConfig::test_brief_mode_defaults_report_and_refuses_unknown_values"
+      ]
+    },
+    {
+      "id": "AC-006",
+      "statement": "ticket_mode is untouched: it still defaults to off and still refuses enforce at load_config",
+      "verification": "test",
+      "tests": [
+        "tests/test_brief_enforce.py::TicketModeUntouched::test_ticket_mode_still_defaults_off_and_refuses_enforce"
+      ],
+      "regression": true
+    },
+    {
+      "id": "AC-007",
+      "statement": "with brief_mode=enforce, a brief whose brief_validation.status is unavailable is refused (fail closed) with 503 brief_validation_unavailable and no attempt row; report and off never refuse on unavailability",
+      "verification": "test",
+      "tests": [
+        "tests/test_brief_enforce.py::UnavailableEnforce::test_enforce_refuses_when_validation_is_unavailable_and_report_modes_do_not"
+      ]
+    }
+  ],
+  "dependencies": [
+    "B4 (wave-b-b4) landed as ff523658c7028e09eaef429fee820a140a392140 (attempt att_61a7101a71dc4094, contract 0f8e6f5c): the vendored validator, the schemas, the public attempt-schema declaration and brief_validation on the attempt record",
+    "hyvv#103 landed as 4af770af2ad563933bb8850c3d54fdb2da5d9ebc: brief_validation.status is 'unavailable' (not 'invalid') when the vendored validator or brief schema cannot load, and problem messages never echo field values",
+    "B6 RED 20e85a4773870c93639f51385d9b37200be970e4 is cut from current hyvv main 4af770af (B4 and #103 merged; C4 ticket_mode default/off-enforce refusal) so AC-006 pins the shipped ticket surface; the implementation starts from this RED and needs no further main merge",
+    "B8 (bundlebees #314, merged a9828b75) has stopped emitting brief-schema drift",
+    "owner decision: the brief_mode=enforce switch is taken no earlier than 48h after B4, B5a and B5b are all on main and the report-only telemetry shows zero false positives; this slice merges dark (default report) and the switch is configuration, not a code change",
+    "RED commit 20e85a4773870c93639f51385d9b37200be970e4 adds only tests/test_brief_enforce.py over main 4af770af; the B6 delta is test-only"
+  ],
+  "assumptions": [
+    "brief_mode is per-host configuration (config.json), not an environment variable",
+    "the refusal happens before attempt insertion so a refused submit has no journal row",
+    "signature verification stays out of scope (C4/C5): this slice enforces the schema only",
+    "off records no brief_validation; report is the default so B4's behaviour is unchanged without configuration",
+    "ticket_mode is owned by C2/C4 and is neither widened nor read by this slice"
+  ],
+  "scope": {
+    "assigned_files": [
+      "launcher.py"
+    ],
+    "test_files": [
+      "tests/test_brief_enforce.py"
+    ],
+    "read_only": [
+      "hyvv/rizzstack_validators.py",
+      "schemas/rizzstack-brief.schema.json"
+    ],
+    "prohibited": [
+      "tests/test_brief_enforce.py",
+      "CHANGELOG.md",
+      ".github/workflows/**",
+      "pyproject.toml",
+      "uv.lock",
+      "schemas/**",
+      "hyvv/rizzstack_validators.py"
+    ]
+  },
+  "source_rev": "20e85a4773870c93639f51385d9b37200be970e4",
+  "tdd": {
+    "applicable": true,
+    "test_first": true
+  },
+  "verification": {
+    "independent": true,
+    "commands": [
+      "env -u PYTHONPATH python3 -m unittest -v tests.test_brief_enforce"
+    ],
+    "integration": false
+  },
+  "evidence_required": [
+    "red",
+    "green",
+    "review"
+  ],
+  "authorization": {
+    "human_gates": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish"
+    ],
+    "not_authorized": [
+      "merge",
+      "deploy",
+      "restart",
+      "tag",
+      "release",
+      "publish",
+      "force-push",
+      "branch deletion",
+      "switch a host to enforce"
+    ]
+  },
+  "risk": {
+    "tier": "high",
+    "reasons": [
+      "turns a report into a refusal on the admission path every bee crosses",
+      "a mis-scoped enforce breaks every dispatch on the host that enables it"
+    ],
+    "blast_radius": "every bundled dispatch on any host configured with brief_mode=enforce"
+  },
+  "review": {
+    "status": "approved",
+    "approved_by": "Kyle (owner), typed approval in chat, 2026-11-27: approved: da07129c (B6-r3; 503 brief_validation_unavailable kept)",
+    "approved_at": "2026-11-27T18:51:33Z",
+    "contract_sha256": "da07129c76edb6847db39efe08e1baf0baad2819bafe478d55d4c9bbd68add9f",
+    "test_collection": {
+      "manifest_sha256": "97e45abb1fec9d97b99871366d0649c4f1f33e900fc95af56ff50a2f92e7f340",
+      "source_rev": "20e85a4773870c93639f51385d9b37200be970e4",
+      "collected": 7
+    }
+  }
+}

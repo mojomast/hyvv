@@ -17,10 +17,16 @@ START = (ROOT / "scripts" / "start.ps1").read_text()
 
 class StartPs1HealthWait(unittest.TestCase):
     def test_default_health_wait_is_at_least_180_and_configurable(self):
-        self.assertRegex(START, r"\$HealthWaitSeconds\s*=\s*180\b")
+        # Startup measured ~414 s at ~1300 journalled attempts (Nov 27 2026): the default
+        # must leave a wide margin above that, so it is now at least 1200 s.
+        m = re.search(r"\$HealthWaitSeconds\s*=\s*(\d+)\b", START)
+        self.assertIsNotNone(m)
+        self.assertGreaterEqual(int(m.group(1)), 1200)
         self.assertIn("HYVV_START_HEALTH_WAIT_S", START)
-        # The wait loop uses the configurable value, not a hardcoded 45.
-        self.assertRegex(START, r"for\s+\(\s*\$i\s*=\s*0;\s*\$i\s+-lt\s+\$HealthWaitSeconds")
+        # The wait is a wall-clock deadline built from the configurable value (an iteration
+        # count also spent the process query and probe time on every pass).
+        self.assertRegex(START, r"\(Get-Date\)\.AddSeconds\(\$HealthWaitSeconds\)")
+        self.assertRegex(START, r"while\s*\(.*\(Get-Date\)\s+-lt\s+\$healthDeadline")
         self.assertNotRegex(START, r"for\s+\(\s*\$i\s*=\s*0;\s*\$i\s+-lt\s+45\b")
 
     def test_loopback_401_or_200_is_healthy_without_a_token(self):
