@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mojomast/workflow/schemas/rizzstack-attempt.schema.json",
+  "title": "rizzstack.attempt/1",
+  "description": "One attempt record and one state enum for hyvv, bundlebees, Orbit and the control plane. Not referenced by any code yet.",
+  "type": "object",
+  "required": ["schema", "attempt_id", "state", "project", "created_at", "updated_at"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "rizzstack.attempt/1"},
+    "attempt_id": {"type": "string", "minLength": 1},
+    "run_id": {"type": "string"},
+    "retry_of": {"type": "string"},
+    "project": {"type": "string", "minLength": 1},
+    "branch": {"type": "string"},
+    "model": {"type": "string"},
+    "state": {"enum": ["queued", "provisioning", "running", "backoff", "succeeded", "failed", "cancelled"]},
+    "reason": {"type": "string", "description": "Why the attempt is in backoff (rate_limited, transient) or failed."},
+    "created_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"},
+    "budget_s": {"type": "integer", "minimum": 1},
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "output_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "cost_usd": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
+    "result_ref": {"type": "string", "description": "Git ref of the attempt's branch (the return artifact)."}
+  }
+}

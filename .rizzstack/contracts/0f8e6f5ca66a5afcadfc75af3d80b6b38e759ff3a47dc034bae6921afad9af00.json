@@ -1,0 +1,213 @@
+{
+  "contract_version": "acdd/1",
+  "id": "wave-b-b4",
+  "title": "hyvv accepts rizzstack.brief/1, maps unversioned briefs, and records validation on the attempt",
+  "outcome": {
+    "summary": "hyvv vendors the standard-library rizzstack.brief/1 validator that B3 lands (validators/python/rizzstack_validators.py) together with the frozen schemas/rizzstack-brief.schema.json and schemas/rizzstack-attempt.schema.json, and uses them at POST /v1/attempts. A brief that names schema rizzstack.brief/1 is validated and the attempt record gains brief_validation {status, problems, unknown_fields}. A brief without a schema key keeps working exactly as before: it is recorded as unversioned with the field names the launcher consumed. Report-only: no refusal path is added in this slice.",
+    "observable_behavior": [
+      "A brief with schema rizzstack.brief/1 carrying all seven required fields is accepted and the attempt record carries brief_validation.status == valid with empty problems and unknown_fields.",
+      "A v1 brief missing `risk` is still accepted (report-only) and records brief_validation.status == invalid with a problem whose path names risk.",
+      "A v1 brief carrying a key the frozen schema does not declare is accepted and lists that key in brief_validation.unknown_fields.",
+      "An unversioned brief (no schema key) is accepted exactly as before and records brief_validation.status == unversioned with legacy_fields listing the keys the launcher consumed.",
+      "The vendored validator runs under `python3 -I -S` with no installed jsonschema, and the vendored schema files are byte-identical to the frozen workflow originals (sha256 pinned in the approved test).",
+      "The launcher's existing refusal set is unchanged: a missing objective or a bad assigned_files list behaves as it does today.",
+      "The closed public attempt schema (contract/v1/schemas/attempt.json) declares brief_validation as object|null, so the required /v1 conformance suite accepts the additive field; the slice adds this declaration and nothing else to the public contract."
+    ]
+  },
+  "interfaces": [
+    {
+      "name": "POST /v1/attempts",
+      "kind": "http",
+      "change": "modify",
+      "notes": "Additive: the 200/201 body's attempt record gains brief_validation. No new refusal."
+    },
+    {
+      "name": "launcher.brief_validation",
+      "kind": "function",
+      "change": "add",
+      "notes": "Pure: (brief) -> {status, problems, unknown_fields, legacy_fields}; calls the vendored validator with the vendored schema_dir. No network, no crypto."
+    },
+    {
+      "name": "hyvv/rizzstack_validators.py",
+      "kind": "module",
+      "change": "add",
+      "notes": "Verbatim copy of workflow mojomast/workflow#177 head 3117d9c0ecb734652629d3a4b8f30a481d4144dd validators/python/rizzstack_validators.py (validate_brief/validate_attempt, stdlib only). Read-only given in the RED commit; the bee does not edit it."
+    },
+    {
+      "name": "schemas/rizzstack-brief.schema.json",
+      "kind": "schema",
+      "change": "add",
+      "notes": "Verbatim frozen B2 schema from workflow main, sha256 pinned by the approved test."
+    },
+    {
+      "name": "schemas/rizzstack-attempt.schema.json",
+      "kind": "schema",
+      "change": "add",
+      "notes": "Verbatim frozen B2 schema from workflow main, sha256 pinned by the approved test."
+    },
+    {
+      "name": "contract/v1/schemas/attempt.json",
+      "kind": "schema",
+      "change": "modify",
+      "notes": "Add a brief_validation property (object|null) to the closed public attempt schema, so the additive field the attempt record now carries satisfies the required /v1 conformance suite (test_attempt_listing_matches_schema and the create/list cases). No required key and no other property changes."
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC-001",
+      "statement": "a rizzstack.brief/1 brief with the seven required fields is accepted and recorded as valid with no problems and no unknown fields",
+      "verification": "test",
+      "tests": [
+        "tests/test_brief_contract_v1.py::BriefV1Report::test_a_complete_v1_brief_is_valid"
+      ]
+    },
+    {
+      "id": "AC-002",
+      "statement": "a v1 brief missing risk is still accepted and records invalid with a problem naming risk (report-only: no refusal path)",
+      "verification": "test",
+      "tests": [
+        "tests/test_brief_contract_v1.py::BriefV1Report::test_a_v1_brief_missing_risk_is_recorded_invalid_and_accepted"
+      ]
+    },
+    {
+      "id": "AC-003",
+      "statement": "a v1 brief carrying an undeclared key is accepted and lists that key in unknown_fields",
+      "verification": "test",
+      "tests": [
+        "tests/test_brief_contract_v1.py::BriefV1Report::test_an_undeclared_key_is_reported_as_unknown"
+      ]
+    },
+    {
+      "id": "AC-004",
+      "statement": "an unversioned brief is accepted exactly as before and records unversioned plus the field names the launcher consumed",
+      "verification": "test",
+      "tests": [
+        "tests/test_brief_contract_v1.py::BriefV1Report::test_an_unversioned_brief_is_recorded_as_unversioned"
+      ]
+    },
+    {
+      "id": "AC-005",
+      "statement": "the vendored validator imports under python3 -I -S and the vendored schema files hash identically to the frozen workflow originals",
+      "verification": "test",
+      "tests": [
+        "tests/test_brief_contract_v1.py::VendoredCopy::test_the_vendored_validator_and_schemas_are_the_frozen_originals"
+      ],
+      "regression": true
+    },
+    {
+      "id": "AC-006",
+      "statement": "the launcher's existing refusal set is unchanged: a brief without objective is still refused with 400",
+      "verification": "test",
+      "tests": [
+        "tests/test_brief_contract_v1.py::ExistingRefusals::test_a_brief_without_objective_is_still_refused"
+      ],
+      "regression": true
+    },
+    {
+      "id": "AC-007",
+      "statement": "the public attempt schema declares brief_validation as object|null and stays a closed object",
+      "verification": "test",
+      "tests": [
+        "tests/test_brief_contract_v1.py::PublicAttemptSchema::test_the_public_attempt_schema_declares_brief_validation"
+      ]
+    }
+  ],
+  "dependencies": [
+    "B3 (mojomast/workflow#177, merged 4d22c070 as 1ea44bea) supplies the vendored validator and the two frozen schemas; this RED is cut from hyvv main 91793509 and adds only the approved test plus those verbatim upstream files",
+    "B6 (wave-b-b6-enforce) owns enforcement; this slice never refuses a brief",
+    "RED commit 1a88d4a64266930c8480946ad58d265aeb357530 on red/wave-b-b4-r2 is test-and-givens only: the approved tests (including the public-schema case) plus the verbatim B3 validator and two frozen schemas; hyvv/rizzstack_validators.py and schemas/* are byte-identical to workflow 1ea44bea and are read-only for the bee",
+    "re-cut 2026-11-27 against current hyvv main 2e2bbcbf05020cf6e10197eceb64385acd2bc6b0 (the merge commit af05f1c, then the schema RED commit 1a88d4a)"
+  ],
+  "assumptions": [
+    "the launcher's current brief handling is the pre-v1 path and stays byte-compatible for unversioned briefs",
+    "the attempt record is the journal row launcher.submit writes; brief_validation is additive and absent for check jobs",
+    "B6 owns enforcement; this slice never refuses a brief",
+    "the public attempt schema must declare every field the create/list payload carries, so the additive brief_validation field is declared there in the same slice"
+  ],
+  "scope": {
+    "assigned_files": [
+      "launcher.py",
+      "contract/v1/schemas/attempt.json"
+    ],
+    "test_files": [
+      "tests/test_brief_contract_v1.py"
+    ],
+    "read_only": [
+      "brief.schema.json",
+      "schemas/rizzstack-ticket.schema.json",
+      "hyvv/rizzstack_validators.py",
+      "schemas/rizzstack-brief.schema.json",
+      "schemas/rizzstack-attempt.schema.json"
+    ],
+    "prohibited": [
+      "tests/test_brief_contract_v1.py",
+      "hyvv/rizzstack_validators.py",
+      "schemas/rizzstack-brief.schema.json",
+      "schemas/rizzstack-attempt.schema.json",
+      "CHANGELOG.md",
+      ".github/workflows/**",
+      "pyproject.toml",
+      "uv.lock",
+      "evidence/**",
+      "contract/v1/tests/**",
+      "contract/v1/openapi.yaml"
+    ]
+  },
+  "source_rev": "1a88d4a64266930c8480946ad58d265aeb357530",
+  "tdd": {
+    "applicable": true,
+    "test_first": true
+  },
+  "verification": {
+    "independent": true,
+    "commands": [
+      "env -u PYTHONPATH python3 -m unittest -v tests.test_brief_contract_v1"
+    ],
+    "integration": false
+  },
+  "evidence_required": [
+    "red",
+    "green",
+    "review"
+  ],
+  "authorization": {
+    "human_gates": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish"
+    ],
+    "not_authorized": [
+      "merge",
+      "deploy",
+      "restart",
+      "tag",
+      "release",
+      "publish",
+      "force-push",
+      "branch deletion",
+      "edit the vendored copies"
+    ]
+  },
+  "risk": {
+    "tier": "high",
+    "reasons": [
+      "changes the admission path every bee create crosses (/v1/attempts)",
+      "a validator that disagrees with the frozen schema makes valid briefs look invalid"
+    ],
+    "blast_radius": "every hyvv attempt create and the attempt journal readers"
+  },
+  "review": {
+    "status": "approved",
+    "approved_by": "Kyle (owner), typed approval in chat, 2026-11-27: approved: 0f8e6f5c (B4-r2; AC-007 + contract/v1/schemas/attempt.json lease accepted as one coherent change)",
+    "approved_at": "2026-11-27T15:00:23Z",
+    "contract_sha256": "0f8e6f5ca66a5afcadfc75af3d80b6b38e759ff3a47dc034bae6921afad9af00",
+    "test_collection": {
+      "manifest_sha256": "9988905590acd19ae1c53f5dbede224b4625f18cb35fefb06c23a9514d0edda8",
+      "source_rev": "1a88d4a64266930c8480946ad58d265aeb357530",
+      "collected": 8
+    }
+  },
+  "notes": "Re-freeze r2 2026-11-27: source_rev moved to the RED commit re-cut on current hyvv main; scope adds contract/v1/schemas/attempt.json so the additive field passes the required /v1 conformance suite. Owner typed approval required before dispatch."
+}
