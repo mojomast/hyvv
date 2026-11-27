@@ -25,6 +25,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
+try:
+    from hyvv import rizzstack_validators as _rizzstack_validators
+except ImportError:
+    _rizzstack_validators = None
+
 if _landing_export is None:  # pragma: no cover - loaded from a sibling copy
     try:
         import importlib.util as _importlib_util
@@ -1991,6 +1996,20 @@ def validate_brief(b, cfg=None):
         if k in b and not (isinstance(b[k], list) and all(isinstance(x, str) for x in b[k])): return f"brief.{k} must be a list of strings"
     return _budget_requirement_error(cfg, b)
 
+
+def _brief_validation_report(brief):
+    if not isinstance(brief, dict) or brief.get("schema") != "rizzstack.brief/1":
+        return {"status": "unversioned", "legacy_fields": sorted(brief) if isinstance(brief, dict) else []}
+    schema_dir = Path(__file__).resolve().parent / "schemas"
+    try:
+        schema = json.loads((schema_dir / "rizzstack-brief.schema.json").read_text("utf-8"))
+        problems = _rizzstack_validators.validate_brief(brief, schema_dir=schema_dir)
+        unknown_fields = sorted(set(brief) - set(schema.get("properties", {})))
+    except Exception:
+        return {"status": "invalid", "problems": ["brief validation unavailable"], "unknown_fields": []}
+    return {"status": "invalid" if problems else "valid", "problems": problems, "unknown_fields": unknown_fields}
+
+
 # Same text rule as contract/v1/project_state.py SAFE_PATH: relative, no empty,
 # "." or ".." segment, no backslash, no trailing slash after normalize, <= 244.
 _SCOPE_PATH = re.compile(r"^(?!/)(?!.*(?:^|/)[.]{1,2}(?:/|$))(?!.*//)(?!.*/$)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
@@ -2293,6 +2312,8 @@ class Launcher:
     def public(self, a):
         keys = ("attempt_id", "kind", "mode", "tier", "state", "detail", "run_id", "sandbox", "created_at", "updated_at", "lseq", "queue_position", "retry_at", "rate_limited", "model", "fallback", "pool", "model_history")
         d = {k: a.get(k) for k in keys}
+        if "brief_validation" in a:
+            d["brief_validation"] = a["brief_validation"]
         if a.get("workspace_error"):
             d["workspace_error"] = a["workspace_error"]
         if d["state"] == "queued": q = self._queue(); d["queue_position"] = q.index(a["attempt_id"]) + 1 if a["attempt_id"] in q else None  # one snapshot: a second _queue() call could race the .index()
@@ -2330,9 +2351,10 @@ class Launcher:
             raise ValueError("verify_of attempt has a different project or source_rev")
         if not (self.dir / "attempts" / f"{vid}.result.json").exists(): raise ValueError("verify_of attempt has no result")
 
-    def submit(self, aid, brief, model=None, kind=None, mode=None):
+    def submit(self, aid, brief, model=None, kind=None, mode=None, validation=None):
         with self.lock:
             if aid in self.attempts: return self.attempts[aid], False  # idempotent: never a second controller
+            if validation is None: validation = _brief_validation_report(brief)
             kind = kind or brief.get("kind") or "opencode"
             if kind not in KINDS: raise ValueError(f"unknown kind: {kind} (allowed: {', '.join(KINDS)})")
             prof = resolve_security_profile(self.cfg, kind, brief)  # ValueError -> 400; coding bees: "default" only
@@ -2340,7 +2362,7 @@ class Launcher:
                 if not brief.get("commands"): raise ValueError("check jobs need brief.commands (a non-empty list of strings)")
                 if brief.get("verify_of") is not None: raise ValueError("verify_of applies to opencode attempts only")
                 now = time.time()
-                a = {"attempt_id": aid, "kind": kind, "brief": brief, "state": "queued", "detail": "waiting for a worker slot", "created_at": now,
+                a = {"attempt_id": aid, "kind": kind, "brief": brief, "brief_validation": validation, "state": "queued", "detail": "waiting for a worker slot", "created_at": now,
                      "updated_at": now, "lseq": 0, "cursor": 0, "rate_limited": 0, "model": None, "security_profile": prof}
                 self.attempts[aid] = a; self._save(a)
                 self.kick(); return a, True
@@ -2353,7 +2375,7 @@ class Launcher:
                 spec = model_spec(self.cfg, model or brief.get("model") or brief.get("tier"), brief)  # ValueError -> 400
             if brief.get("verify_of") is not None: self._check_verify_of(brief, kind)
             now = time.time()
-            a = {"attempt_id": aid, "kind": kind, "brief": brief, "state": "queued", "detail": "waiting for a worker slot", "created_at": now,
+            a = {"attempt_id": aid, "kind": kind, "brief": brief, "brief_validation": validation, "state": "queued", "detail": "waiting for a worker slot", "created_at": now,
                  "updated_at": now, "lseq": 0, "cursor": 0, "rate_limited": 0, "model": None if spec.get("pool") else spec["name"]}
             if spec.get("pool"): a.update(pool=spec["pool"], tried=[], model_history=[])
             if kind == "agy-cua":
@@ -3463,11 +3485,12 @@ def make_handler(L, token):
                     aid = "att_" + uuid.uuid4().hex[:16]  # 0.1.13: mint when omitted (bundlebees client does not send one)
                 elif not re.fullmatch(r"[A-Za-z0-9_\-]{8,64}", aid):
                     return self._send(400, {"error": "attempt_id required"})
+                validation = _brief_validation_report(b.get("brief"))
                 if isinstance(b.get("brief"), dict): b["brief"] = normalize_brief(b["brief"])
                 err = validate_brief(b.get("brief"), L.cfg)
                 if err: return self._send(400, {"error": err})
                 if b["brief"].get("project") and b["brief"]["project"] not in L.cfg["projects"]: return self._send(403, {"error": "project not authorized on this PC"})
-                try: a, created = L.submit(aid, b["brief"], b.get("model") or b.get("tier"), b.get("kind"), b.get("mode"))
+                try: a, created = L.submit(aid, b["brief"], b.get("model") or b.get("tier"), b.get("kind"), b.get("mode"), validation=validation)
                 except ValueError as ex: return self._send(400, {"error": str(ex)})
                 return self._send(201 if created else 200, L.public(a))
             if p == ["v1", "route"]:  # preview: what this request would resolve to; no run is started
