@@ -5,15 +5,23 @@ This helper is run by scripts/launcher-admin.ps1 from the admin scripts director
 (never from the hyvv checkout). The wheel built by ``uv build --wheel`` is the only
 payload source: the admin script no longer keeps a hand-written list of files, so
 schemas/, contract/v1/schemas/, the rails modules and the hyvv package all reach the
-install dir. The running build is proven by its describe sha (``0.1.19+g521e9bc``),
-not by the bare VERSION literal, so a build off the tag can no longer masquerade as
-the tag and a rollback to a pre-describe build still verifies.
+install dir. The wheel's single dist-info directory ships too: an install root has
+no pyproject.toml and no .git, so hyvv/__init__ resolves its version from the
+installed dist-info metadata, and a launcher importing hyvv would crash without it.
+Files a previous deploy installed but the new wheel no longer ships are pruned, so
+stale modules and stale dist-info metadata never linger on a host. The running
+build is proven by its describe sha (``0.1.19+g521e9bc``), not by the bare VERSION
+literal, so a build off the tag can no longer masquerade as the tag and a rollback
+to a pre-describe build still verifies.
 
 Standard library only, no network, no side effects at import time. Safety rules: a
 wheel member that is absolute, has a drive, contains a backslash or has ``..``/``.``/
-empty segments is refused, and the wheel must never carry admin scripts, config,
-keys or tokens onto a host (anything under scripts/, any *.ps1, any basename
-config.json, any *.key or *.token is refused).
+empty segments is refused, a wheel carrying more than one top-level *.dist-info dir
+is refused, and the wheel must never carry admin scripts, config, keys or tokens
+onto a host (anything under scripts/, any *.ps1, any basename config.json, any
+*.key or *.token is refused). prune() applies the same member-name and guard rules
+to every removal candidate before anything is removed, and never follows symlinks
+or reparse points.
 """
 from __future__ import annotations
 
@@ -130,11 +138,15 @@ def _is_guarded(name):
 def runtime_files(wheel_path):
     """Sorted posix names of the wheel members that belong on the install root.
 
-    Directories and anything under a top-level *.dist-info/ dir are excluded. Any
-    unsafe or guarded member anywhere in the archive raises ValueError: the whole
-    wheel is rejected, never partially installed.
+    The wheel's one top-level *.dist-info dir ships with everything else: on a host
+    the install root has no pyproject.toml, so hyvv/__init__ resolves its version
+    from that installed metadata. Directory entries themselves are excluded. Any
+    unsafe or guarded member anywhere in the archive, or more than one top-level
+    *.dist-info dir, raises ValueError: the whole wheel is rejected, never
+    partially installed.
     """
     names = []
+    dist_info = set()
     with zipfile.ZipFile(wheel_path) as zf:
         for info in zf.infolist():
             name = info.filename
@@ -143,13 +155,25 @@ def runtime_files(wheel_path):
             _check_member_name(check)
             if _is_guarded(check):
                 raise ValueError("guarded member refused: %r" % name)
+            parts = check.split("/")
+            if parts[0].endswith(".dist-info") and (is_dir or len(parts) > 1):
+                dist_info.add(parts[0])
             if is_dir:
                 continue
-            parts = check.split("/")
-            if len(parts) > 1 and parts[0].endswith(".dist-info"):
-                continue
             names.append(check)
+    if len(dist_info) > 1:
+        raise ValueError("wheel carries %d top-level dist-info dirs, expected exactly one: %s"
+                         % (len(dist_info), ", ".join(sorted(dist_info))))
     return sorted(set(names))
+
+
+def _wheel_dist_info_dir(wheel_path):
+    """The wheel's single top-level *.dist-info dir name, or None when it has none."""
+    for name in runtime_files(wheel_path):
+        top = name.split("/")[0]
+        if top.endswith(".dist-info"):
+            return top
+    return None
 
 
 def _dest_for(root, name):
@@ -221,18 +245,76 @@ def _receipt_file_names(root):
     return out
 
 
+def _dist_info_dirs(root):
+    """Top-level hyvv-*.dist-info directories under root, sorted by name.
+
+    A symlink (or any reparse-point stand-in) named like a dist-info dir is never
+    followed: it raises ValueError so the caller refuses the whole operation.
+    """
+    root = Path(root)
+    out = []
+    if not root.is_dir():
+        return out
+    for child in sorted(root.iterdir()):
+        if not (child.name.startswith("hyvv-") and child.name.endswith(".dist-info")):
+            continue
+        if child.is_symlink():
+            raise ValueError("refusing symlinked dist-info dir: %r" % child.name)
+        if child.is_dir():
+            out.append(child)
+    return out
+
+
+def _files_under(root, base):
+    """Sorted posix names (relative to root) of every file under base.
+
+    Walks without ever following symlinks: symlinked subdirectories are not
+    descended into and a symlinked file is listed (unlinking it later removes the
+    link, never its target).
+    """
+    root = Path(root)
+    out = []
+    for dirpath, dirnames, filenames in os.walk(str(base), followlinks=False):
+        dirnames[:] = [d for d in dirnames if not (Path(dirpath) / d).is_symlink()]
+        for filename in filenames:
+            out.append((Path(dirpath) / filename).relative_to(root).as_posix())
+    return sorted(out)
+
+
+def _stale_dist_info_files(root):
+    """Sorted names of every file under any root/hyvv-*.dist-info dir."""
+    root = Path(root)
+    out = []
+    for dist in _dist_info_dirs(root):
+        out.extend(_files_under(root, dist))
+    return sorted(out)
+
+
+def _check_candidate_name(name):
+    """The member-name and guard rules every prune/backup candidate must pass."""
+    _check_member_name(name)
+    if _is_guarded(name):
+        raise ValueError("guarded payload member refused: %r" % name)
+
+
 def backup(wheel_path, root, dest):
     """Back up the previous payload: every runtime file of the NEW wheel, every file
-    the existing deployed-version receipt lists, and the receipt itself.
+    the existing deployed-version receipt lists, every file under any existing
+    root/hyvv-*.dist-info dir (so restore() brings stale metadata back), and the
+    receipt itself.
 
     Each name is copied to dest/<name> when it exists; dest/manifest.json records
     {'existed', 'sha256'} per name so restore() can return the exact previous tree.
-    Returns the backup dir as a Path.
+    Every candidate name passes the member-name and guard rules before anything is
+    copied. Returns the backup dir as a Path.
     """
     root = Path(root)
     dest = Path(dest)
     names = set(runtime_files(wheel_path))
     names.update(_receipt_file_names(root))
+    for name in _stale_dist_info_files(root):
+        _check_candidate_name(name)
+        names.add(name)
     names.add(DEPLOYED_VERSION_FILE)
     dest.mkdir(parents=True, exist_ok=True)
     entries = {}
@@ -290,91 +372,136 @@ def restore(dest, root):
                 parent = parent.parent
 
 
+def _remove_empty_parents(root, start):
+    """Remove now-empty parent dirs of a removed file, inside root, never root."""
+    root = Path(root)
+    parent = Path(start)
+    while (parent != root and root in parent.parents and parent.is_dir()
+           and not parent.is_symlink() and not any(parent.iterdir())):
+        parent.rmdir()
+        parent = parent.parent
+
+
+def prune(wheel_path, root):
+    """Remove payload files the new wheel no longer ships. Returns sorted removed names.
+
+    Candidates are (a) every name in an existing root/hyvv-deployed.json 'files' map
+    that is not in the new wheel's runtime set, and (b) every file under a top-level
+    root/hyvv-*.dist-info dir whose dir name differs from the new wheel's dist-info
+    dir. Every candidate passes the member-name and guard rules before anything is
+    removed (any failure raises ValueError and removes nothing). Symlinks are never
+    followed: a symlinked dist-info dir raises ValueError. Missing files are not
+    errors. After a removal, now-empty parent dirs inside root are removed (never
+    root itself).
+    """
+    root = Path(root)
+    runtime = set(runtime_files(wheel_path))
+    keep_dist_info = _wheel_dist_info_dir(wheel_path)
+    candidates = set()
+    for name in _receipt_file_names(root):
+        if name not in runtime:
+            candidates.add(name)
+    for dist in _dist_info_dirs(root):
+        if dist.name == keep_dist_info:
+            continue
+        candidates.update(_files_under(root, dist))
+    for name in sorted(candidates):
+        _check_candidate_name(name)
+    removed = []
+    for name in sorted(candidates):
+        target = _dest_for(root, name)
+        if target.is_file() or target.is_symlink():
+            target.unlink()
+            removed.append(name)
+            _remove_empty_parents(root, target.parent)
+    return sorted(removed)
+
+
 # The smoke child runs isolated (python -I -c CODE <root>) with the deploy root first
 # on sys.path. It imports launcher, proves it came from the root, loads the ticket
-# schema, then imports every top-level runtime module and every hyvv submodule. The
-# wheel's runtime set carries no dist-info and no pyproject.toml, so throwaway package
-# metadata is provided in a temp dir (outside the root) purely so hyvv/__init__ can
-# resolve a version; every imported module's __file__ must still live under the root.
+# schema, then imports every top-level runtime module and every hyvv submodule. hyvv
+# is imported honestly like any other module: the wheel's dist-info ships in the
+# runtime set, so on a real install hyvv/__init__ resolves its version from that
+# metadata, and when the metadata is missing the import fails and smoke says so
+# (no faked dist-info, no temp package). Every imported module's __file__ must
+# still live under the root.
 _SMOKE_CHILD = r"""
-import importlib, json, shutil, sys, tempfile
+import importlib, json, sys
 from pathlib import Path
 
 root = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(root))
-result = {"ok": False, "ticket_schema": "unknown", "rizzstack_validators": "absent", "modules": {}, "error": ""}
+result = {"ok": False, "ticket_schema": "unknown", "rizzstack_validators": "absent",
+          "modules": {}, "hyvv_version": None, "error": ""}
 errors = []
-meta = Path(tempfile.mkdtemp(prefix="hyvv-smoke-meta-"))
-try:
-    dist = meta / "hyvv-0.0.0.dist-info"
-    dist.mkdir()
-    (dist / "METADATA").write_text("Metadata-Version: 2.1\nName: hyvv\nVersion: 0.0.0\n", encoding="utf-8")
-    sys.path.append(str(meta))
 
-    def note(name):
-        try:
-            mod = importlib.import_module(name)
-        except Exception as exc:
-            result["modules"][name] = "error: %s" % exc
-            errors.append("import %s: %s" % (name, exc))
-            return None
-        where = Path(getattr(mod, "__file__", "") or "").resolve()
-        if where != root and root not in where.parents:
-            result["modules"][name] = "error: outside root"
-            errors.append("module %s loaded from %s, outside the deploy root" % (name, getattr(mod, "__file__", "?")))
-            return mod
-        result["modules"][name] = "ok"
+def note(name):
+    try:
+        mod = importlib.import_module(name)
+    except Exception as exc:
+        result["modules"][name] = "error: %s" % exc
+        errors.append("import %s: %s" % (name, exc))
+        return None
+    where = Path(getattr(mod, "__file__", "") or "").resolve()
+    if where != root and root not in where.parents:
+        result["modules"][name] = "error: outside root"
+        errors.append("module %s loaded from %s, outside the deploy root" % (name, getattr(mod, "__file__", "?")))
         return mod
+    result["modules"][name] = "ok"
+    return mod
 
-    launcher = note("launcher")
-    if launcher is not None:
-        try:
-            if Path(launcher.__file__).resolve().parent != root:
-                errors.append("launcher loaded from %s, not the deploy root" % launcher.__file__)
-        except Exception as exc:
-            errors.append("launcher path check failed: %s" % exc)
-        try:
-            schema = launcher._ticket_schema()
-            if isinstance(schema, dict):
-                result["ticket_schema"] = "ok"
-            else:
-                result["ticket_schema"] = "not a dict"
-                errors.append("ticket schema is not a dict")
-        except Exception as exc:
-            result["ticket_schema"] = "%s: %s" % (type(exc).__name__, exc)
-            errors.append("ticket schema: %s" % exc)
+launcher = note("launcher")
+if launcher is not None:
+    try:
+        if Path(launcher.__file__).resolve().parent != root:
+            errors.append("launcher loaded from %s, not the deploy root" % launcher.__file__)
+    except Exception as exc:
+        errors.append("launcher path check failed: %s" % exc)
+    try:
+        schema = launcher._ticket_schema()
+        if isinstance(schema, dict):
+            result["ticket_schema"] = "ok"
+        else:
+            result["ticket_schema"] = "not a dict"
+            errors.append("ticket schema is not a dict")
+    except Exception as exc:
+        result["ticket_schema"] = "%s: %s" % (type(exc).__name__, exc)
+        errors.append("ticket schema: %s" % exc)
 
-    runtime = None
-    receipt = root / "hyvv-deployed.json"
-    if receipt.is_file():
-        try:
-            data = json.loads(receipt.read_text(encoding="utf-8-sig"))
-            files = data.get("files")
-            if isinstance(files, dict):
-                runtime = sorted(str(n) for n in files)
-            elif isinstance(files, list):
-                runtime = sorted(str(n) for n in files)
-        except Exception as exc:
-            errors.append("deployed-version receipt unreadable: %s" % exc)
-    if runtime is None:
-        runtime = sorted(p.name for p in root.glob("*.py"))
-    for name in runtime:
-        if "/" in name or "\\" in name or not name.endswith(".py"):
+runtime = None
+receipt = root / "hyvv-deployed.json"
+if receipt.is_file():
+    try:
+        data = json.loads(receipt.read_text(encoding="utf-8-sig"))
+        files = data.get("files")
+        if isinstance(files, dict):
+            runtime = sorted(str(n) for n in files)
+        elif isinstance(files, list):
+            runtime = sorted(str(n) for n in files)
+    except Exception as exc:
+        errors.append("deployed-version receipt unreadable: %s" % exc)
+if runtime is None:
+    runtime = sorted(p.name for p in root.glob("*.py"))
+for name in runtime:
+    if "/" in name or "\\" in name or not name.endswith(".py"):
+        continue
+    stem = name[:-3]
+    if stem != "launcher":
+        note(stem)
+
+pkg = root / "hyvv"
+if pkg.is_dir():
+    for f in sorted(pkg.glob("*.py")):
+        if f.name == "__main__.py":
             continue
-        stem = name[:-3]
-        if stem != "launcher":
-            note(stem)
-
-    pkg = root / "hyvv"
-    if pkg.is_dir():
-        for f in sorted(pkg.glob("*.py")):
-            if f.name == "__main__.py":
-                continue
-            note("hyvv" if f.name == "__init__.py" else "hyvv." + f.name[:-3])
-    if (pkg / "rizzstack_validators.py").is_file():
-        result["rizzstack_validators"] = "present"
-finally:
-    shutil.rmtree(str(meta), ignore_errors=True)
+        mod = note("hyvv" if f.name == "__init__.py" else "hyvv." + f.name[:-3])
+        if f.name == "__init__.py" and mod is not None:
+            try:
+                result["hyvv_version"] = str(mod.__version__)
+            except Exception:
+                result["hyvv_version"] = None
+if (pkg / "rizzstack_validators.py").is_file():
+    result["rizzstack_validators"] = "present"
 
 result["ok"] = not errors and result["ticket_schema"] == "ok"
 result["error"] = "; ".join(errors)
@@ -389,8 +516,12 @@ def smoke(root, python=None, timeout=180):
     ok False. ok means launcher and every runtime module imported from under root
     and the ticket schema loaded as a dict.
     """
-    result = {"ok": False, "ticket_schema": "unknown", "rizzstack_validators": "unknown", "modules": {}, "error": ""}
+    result = {"ok": False, "ticket_schema": "unknown", "rizzstack_validators": "unknown",
+              "modules": {}, "hyvv_version": None, "error": ""}
     exe = python or sys.executable
+    # The child runs with cwd=root, so hand it an absolute root (a relative one would
+    # resolve against itself).
+    root = Path(root).resolve()
     try:
         proc = subprocess.run([exe, "-I", "-c", _SMOKE_CHILD, str(root)], cwd=str(root),
                               capture_output=True, text=True, timeout=timeout)
@@ -415,6 +546,8 @@ def smoke(root, python=None, timeout=180):
     result["ticket_schema"] = str(data.get("ticket_schema", "unknown"))
     result["rizzstack_validators"] = str(data.get("rizzstack_validators", "unknown"))
     result["modules"] = modules if isinstance(modules, dict) else {}
+    hyvv_version = data.get("hyvv_version")
+    result["hyvv_version"] = str(hyvv_version) if hyvv_version else None
     result["error"] = str(data.get("error", ""))
     if proc.returncode != 0 and result["ok"]:
         result["ok"] = False
@@ -441,6 +574,10 @@ def main(argv=None):
     p.add_argument("--wheel", required=True)
 
     p = sub.add_parser("install", help="install the wheel's runtime files into a root")
+    p.add_argument("--wheel", required=True)
+    p.add_argument("--root", required=True)
+
+    p = sub.add_parser("prune", help="remove payload files the new wheel no longer ships")
     p.add_argument("--wheel", required=True)
     p.add_argument("--root", required=True)
 
@@ -482,6 +619,12 @@ def main(argv=None):
             names = install(args.wheel, args.root)
             print("installed=%d" % len(names))
             return 0
+        if args.cmd == "prune":
+            removed = prune(args.wheel, args.root)
+            print("pruned=%d" % len(removed))
+            for name in removed:
+                print(name)
+            return 0
         if args.cmd == "verify-root":
             problems = verify_root(args.wheel, args.root)
             if not problems:
@@ -501,9 +644,10 @@ def main(argv=None):
             return 0
         if args.cmd == "smoke":
             result = smoke(args.root, python=args.python)
-            print("smoke=%s ticket_schema=%s rizzstack_validators=%s modules=%d" % (
+            print("smoke=%s ticket_schema=%s rizzstack_validators=%s modules=%d hyvv_version=%s" % (
                 "ok" if result["ok"] else "fail", _one_line(result["ticket_schema"]),
-                result["rizzstack_validators"], len(result["modules"])))
+                result["rizzstack_validators"], len(result["modules"]),
+                result["hyvv_version"] if result["hyvv_version"] else "none"))
             if not result["ok"]:
                 print("error=%s" % _one_line(result["error"]))
             return 0 if result["ok"] else 1

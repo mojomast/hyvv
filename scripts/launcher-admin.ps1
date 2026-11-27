@@ -3,8 +3,8 @@
 # Writes may change config.json "projects" entries only.
 # 'logs' and 'update-status' are read-only. 'apply-update' builds the hyvv wheel from a
 # dedicated checkout, installs the wheel's runtime files (never scripts/, config, keys or
-# tokens) into the install dir, proves the running build by its describe sha, and restarts
-# when idle.
+# tokens) into the install dir, prunes what the new wheel no longer ships, proves the
+# running build by its describe sha, and restarts when idle.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3.0
 
@@ -36,13 +36,13 @@ $LogsMaxLines = 1000
 # fixture under orbit-worker-fixtures (bees/sync touch those).
 $HyvvCheckout = Join-Path $env:USERPROFILE 'hyvv-deploy'
 # "Install" = build the wheel from the checkout (uv build --wheel), then let deploy_payload.py
-# copy the wheel's runtime files into $Root (the dir start.ps1 runs launcher.py from) and prove
-# the copy byte-for-byte, then warm the same uv env start.ps1 uses. The helper ships beside this
-# script and is NEVER taken from the checkout; scripts\*.ps1 (including this file), config.json,
-# *.token and *.key are never in the wheel's runtime set, so a merge to main cannot rewrite
-# these guardrails.
+# copy the wheel's runtime files into $Root (the dir start.ps1 runs launcher.py from), prune
+# files the new wheel no longer ships, and prove the copy byte-for-byte, then warm the same uv
+# env start.ps1 uses. The helper ships beside this script and is NEVER taken from the checkout;
+# scripts\*.ps1 (including this file), config.json, *.token and *.key are never in the wheel's
+# runtime set, so a merge to main cannot rewrite these guardrails.
 $DeployHelper = Join-Path $ScriptDir 'deploy_payload.py'
-$InstallUvArgs = @('run','-q','--python',$Python,'--with','cua==0.5.0','python','-c','import cua')
+$InstallUvArgs = @('run','--no-project','-q','--python',$Python,'--with','cua==0.5.0','python','-c','import cua')
 $HyvvRepoName = 'hyvv'
 $HyvvOriginUrl = 'https://github.com/mojomast/hyvv.git'
 $HyvvMainRef = 'refs/remotes/origin/main'
@@ -594,7 +594,7 @@ function Invoke-DeployHelper([string[]]$a) {
   $prevEap = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
   try {
-    $raw = & uv run -q --python $Python python $DeployHelper @a 2>&1 | Out-String
+    $raw = & uv run -q --no-project --python $Python python $DeployHelper @a 2>&1 | Out-String
     $code = $LASTEXITCODE
   } finally {
     $ErrorActionPreference = $prevEap
@@ -783,12 +783,16 @@ function Restore-Payload([string]$dir) {
 }
 
 function Invoke-Install([string]$wheel) {
-  # Syntax-gate the checkout's launcher first, then install the wheel's runtime files, prove
-  # the copy byte-for-byte and import-prove the installed tree, all before any restart.
-  $comp = & uv run -q --python $Python python -m py_compile (Join-Path $HyvvCheckout 'launcher.py') (Join-Path $HyvvCheckout 'agy_cua_mcp.py') 2>&1 | Out-String
+  # Syntax-gate the checkout's launcher first, then install the wheel's runtime files, prune
+  # what the new wheel no longer ships, prove the copy byte-for-byte and import-prove the
+  # installed tree, all before any restart. Every uv call passes --no-project so uv never
+  # syncs a project from the cwd.
+  $comp = & uv run --no-project -q --python $Python python -m py_compile (Join-Path $HyvvCheckout 'launcher.py') (Join-Path $HyvvCheckout 'agy_cua_mcp.py') 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "py_compile failed: $((Write-Scrubbed $comp) -join ' ')" }
   $r = Invoke-DeployHelper @('install','--wheel',$wheel,'--root',$Root)
   if ($r.Code -ne 0) { throw "payload install failed: $($r.Out)" }
+  $p = Invoke-DeployHelper @('prune','--wheel',$wheel,'--root',$Root)
+  if ($p.Code -ne 0) { throw "payload prune failed: $($p.Out)" }
   $v = Invoke-DeployHelper @('verify-root','--wheel',$wheel,'--root',$Root)
   if ($v.Code -ne 0) { throw "post-copy check failed: $($v.Out)" }
   $s = Invoke-DeployHelper @('smoke','--root',$Root)
@@ -950,6 +954,8 @@ function Invoke-UpdateStatus {
     Write-Output "last_apply_update_ok=$okv"
     Write-Output ("last_apply_update_detail=" + (Format-RedactedLogLine $detail))
   }
+  # Read-only probe: a missing lock file means 'no'; an IOException means another
+  # process holds it ('yes'); any other error fails closed as 'unknown' (never 'no').
   $held = 'no'
   if (Test-Path -LiteralPath $LockPath -PathType Leaf) {
     $fs = $null
@@ -958,7 +964,7 @@ function Invoke-UpdateStatus {
     } catch [System.IO.IOException] {
       $held = 'yes'
     } catch {
-      $held = 'no'
+      $held = 'unknown'
     } finally {
       if ($fs) { $fs.Close() }
     }
