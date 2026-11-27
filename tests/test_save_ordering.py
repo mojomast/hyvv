@@ -32,6 +32,29 @@ class SaveOrdering(unittest.TestCase):
             stored = json.loads(la._path(aid).read_text(encoding="utf-8"))
             self.assertEqual(stored["state"], "cancel_requested")
 
+    def test_stale_save_appends_an_event_and_reloads_memory(self):
+        with tempfile.TemporaryDirectory() as d:
+            la, _ = _launcher(d)
+            aid = "att_dd00000003"
+            running = _attempt(aid=aid, state="running", lseq=1)
+            la.attempts[aid] = running
+            la._save(running)
+            la._save(dict(running, state="cancel_requested", lseq=2))
+
+            la._save(running)  # stale write from the dispatcher
+
+            self.assertEqual(la.attempts[aid]["state"], "cancel_requested")
+            events = [
+                json.loads(line)
+                for line in (la.dir / "attempts" / f"{aid}.events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            refused = [e for e in events if e["kind"] == "journal_stale_save_refused"]
+            self.assertEqual(len(refused), 1)
+            self.assertEqual(refused[0]["state"], "cancel_requested")
+            self.assertEqual(refused[0]["attempted_lseq"], 1)
+
     @unittest.skipIf(os.name == "nt", "POSIX mode bits")
     def test_saved_journal_keeps_the_previous_mode(self):
         with tempfile.TemporaryDirectory() as d:

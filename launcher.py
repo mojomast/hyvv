@@ -2436,9 +2436,13 @@ class Launcher:
         self.model_health = {m: {"last_limited": 0.0, "last_used": 0.0} for m in FREE_POOL}
         self.dir = Path(cfg["data_dir"]); (self.dir / "attempts").mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
-        # Journal writes are serialized per attempt and refuse an older lseq.
+        # Journal writes are serialized within this process and refuse an older
+        # lseq.  The launcher is the only writer of attempts/*.json (workers
+        # report through the API), so this is a process-local lock; a second
+        # writer process would need an fcntl file lock as well.
         self._save_locks: dict[str, threading.Lock] = {}
         self._save_locks_guard = threading.Lock()
+        self.last_journal_error = None
         self.attempts = {}
         self.controllers = {}  # attempt_id -> asyncio task (exactly one per attempt)
         self._budget_finishing = set()  # attempt_ids with a budget teardown in flight (in-memory single-flight)
@@ -2481,16 +2485,37 @@ class Launcher:
         # Last-writer-wins would let a stale "running" save overwrite a newer
         # "cancel_requested".  lseq is monotonic on every state transition, so
         # a write older than the journal is refused.
-        if int(a.get("lseq", 0)) < self._journal_lseq(p):
+        current = self._journal_record(p)
+        current_lseq = -1 if current is None else int(current.get("lseq", 0))
+        if int(a.get("lseq", 0)) < current_lseq:
+            self._refuse_stale_save(a, current)
             return
         self._write_journal(p, a)
 
     @staticmethod
-    def _journal_lseq(p):
+    def _journal_record(p):
         try:
-            return int(json.loads(p.read_text(encoding="utf-8")).get("lseq", 0))
+            value = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
-            return -1
+            return None
+        return value if isinstance(value, dict) else None
+
+    def _refuse_stale_save(self, a, current):
+        """Record the refused write and make memory agree with the journal."""
+        aid = a["attempt_id"]
+        event = {
+            "lseq": int(current.get("lseq", 0)),
+            "ts": time.time(),
+            "kind": "journal_stale_save_refused",
+            "attempted_lseq": int(a.get("lseq", 0)),
+            "attempted_state": a.get("state"),
+            "state": current.get("state"),
+        }
+        try:
+            self._append_events(a, [event])
+        except OSError as exc:
+            self.last_journal_error = str(exc)
+        self.attempts[aid] = current
 
     def _write_journal(self, p, a):
         fd, tmp_name = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=p.parent)
