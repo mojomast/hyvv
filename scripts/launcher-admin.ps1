@@ -607,6 +607,34 @@ function Invoke-DeployHelper([string[]]$a) {
 # (atomic tmp + Move-Item), so the read-only 'update-status' op can show where a run is even
 # after the admin channel that started it has timed out.
 $script:DeployState = $null
+
+# The build sha a launcher reports in its version string ('0.1.19+g521e9bc' -> '521e9bc');
+# 'none' for a bare pre-describe version or no version at all.
+function Get-BuildSha([string]$version) {
+  if ($version -cmatch '\+g([0-9a-f]{7,40})$') { return $Matches[1] }
+  return 'none'
+}
+
+# The one outcome line apply-update prints (and mirrors into the state file): what is deployed,
+# the running version, the build sha that version proves, and the revert result. The free-text
+# reason, when there is one, always comes last.
+function Format-OutcomeLine([string]$outcome, [string]$deployed, [string]$version, [string]$revert, [string]$reason) {
+  if (-not $deployed) { $deployed = 'none' }
+  if (-not $version) { $version = 'unknown' }
+  if (-not $revert) { $revert = 'none' }
+  $line = "outcome=$outcome deployed=$deployed version=$version build_sha=$(Get-BuildSha $version) revert=$revert"
+  if ($reason) { $line = "$line reason=$reason" }
+  return $line
+}
+
+function Set-DeployOutcome([string]$deployed, [string]$version, [string]$revert) {
+  if ($null -eq $script:DeployState) { return }
+  $script:DeployState['deployed'] = $deployed
+  $script:DeployState['version'] = $(if ($version) { $version } else { 'unknown' })
+  $script:DeployState['build_sha'] = Get-BuildSha $version
+  $script:DeployState['revert'] = $revert
+}
+
 function Write-Phase([string]$phase, [string]$outcome, [string]$reason) {
   $elapsed = 0
   if ($null -ne $script:DeployState) { $elapsed = [int]((Get-Date) - $script:DeployState['started']).TotalSeconds }
@@ -622,6 +650,9 @@ function Write-Phase([string]$phase, [string]$outcome, [string]$reason) {
   }
   if ($outcome) { $rec['outcome'] = $outcome }
   if ($reason) { $rec['reason'] = $reason }
+  foreach ($k in @('deployed','version','build_sha','revert')) {
+    if ($script:DeployState.ContainsKey($k) -and $script:DeployState[$k]) { $rec[$k] = [string]$script:DeployState[$k] }
+  }
   $dest = Join-Path $Data 'apply-update.state.json'
   $tmp = "$dest.tmp-admin"
   Set-Content -LiteralPath $tmp -Value ($rec | ConvertTo-Json -Depth 4 -Compress) -Encoding utf8
@@ -805,7 +836,7 @@ function Invoke-ApplyUpdate([string[]]$argv) {
   if ($argv.Count -lt 1 -or $argv.Count -gt 2) { throw 'usage: apply-update <commit-sha> [hyvv]' }
   $ref = $argv[0]
   $repo = if ($argv.Count -eq 2) { $argv[1] } else { $HyvvRepoName }
-  $auditArgs = [ordered]@{ repo = $repo; ref = $ref; old_sha = $null; new_sha = $null; version_before = $null; version_after = $null; payload_backup = $null; rolled_back = $false }
+  $auditArgs = [ordered]@{ repo = $repo; ref = $ref; old_sha = $null; new_sha = $null; version_before = $null; version_after = $null; build_sha = $null; payload_backup = $null; rolled_back = $false }
   try {
     if ($repo -cne $HyvvRepoName) { throw "repo must be '$HyvvRepoName'" }
     if ($ref -cnotmatch '^[0-9a-f]{7,40}$') { throw 'ref must be a lowercase commit sha (7-40 hex); branches and tags are refused' }
@@ -849,6 +880,7 @@ function Invoke-ApplyUpdate([string[]]$argv) {
 
     if ($new -eq $old) { Write-Output "note=checkout already at $new; reinstalling and restarting" }
     $payloadBak = $null
+    $probe = $null
     try {
       [void](Invoke-Git @('checkout','--detach','--quiet',$new))
       if ((Invoke-Git @('rev-parse','HEAD')).Out -ne $new) { throw 'checkout did not land on the requested commit' }
@@ -876,13 +908,17 @@ function Invoke-ApplyUpdate([string[]]$argv) {
       if ($sm.Code -ne 0) { throw "post-restart smoke failed: $($sm.Out)" }
       if (-not (Test-LauncherRunsFromRoot)) { throw 'no launcher process is running launcher.py from the install dir' }
       $auditArgs.version_after = "$($probe.Version)@$new"
+      $auditArgs.build_sha = Get-BuildSha "$($probe.Version)"
+      Set-DeployOutcome $new "$($probe.Version)" 'none'
       Write-Phase 'done' 'ok'
       Write-Audit 'apply-update' $true "updated $old -> $new" $payloadBak $auditArgs
-      Write-Output "outcome=ok deployed=$new version=$($probe.Version) revert=none"
+      Write-Output (Format-OutcomeLine 'ok' $new "$($probe.Version)" 'none' '')
       Write-Output "ok=yes op=apply-update old_sha=$old new_sha=$new version=$want deployed=$($dv1.status) payload_backup=$payloadBak"
     } catch {
       $why = [string]$_.Exception.Message
-      Write-Output "outcome=failed reason=$why revert=pending old_sha=$old"
+      $failedVersion = $(if ($probe) { "$($probe.Version)" } else { '' })
+      Set-DeployOutcome 'none' $failedVersion 'pending'
+      Write-Output (Format-OutcomeLine 'failed' 'none' $failedVersion 'pending' "target=$new old_sha=$old $why")
       Write-Phase 'failed' 'failed' $why
       Write-Output "apply_update_failed; reverting to $old"
       $auditArgs.rolled_back = $true
@@ -903,8 +939,10 @@ function Invoke-ApplyUpdate([string[]]$argv) {
       }
       $dvr = Get-DeployedVersion
       $auditArgs.version_after = "running=$($pr.Version) deployed=$($dvr.status)"
+      $auditArgs.build_sha = Get-BuildSha "$($pr.Version)"
+      Set-DeployOutcome $old "$($pr.Version)" $revert
       Write-Phase 'reverted' 'failed' $why
-      Write-Output "outcome=failed revert=$revert deployed=$old"
+      Write-Output (Format-OutcomeLine 'failed' $old "$($pr.Version)" $revert '')
       Write-Audit 'apply-update' $false ("failed: $why; revert=$revert") $payloadBak $auditArgs
       throw "apply-update failed: $why (revert=$revert, old_sha=$old)"
     }
@@ -920,6 +958,7 @@ function Invoke-UpdateStatus {
   $statePath = Join-Path $Data 'apply-update.state.json'
   if (Test-Path -LiteralPath $statePath -PathType Leaf) {
     $phase = 'unknown'; $target = 'unknown'; $oldSha = 'unknown'; $outcome = 'none'; $updated = 'unknown'
+    $extra = [ordered]@{ deployed = 'unknown'; version = 'unknown'; build_sha = 'unknown'; revert = 'unknown' }
     try {
       $st = Get-Content -LiteralPath $statePath -Raw -Encoding utf8 | ConvertFrom-Json
       if ($st.PSObject.Properties['phase']) { $phase = [string]$st.phase }
@@ -927,12 +966,14 @@ function Invoke-UpdateStatus {
       if ($st.PSObject.Properties['old_sha']) { $oldSha = [string]$st.old_sha }
       if ($st.PSObject.Properties['outcome']) { $outcome = [string]$st.outcome }
       if ($st.PSObject.Properties['updated_at']) { $updated = [string]$st.updated_at }
+      foreach ($k in @($extra.Keys)) { if ($st.PSObject.Properties[$k]) { $extra[$k] = [string]$st.$k } }
     } catch { }
     Write-Output "state_phase=$phase"
     Write-Output "state_target=$target"
     Write-Output "state_old_sha=$oldSha"
     Write-Output "state_outcome=$outcome"
     Write-Output "state_updated_at=$updated"
+    foreach ($k in $extra.Keys) { Write-Output "state_$k=$($extra[$k])" }
   } else {
     Write-Output "state=none"
   }

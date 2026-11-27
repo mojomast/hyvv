@@ -460,6 +460,7 @@ from pathlib import Path
 root = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(root))
 result = {"ok": False, "ticket_schema": "unknown", "rizzstack_validators": "absent",
+          "brief_schema": "n/a", "brief_validation": "n/a",
           "modules": {}, "hyvv_version": None, "error": ""}
 errors = []
 
@@ -494,6 +495,35 @@ def check_hyvv_origin(mod):
         return ""
     return "hyvv metadata resolved outside the deploy root"
 
+# A launcher that validates briefs (B4 on) must load the deployed brief schema and its
+# vendored validator must answer: a "unavailable" status is what a broken deploy looks
+# like at runtime, so it fails smoke (and with it, the deploy). A launcher that predates
+# brief validation (a rollback target) reports n/a for both.
+BRIEF_PROBE = {"schema": "rizzstack.brief/1"}
+
+def check_brief(launcher):
+    if not callable(getattr(launcher, "brief_validation", None)):
+        return
+    try:
+        schema = json.loads((root / "schemas" / "rizzstack-brief.schema.json").read_text(encoding="utf-8"))
+        props = schema.get("properties") if isinstance(schema, dict) else None
+        if isinstance(props, dict) and props:
+            result["brief_schema"] = "ok"
+        else:
+            result["brief_schema"] = "no properties"
+            errors.append("brief schema has no properties")
+    except Exception as exc:
+        result["brief_schema"] = "%s: %s" % (type(exc).__name__, exc)
+        errors.append("brief schema: %s" % exc)
+    try:
+        report = launcher.brief_validation(dict(BRIEF_PROBE))
+        status = str(report.get("status")) if isinstance(report, dict) else "not a dict"
+    except Exception as exc:
+        status = "error: %s: %s" % (type(exc).__name__, exc)
+    result["brief_validation"] = status
+    if status not in ("valid", "invalid"):
+        errors.append("brief_validation status is %s after deploy" % status)
+
 launcher = note("launcher")
 if launcher is not None:
     try:
@@ -511,6 +541,7 @@ if launcher is not None:
     except Exception as exc:
         result["ticket_schema"] = "%s: %s" % (type(exc).__name__, exc)
         errors.append("ticket schema: %s" % exc)
+    check_brief(launcher)
 
 runtime = None
 receipt = root / "hyvv-deployed.json"
@@ -590,6 +621,8 @@ def _smoke_result_fields(data):
     return {"ok": bool(data.get("ok")),
             "ticket_schema": str(data.get("ticket_schema", "unknown")),
             "rizzstack_validators": str(data.get("rizzstack_validators", "unknown")),
+            "brief_schema": str(data.get("brief_schema", "unknown")),
+            "brief_validation": str(data.get("brief_validation", "unknown")),
             "modules": modules if isinstance(modules, dict) else {},
             "hyvv_version": str(hyvv_version) if hyvv_version else None,
             "error": str(data.get("error", ""))}
@@ -600,10 +633,12 @@ def smoke(root, python=None, timeout=180):
 
     Never raises: any failure to run or parse the child lands in 'error' with
     ok False. ok means launcher and every runtime module imported from under root,
-    the ticket schema loaded as a dict, and hyvv's module and dist-info metadata
-    both resolved from under root.
+    the ticket schema loaded as a dict, hyvv's module and dist-info metadata both
+    resolved from under root, and (for a launcher with brief validation) the brief
+    schema loaded and brief_validation answered valid/invalid, never "unavailable".
     """
     result = {"ok": False, "ticket_schema": "unknown", "rizzstack_validators": "unknown",
+              "brief_schema": "unknown", "brief_validation": "unknown",
               "modules": {}, "hyvv_version": None, "error": ""}
     exe = python or sys.executable
     # The child runs with cwd=root, so hand it an absolute root (a relative one would
@@ -727,9 +762,11 @@ def _cmd_restore(args):
 
 def _cmd_smoke(args):
     result = smoke(args.root, python=args.python)
-    print("smoke=%s ticket_schema=%s rizzstack_validators=%s modules=%d hyvv_version=%s" % (
+    print("smoke=%s ticket_schema=%s rizzstack_validators=%s brief_schema=%s brief_validation=%s"
+          " modules=%d hyvv_version=%s" % (
         "ok" if result["ok"] else "fail", _one_line(result["ticket_schema"]),
-        result["rizzstack_validators"], len(result["modules"]),
+        result["rizzstack_validators"], _one_line(result["brief_schema"]),
+        _one_line(result["brief_validation"]), len(result["modules"]),
         result["hyvv_version"] if result["hyvv_version"] else "none"))
     if not result["ok"]:
         print("error=%s" % _one_line(result["error"]))

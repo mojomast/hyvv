@@ -343,6 +343,8 @@ def local_import_closure(root: Path) -> set[str]:
 
 RUNTIME_DATA = (
     "schemas/rizzstack-ticket.schema.json",
+    "schemas/rizzstack-brief.schema.json",
+    "schemas/rizzstack-attempt.schema.json",
     "contract/v1/schemas/attempt.json",
     "brief.schema.json",
     "result.schema.json",
@@ -374,9 +376,12 @@ class BuiltWheelPayload(unittest.TestCase):
         closure = local_import_closure(ROOT)
         self.assertIn("provisioning.py", closure)
         self.assertIn("rails_emitter.py", closure)
-        if (ROOT / "hyvv" / "rizzstack_validators.py").is_file():
-            closure.add("hyvv/rizzstack_validators.py")
-        needed = closure | set(RUNTIME_DATA) | {p.relative_to(ROOT).as_posix() for p in (ROOT / "schemas").rglob("*") if p.is_file()}
+        # launcher.py loads rizzstack_validators through its import fallback too, so the
+        # AST walk sees it; name it explicitly anyway with the other B4 runtime file.
+        closure |= {"hyvv/rizzstack_validators.py", "hyvv/ticket_verify.py"}
+        needed = (closure | set(RUNTIME_DATA)
+                  | {p.relative_to(ROOT).as_posix() for p in (ROOT / "schemas").rglob("*") if p.is_file()}
+                  | {p.relative_to(ROOT).as_posix() for p in (ROOT / "contract" / "v1" / "schemas").glob("*.json")})
         missing = sorted(needed - set(self.files))
         self.assertEqual(missing, [], f"runtime files absent from the wheel: {missing}")
 
@@ -399,8 +404,44 @@ class BuiltWheelPayload(unittest.TestCase):
         self.assertIn("hyvv", result["modules"])
         version = re.search(r'^version = "([^"]+)"', (ROOT / "pyproject.toml").read_text("utf-8"), re.M).group(1)
         self.assertEqual(result["hyvv_version"], version)
-        want = "present" if "hyvv/rizzstack_validators.py" in self.files else "absent"
-        self.assertEqual(result["rizzstack_validators"], want)
+        self.assertEqual(result["rizzstack_validators"], "present")
+        self.assertIn("hyvv.rizzstack_validators", result["modules"])
+        self.assertEqual(result["brief_schema"], "ok")
+        self.assertIn(result["brief_validation"], ("valid", "invalid"))
+
+    def test_smoke_fails_without_the_brief_schema(self):
+        """No brief schema means brief_validation answers "unavailable": a failed deploy."""
+        root = self.tmp / "smoke-no-brief-schema"
+        root.mkdir()
+        self.dp.install(self.wheel, root)
+        (root / "schemas" / "rizzstack-brief.schema.json").unlink()
+        result = self.dp.smoke(root)
+        self.assertFalse(result["ok"], result)
+        self.assertNotEqual(result["brief_schema"], "ok")
+        self.assertEqual(result["brief_validation"], "unavailable")
+        self.assertIn("brief_validation status is unavailable", result["error"])
+
+    def test_smoke_fails_when_brief_validation_is_unavailable(self):
+        """The validator module missing from the deploy root: the launcher still imports,
+        but brief_validation reports "unavailable", and smoke fails."""
+        root = self.tmp / "smoke-no-validator"
+        root.mkdir()
+        self.dp.install(self.wheel, root)
+        (root / "hyvv" / "rizzstack_validators.py").unlink()
+        result = self.dp.smoke(root)
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["modules"].get("launcher"), "ok")
+        self.assertEqual(result["brief_validation"], "unavailable")
+
+    def test_cli_smoke_fails_on_unavailable_brief_validation(self):
+        root = self.tmp / "smoke-cli-unavailable"
+        root.mkdir()
+        self.dp.install(self.wheel, root)
+        (root / "hyvv" / "rizzstack_validators.py").unlink()
+        r = run([sys.executable, str(HELPER), "smoke", "--root", str(root)])
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("smoke=fail", r.stdout)
+        self.assertIn("brief_validation=unavailable", r.stdout)
 
     def test_smoke_fails_when_the_hyvv_metadata_is_missing(self):
         """No faked metadata: a host without the dist-info cannot import hyvv, and smoke says so."""
@@ -430,7 +471,9 @@ class BuiltWheelPayload(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("smoke=ok", r.stdout)
         self.assertIn("ticket_schema=ok", r.stdout)
-        self.assertRegex(r.stdout, r"rizzstack_validators=(present|absent)")
+        self.assertIn("rizzstack_validators=present", r.stdout)
+        self.assertIn("brief_schema=ok", r.stdout)
+        self.assertRegex(r.stdout, r"brief_validation=(valid|invalid) ")
 
 
 def function_body(text: str, name: str) -> str:
@@ -469,11 +512,42 @@ class LauncherAdminApplyUpdate(unittest.TestCase):
 
     def test_outcome_is_printed_before_the_revert_restart(self):
         body = function_body(self.text, "Invoke-ApplyUpdate")
-        first_outcome = body.find("outcome=failed")
+        first_outcome = body.find("Format-OutcomeLine 'failed'")
         self.assertGreater(first_outcome, -1)
         revert_restart = body.rfind("Invoke-RestartIdleCore")
         self.assertLess(first_outcome, revert_restart)
-        self.assertIn("outcome=ok", body)
+        self.assertIn("Format-OutcomeLine 'ok'", body)
+
+    def test_post_restart_smoke_failure_reverts(self):
+        """Step 6 smoke (brief schema + brief_validation) runs inside the try whose catch reverts."""
+        body = function_body(self.text, "Invoke-ApplyUpdate")
+        smoke = body.find("post-restart smoke failed")
+        catch = body.find("} catch {", smoke)
+        self.assertGreater(smoke, body.find("Invoke-RestartIdleCore"))
+        self.assertGreater(catch, smoke)
+        self.assertIn("Write-Phase 'reverting'", body[catch:])
+        self.assertIn("Restore-Payload", body[catch:])
+
+    def test_every_outcome_line_names_deployed_version_build_sha_and_revert(self):
+        body = function_body(self.text, "Invoke-ApplyUpdate")
+        self.assertNotRegex(body, r'Write-Output "outcome=')
+        self.assertEqual(len(re.findall(r"Format-OutcomeLine '(ok|failed)'", body)), 3)
+        fmt = function_body(self.text, "Format-OutcomeLine")
+        for key in ("deployed=", "version=", "build_sha=", "revert="):
+            self.assertIn(key, fmt)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh is required to run the outcome formatter")
+    def test_outcome_line_carries_the_build_sha(self):
+        fns = function_body(self.text, "Get-BuildSha") + "\n" + function_body(self.text, "Format-OutcomeLine")
+        cmd = (fns + "\nFormat-OutcomeLine 'ok' '%s' '0.1.19+g521e9bc' 'none' ''"
+               "\nFormat-OutcomeLine 'failed' 'none' '' 'pending' 'target=x why it broke'"
+               "\nFormat-OutcomeLine 'failed' '%s' '0.1.19' 'ok' ''" % (TARGET, OLD))
+        r = run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", cmd])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = r.stdout.strip().splitlines()
+        self.assertEqual(lines[0], f"outcome=ok deployed={TARGET} version=0.1.19+g521e9bc build_sha=521e9bc revert=none")
+        self.assertEqual(lines[1], "outcome=failed deployed=none version=unknown build_sha=none revert=pending reason=target=x why it broke")
+        self.assertEqual(lines[2], f"outcome=failed deployed={OLD} version=0.1.19 build_sha=none revert=ok")
 
     def test_update_status_is_an_allowed_read_only_op(self):
         allowed = re.search(r"\$AllowedOps = @\(([^)]*)\)", self.text).group(1)
@@ -509,6 +583,8 @@ class LauncherAdminApplyUpdate(unittest.TestCase):
             state = data / "apply-update.state.json"
             state.write_text(json.dumps({"op": "apply-update", "target": TARGET, "old_sha": OLD,
                                          "phase": "reverted", "outcome": "failed",
+                                         "deployed": OLD, "version": "0.1.19", "build_sha": "none",
+                                         "revert": "ok",
                                          "started_at": "2026-11-27T12:58:37Z",
                                          "updated_at": "2026-11-27T13:12:45Z"}), encoding="utf-8")
             before = {p.name: p.read_bytes() for p in data.iterdir()}
@@ -521,6 +597,10 @@ class LauncherAdminApplyUpdate(unittest.TestCase):
             self.assertIn("state_phase=reverted", out)
             self.assertIn(f"state_target={TARGET}", out)
             self.assertIn("state_outcome=failed", out)
+            self.assertIn(f"state_deployed={OLD}", out)
+            self.assertIn("state_version=0.1.19", out)
+            self.assertIn("state_build_sha=none", out)
+            self.assertIn("state_revert=ok", out)
             self.assertIn("last_apply_update_ok=no", out)
             self.assertIn("last_apply_update_detail=failed: running launcher reports version", out)
             self.assertIn("lock_held=no", out)
