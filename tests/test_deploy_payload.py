@@ -303,6 +303,28 @@ class WheelPayload(unittest.TestCase):
         self.assertIn("missing: launcher.py", r.stdout)
 
 
+def _imported_names(tree: ast.AST) -> list[str]:
+    names = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names += [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            names.append(node.module)
+            names += [f"{node.module}.{a.name}" for a in node.names]
+    return names
+
+
+def _local_file(root: Path, name: str) -> str | None:
+    """The repo file a dotted import name resolves to (longest prefix), or None."""
+    parts = name.split(".")
+    for i in range(len(parts), 0, -1):
+        for hit in (root.joinpath(*parts[:i]).with_suffix(".py"), root.joinpath(*parts[:i], "__init__.py")):
+            if hit.is_file():
+                rel = hit.relative_to(root).as_posix()
+                return None if rel.startswith("tests") else rel
+    return None
+
+
 def local_import_closure(root: Path) -> set[str]:
     """Repo-relative .py files launcher.py reaches through imports of modules that live in this repo."""
     seen: set[str] = set()
@@ -312,23 +334,10 @@ def local_import_closure(root: Path) -> set[str]:
         if rel in seen:
             continue
         seen.add(rel)
-        tree = ast.parse((root / rel).read_text("utf-8"))
-        names = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                names += [a.name for a in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-                names.append(node.module)
-                names += [f"{node.module}.{a.name}" for a in node.names]
-        for name in names:
-            parts = name.split(".")
-            for i in range(len(parts), 0, -1):
-                mod = root.joinpath(*parts[:i]).with_suffix(".py")
-                pkg = root.joinpath(*parts[:i], "__init__.py")
-                hit = mod if mod.is_file() else pkg if pkg.is_file() else None
-                if hit and not str(hit.relative_to(root)).startswith("tests"):
-                    todo.append(hit.relative_to(root).as_posix())
-                    break
+        for name in _imported_names(ast.parse((root / rel).read_text("utf-8"))):
+            hit = _local_file(root, name)
+            if hit:
+                todo.append(hit)
     return seen
 
 
