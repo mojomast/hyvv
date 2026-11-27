@@ -1,8 +1,10 @@
 # Limited launcher admin for moltussy Hermes.
 # Forced-command only: parse SSH_ORIGINAL_COMMAND (or argv when run locally). No shell eval.
 # Writes may change config.json "projects" entries only.
-# 'logs' is read-only. 'apply-update' swaps a fixed list of launcher payload files from a
-# dedicated hyvv checkout (never scripts/, config, keys or tokens) and restarts when idle.
+# 'logs' and 'update-status' are read-only. 'apply-update' builds the hyvv wheel from a
+# dedicated checkout, installs the wheel's runtime files (never scripts/, config, keys or
+# tokens) into the install dir, proves the running build by its describe sha, and restarts
+# when idle.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3.0
 
@@ -14,7 +16,7 @@ if (-not (Get-Variable -Name Python -Scope Script -ErrorAction SilentlyContinue)
 $FixturesRoot = Join-Path $env:USERPROFILE 'orbit-worker-fixtures'
 $LockPath = Join-Path $Data 'admin.lock'
 $AuditPath = Join-Path $Data 'admin-audit.jsonl'
-$AllowedOps = @('status','list-projects','add-project','remove-project','restart-idle','logs','apply-update')
+$AllowedOps = @('status','list-projects','add-project','remove-project','restart-idle','logs','apply-update','update-status')
 $ForbiddenConfigKeys = @('bind','extra_binds','go_key_file','deepseek_key_file','api_token_file','token','tokens','coordinators')
 $BeeActiveStates = @('starting','running','cancel_requested')
 $RestartWaitSeconds = 1800
@@ -27,17 +29,19 @@ $AttemptIdPattern = '^att_[0-9a-f]{8,32}$'
 $LogsDefaultLines = 200
 $LogsMaxLines = 1000
 
-# --- apply-update: the two constants filled in at apply time ---
+# --- apply-update constants ---
 # No credential is read by this script: idle = strict attempts-journal check, liveness = unauthenticated
 # loopback 401 + its Server header, deployed version = hyvv-deployed.json written at install time.
-# BLOCKER (2026-11-12): this checkout does not exist yet, and hyvv origin/main does not contain
-# the launcher (PR #1 unmerged). Create it with a plain clone of mojomast/hyvv owned by kyle.
-# It must NOT be a bee fixture under orbit-worker-fixtures (bees/sync touch those).
+# The checkout must be a plain clone of mojomast/hyvv owned by kyle. It must NOT be a bee
+# fixture under orbit-worker-fixtures (bees/sync touch those).
 $HyvvCheckout = Join-Path $env:USERPROFILE 'hyvv-deploy'
-# "Install" = copy exactly these files from the checkout into $Root (the dir start.ps1 runs
-# launcher.py from), then warm the same uv env start.ps1 uses. scripts\*.ps1 (including this file),
-# config.json, *.token and *.key are never copied, so a merge to main cannot rewrite these guardrails.
-$InstallPayload = @('launcher.py','agy_cua_mcp.py','brief.schema.json','result.schema.json','provisioning.py','landing_export.py')
+# "Install" = build the wheel from the checkout (uv build --wheel), then let deploy_payload.py
+# copy the wheel's runtime files into $Root (the dir start.ps1 runs launcher.py from) and prove
+# the copy byte-for-byte, then warm the same uv env start.ps1 uses. The helper ships beside this
+# script and is NEVER taken from the checkout; scripts\*.ps1 (including this file), config.json,
+# *.token and *.key are never in the wheel's runtime set, so a merge to main cannot rewrite
+# these guardrails.
+$DeployHelper = Join-Path $ScriptDir 'deploy_payload.py'
 $InstallUvArgs = @('run','-q','--python',$Python,'--with','cua==0.5.0','python','-c','import cua')
 $HyvvRepoName = 'hyvv'
 $HyvvOriginUrl = 'https://github.com/mojomast/hyvv.git'
@@ -583,6 +587,47 @@ function Invoke-Git([string[]]$gitArgs, [switch]$AllowFail) {
   return [pscustomobject]@{ Code = $code; Out = $out.Trim() }
 }
 
+function Invoke-DeployHelper([string[]]$a) {
+  # The deploy helper ships beside this script and is never taken from the checkout. Same uv
+  # interpreter the launcher uses; stderr is merged with $ErrorActionPreference relaxed (like
+  # Invoke-Git) so a chatty uv cannot trip Stop before the exit-code check.
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $raw = & uv run -q --python $Python python $DeployHelper @a 2>&1 | Out-String
+    $code = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $prevEap
+  }
+  $out = (Write-Scrubbed $raw | Out-String).Trim()
+  return @{ Code = $code; Out = $out }
+}
+
+# Apply-update progress: every phase goes to the output AND to $Data\apply-update.state.json
+# (atomic tmp + Move-Item), so the read-only 'update-status' op can show where a run is even
+# after the admin channel that started it has timed out.
+$script:DeployState = $null
+function Write-Phase([string]$phase, [string]$outcome, [string]$reason) {
+  $elapsed = 0
+  if ($null -ne $script:DeployState) { $elapsed = [int]((Get-Date) - $script:DeployState['started']).TotalSeconds }
+  Write-Output ("phase={0} t={1}" -f $phase, $elapsed)
+  if ($null -eq $script:DeployState) { return }
+  $rec = [ordered]@{
+    op = 'apply-update'
+    target = [string]$script:DeployState['target']
+    old_sha = [string]$script:DeployState['old_sha']
+    phase = $phase
+    started_at = [string]$script:DeployState['started_at']
+    updated_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  }
+  if ($outcome) { $rec['outcome'] = $outcome }
+  if ($reason) { $rec['reason'] = $reason }
+  $dest = Join-Path $Data 'apply-update.state.json'
+  $tmp = "$dest.tmp-admin"
+  Set-Content -LiteralPath $tmp -Value ($rec | ConvertTo-Json -Depth 4 -Compress) -Encoding utf8
+  Move-Item -LiteralPath $tmp -Destination $dest -Force
+}
+
 function Get-JournalSnapshot {
   # Strict read of the launcher's own attempt journal (attempts\<id>.json, written atomically by
   # launcher.py via tmp + os.replace on every state change). Any fact we cannot establish -> throw.
@@ -641,9 +686,16 @@ function Get-LoopbackServerVersion {
 
 function Get-FileSha256([string]$path) { (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
 
-function Write-DeployedVersion([string]$sha, [string]$version) {
+function Get-WheelRuntimeFiles([string]$wheel) {
+  $r = Invoke-DeployHelper @('files','--wheel',$wheel)
+  if ($r.Code -ne 0) { throw "deploy helper could not list the wheel's runtime files: $($r.Out)" }
+  return @($r.Out -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+}
+
+function Write-DeployedVersion([string]$sha, [string]$version, [string]$wheel) {
+  # The receipt's files map covers the wheel's whole runtime file list.
   $files = [ordered]@{}
-  foreach ($rel in $InstallPayload) { $files[$rel] = Get-FileSha256 (Join-Path $Root $rel) }
+  foreach ($rel in (Get-WheelRuntimeFiles $wheel)) { $files[$rel] = Get-FileSha256 (Join-Path $Root $rel) }
   $rec = [ordered]@{ repo = 'mojomast/hyvv'; sha = $sha; version = $version; installed_at_utc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); files = $files }
   $dest = Join-Path $Root $DeployedVersionFile
   $tmp = "$dest.tmp-admin"
@@ -652,7 +704,8 @@ function Write-DeployedVersion([string]$sha, [string]$version) {
 }
 
 function Get-DeployedVersion {
-  # Never throws: absent/unreadable/stale file -> status 'unknown / mismatch'.
+  # Never throws: absent/unreadable/stale file -> status 'unknown / mismatch'. The receipt's
+  # own files map is the payload list, so this never needs the wheel.
   $p = Join-Path $Root $DeployedVersionFile
   $out = [ordered]@{ status = 'unknown / mismatch'; sha = $null; version = $null; installed_at_utc = $null }
   if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return [pscustomobject]$out }
@@ -663,9 +716,14 @@ function Get-DeployedVersion {
     # Read the timestamp textually: PS 7's ConvertFrom-Json turns ISO strings into local DateTime.
     if ($rawJson -match '"installed_at_utc"\s*:\s*"([0-9TZ:-]+)"') { $out.installed_at_utc = $Matches[1] }
     $match = $true
-    foreach ($rel in $InstallPayload) {
+    $filesProp = $d.PSObject.Properties['files']
+    $names = @()
+    if ($filesProp -and $filesProp.Value) { $names = @($filesProp.Value.PSObject.Properties | ForEach-Object { $_.Name }) }
+    if ($names.Count -eq 0) { $match = $false }
+    foreach ($rel in $names) {
       $f = Join-Path $Root $rel
-      $want = $null; if ($d.files -and $d.files.PSObject.Properties[$rel]) { $want = [string]$d.files.$rel }
+      $prop = $filesProp.Value.PSObject.Properties[$rel]
+      $want = $null; if ($prop) { $want = [string]$prop.Value }
       if (-not $want -or -not (Test-Path -LiteralPath $f -PathType Leaf) -or (Get-FileSha256 $f) -ne $want) { $match = $false }
     }
     if ($match -and $out.sha -match '^[0-9a-f]{40}$') { $out.status = 'match' }
@@ -685,39 +743,56 @@ function Get-PayloadVersion([string]$dir) {
   return $m.Matches[0].Groups[1].Value
 }
 
-function Backup-Payload {
+function Invoke-BuildWheel {
+  # The wheel is the only payload source. It is built into a fresh dir under $Data (never into
+  # the checkout), exactly one hyvv-*.whl must result, and the checkout must still be clean.
+  $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+  $outDir = Join-Path $Data ("wheel-build-{0}" -f $stamp)
+  New-Item -ItemType Directory -Force $outDir | Out-Null
+  $buildArgs = @('build','--wheel','--out-dir',$outDir,$HyvvCheckout)
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $out = & uv @buildArgs 2>&1 | Out-String
+    $code = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $prevEap
+  }
+  if ($code -ne 0) { throw "uv build failed (exit $code): $((Write-Scrubbed $out) -join ' ')" }
+  $wheels = @(Get-ChildItem -LiteralPath $outDir -Filter 'hyvv-*.whl' -File -ErrorAction Stop)
+  if ($wheels.Count -ne 1) { throw "uv build produced $($wheels.Count) hyvv wheels, expected exactly one" }
+  $wheelPath = $wheels[0].FullName
+  Test-NotReparsePoint $wheelPath
+  $dirty = (Invoke-Git @('status','--porcelain','--untracked-files=all')).Out
+  if ($dirty) { throw 'hyvv checkout is dirty after the wheel build; refusing' }
+  return $wheelPath
+}
+
+function Backup-Payload([string]$wheel) {
   $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
   $dir = Join-Path $Data ("payload.bak-apply-update-{0}" -f $stamp)
   New-Item -ItemType Directory -Force $dir | Out-Null
-  foreach ($rel in @($InstallPayload + $DeployedVersionFile)) {
-    $src = Join-Path $Root $rel
-    if (Test-Path -LiteralPath $src -PathType Leaf) { Copy-Item -LiteralPath $src -Destination (Join-Path $dir $rel) -Force }
-  }
+  $r = Invoke-DeployHelper @('backup','--wheel',$wheel,'--root',$Root,'--dest',$dir)
+  if ($r.Code -ne 0) { throw "payload backup failed: $($r.Out)" }
   return $dir
 }
 
 function Restore-Payload([string]$dir) {
-  foreach ($rel in $InstallPayload) {
-    $b = Join-Path $dir $rel
-    if (Test-Path -LiteralPath $b -PathType Leaf) { Copy-Item -LiteralPath $b -Destination (Join-Path $Root $rel) -Force }
-  }
-  $vb = Join-Path $dir $DeployedVersionFile; $vl = Join-Path $Root $DeployedVersionFile
-  if (Test-Path -LiteralPath $vb -PathType Leaf) { Copy-Item -LiteralPath $vb -Destination $vl -Force }
-  elseif (Test-Path -LiteralPath $vl) { Remove-Item -LiteralPath $vl -Force }
+  $r = Invoke-DeployHelper @('restore','--backup',$dir,'--root',$Root)
+  if ($r.Code -ne 0) { throw "payload restore failed: $($r.Out)" }
 }
 
-function Invoke-Install {
-  # Validate everything in the checkout first, then copy, so a half-copied payload is unlikely.
-  foreach ($rel in $InstallPayload) {
-    $src = Join-Path $HyvvCheckout $rel
-    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { throw "checkout is missing $rel" }
-    Test-NotReparsePoint $src
-  }
+function Invoke-Install([string]$wheel) {
+  # Syntax-gate the checkout's launcher first, then install the wheel's runtime files, prove
+  # the copy byte-for-byte and import-prove the installed tree, all before any restart.
   $comp = & uv run -q --python $Python python -m py_compile (Join-Path $HyvvCheckout 'launcher.py') (Join-Path $HyvvCheckout 'agy_cua_mcp.py') 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "py_compile failed: $((Write-Scrubbed $comp) -join ' ')" }
-  foreach ($rel in $InstallPayload) {
-    Copy-Item -LiteralPath (Join-Path $HyvvCheckout $rel) -Destination (Join-Path $Root $rel) -Force
-  }
+  $r = Invoke-DeployHelper @('install','--wheel',$wheel,'--root',$Root)
+  if ($r.Code -ne 0) { throw "payload install failed: $($r.Out)" }
+  $v = Invoke-DeployHelper @('verify-root','--wheel',$wheel,'--root',$Root)
+  if ($v.Code -ne 0) { throw "post-copy check failed: $($v.Out)" }
+  $s = Invoke-DeployHelper @('smoke','--root',$Root)
+  if ($s.Code -ne 0) { throw "pre-restart smoke failed: $($s.Out)" }
   $warm = & uv @InstallUvArgs 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "uv env warm-up failed: $((Write-Scrubbed $warm) -join ' ')" }
 }
@@ -736,6 +811,8 @@ function Invoke-ApplyUpdate([string[]]$argv) {
   }
   $lock = Acquire-AdminLock
   try {
+    $script:DeployState = @{ target = $ref; old_sha = $null; started = Get-Date; started_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+    Write-Phase 'locked'
     try {
       if (-not (Test-Path -LiteralPath (Join-Path $HyvvCheckout '.git'))) { throw "hyvv checkout not found at $HyvvCheckout" }
       Test-NotReparsePoint $HyvvCheckout
@@ -745,6 +822,7 @@ function Invoke-ApplyUpdate([string[]]$argv) {
       if ($dirty) { throw 'hyvv checkout is dirty; refusing' }
       $old = (Invoke-Git @('rev-parse','--verify','HEAD^{commit}')).Out
       $auditArgs.old_sha = $old
+      $script:DeployState['old_sha'] = $old
       [void](Invoke-Git @('fetch','--prune','--no-tags','origin','+refs/heads/main:refs/remotes/origin/main'))
       $r = Invoke-Git @('rev-parse','--verify','--quiet',"$ref^{commit}") -AllowFail
       if ($r.Code -ne 0 -or $r.Out -notmatch '^[0-9a-f]{40}$') { throw 'ref does not resolve to exactly one commit' }
@@ -752,9 +830,12 @@ function Invoke-ApplyUpdate([string[]]$argv) {
       # A hex-looking branch/tag name could shadow a short sha: the resolved sha must start with what was asked for.
       if (-not $new.StartsWith($ref)) { throw 'ref resolved to a different object (ambiguous name); refusing' }
       $auditArgs.new_sha = $new
+      $script:DeployState['target'] = $new
       $anc = Invoke-Git @('merge-base','--is-ancestor',$new,$HyvvMainRef) -AllowFail
       if ($anc.Code -ne 0) { throw 'commit is not on origin/main; refusing' }
+      Write-Phase 'fetched'
       [void](Assert-HostIdle)
+      Write-Phase 'idle'
       $dv = Get-DeployedVersion
       $auditArgs.version_before = $(if ($dv.status -eq 'match') { "$($dv.version)@$($dv.sha)" } else { 'unknown / mismatch' })
     } catch {
@@ -763,43 +844,126 @@ function Invoke-ApplyUpdate([string[]]$argv) {
     }
 
     if ($new -eq $old) { Write-Output "note=checkout already at $new; reinstalling and restarting" }
-    $payloadBak = Backup-Payload
-    $auditArgs.payload_backup = $payloadBak
+    $payloadBak = $null
     try {
       [void](Invoke-Git @('checkout','--detach','--quiet',$new))
       if ((Invoke-Git @('rev-parse','HEAD')).Out -ne $new) { throw 'checkout did not land on the requested commit' }
+      # The wheel is built before the backup so the backup covers the new runtime set.
+      $wheel = Invoke-BuildWheel
+      Write-Phase 'built'
+      $payloadBak = Backup-Payload $wheel
+      $auditArgs.payload_backup = $payloadBak
+      Write-Phase 'backed-up'
       $want = Get-PayloadVersion $HyvvCheckout
-      Invoke-Install
-      Write-DeployedVersion $new $want
+      Invoke-Install $wheel
+      Write-DeployedVersion $new $want $wheel
       $dv1 = Get-DeployedVersion
       if ($dv1.status -ne 'match' -or $dv1.sha -ne $new) { throw 'version file did not read back as the new sha' }
+      Write-Phase 'installed'
+      Write-Phase 'restarting'
       Invoke-RestartIdleCore          # waits for loopback 401/200 (unauthenticated) = process listening
+      Write-Phase 'verifying'
       $probe = Get-LoopbackServerVersion
       if ($probe.Code -ne 401 -and $probe.Code -ne 200) { throw "launcher not listening after restart (http=$($probe.Code))" }
-      if ($probe.Version -ne $want) { throw "running launcher reports version '$($probe.Version)', expected $want" }
+      if (-not $probe.Version) { throw 'launcher did not report a build version after restart' }
+      $cv = Invoke-DeployHelper @('check-version','--running',"$($probe.Version)",'--want',$want,'--target',$new,'--target-launcher',(Join-Path $Root 'launcher.py'))
+      if ($cv.Code -ne 0) { throw "version check failed: $($cv.Out)" }
+      $sm = Invoke-DeployHelper @('smoke','--root',$Root)
+      if ($sm.Code -ne 0) { throw "post-restart smoke failed: $($sm.Out)" }
       if (-not (Test-LauncherRunsFromRoot)) { throw 'no launcher process is running launcher.py from the install dir' }
-      $auditArgs.version_after = "$want@$new"
+      $auditArgs.version_after = "$($probe.Version)@$new"
+      Write-Phase 'done' 'ok'
       Write-Audit 'apply-update' $true "updated $old -> $new" $payloadBak $auditArgs
+      Write-Output "outcome=ok deployed=$new version=$($probe.Version) revert=none"
       Write-Output "ok=yes op=apply-update old_sha=$old new_sha=$new version=$want deployed=$($dv1.status) payload_backup=$payloadBak"
     } catch {
       $why = [string]$_.Exception.Message
+      Write-Output "outcome=failed reason=$why revert=pending old_sha=$old"
+      Write-Phase 'failed' 'failed' $why
       Write-Output "apply_update_failed; reverting to $old"
       $auditArgs.rolled_back = $true
       $revert = 'ok'
+      Write-Phase 'reverting'
       try { [void](Invoke-Git @('checkout','--detach','--quiet',$old)) } catch { $revert = 'checkout-failed' }
       # Restore the exact bytes that were running before (they may predate the checkout).
-      try { Restore-Payload $payloadBak } catch { $revert = 'restore-failed' }
+      if ($payloadBak) { try { Restore-Payload $payloadBak } catch { $revert = 'restore-failed' } }
       try { Invoke-RestartIdleCore } catch { $revert = "$revert,restart-failed" }
       $pr = Get-LoopbackServerVersion
       if ($pr.Code -ne 401 -and $pr.Code -ne 200) { $revert = "$revert,not-listening" }
+      elseif (-not $pr.Version) { $revert = "$revert,version-mismatch" }
+      else {
+        try {
+          $cvOld = Invoke-DeployHelper @('check-version','--running',"$($pr.Version)",'--want',(Get-PayloadVersion $Root),'--target',$old,'--target-launcher',(Join-Path $Root 'launcher.py'))
+          if ($cvOld.Code -ne 0) { $revert = "$revert,version-mismatch" }
+        } catch { $revert = "$revert,version-mismatch" }
+      }
       $dvr = Get-DeployedVersion
       $auditArgs.version_after = "running=$($pr.Version) deployed=$($dvr.status)"
+      Write-Phase 'reverted' 'failed' $why
+      Write-Output "outcome=failed revert=$revert deployed=$old"
       Write-Audit 'apply-update' $false ("failed: $why; revert=$revert") $payloadBak $auditArgs
       throw "apply-update failed: $why (revert=$revert, old_sha=$old)"
     }
   } finally {
     $lock.Close()
   }
+}
+
+function Invoke-UpdateStatus {
+  # Read-only: reports the apply-update state file, the last apply-update audit record and
+  # whether the admin lock is held. Creates nothing and changes nothing.
+  Write-Output "ok=yes op=update-status"
+  $statePath = Join-Path $Data 'apply-update.state.json'
+  if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+    $phase = 'unknown'; $target = 'unknown'; $oldSha = 'unknown'; $outcome = 'none'; $updated = 'unknown'
+    try {
+      $st = Get-Content -LiteralPath $statePath -Raw -Encoding utf8 | ConvertFrom-Json
+      if ($st.PSObject.Properties['phase']) { $phase = [string]$st.phase }
+      if ($st.PSObject.Properties['target']) { $target = [string]$st.target }
+      if ($st.PSObject.Properties['old_sha']) { $oldSha = [string]$st.old_sha }
+      if ($st.PSObject.Properties['outcome']) { $outcome = [string]$st.outcome }
+      if ($st.PSObject.Properties['updated_at']) { $updated = [string]$st.updated_at }
+    } catch { }
+    Write-Output "state_phase=$phase"
+    Write-Output "state_target=$target"
+    Write-Output "state_old_sha=$oldSha"
+    Write-Output "state_outcome=$outcome"
+    Write-Output "state_updated_at=$updated"
+  } else {
+    Write-Output "state=none"
+  }
+  $last = $null
+  if (Test-Path -LiteralPath $AuditPath -PathType Leaf) {
+    foreach ($line in @(Get-Content -LiteralPath $AuditPath -Encoding utf8)) {
+      if ([string]::IsNullOrWhiteSpace($line)) { continue }
+      try { $rec = $line | ConvertFrom-Json } catch { continue }
+      if ($rec -and $rec.PSObject.Properties['op'] -and [string]$rec.op -eq 'apply-update') { $last = $rec }
+    }
+  }
+  if ($null -eq $last) {
+    Write-Output "last_apply_update=none"
+  } else {
+    $ts = ''; if ($last.PSObject.Properties['ts']) { $ts = [string]$last.ts }
+    $okv = 'no'; if ($last.PSObject.Properties['ok'] -and $last.ok) { $okv = 'yes' }
+    $detail = ''; if ($last.PSObject.Properties['detail']) { $detail = [string]$last.detail }
+    Write-Output "last_apply_update_ts=$ts"
+    Write-Output "last_apply_update_ok=$okv"
+    Write-Output ("last_apply_update_detail=" + (Format-RedactedLogLine $detail))
+  }
+  $held = 'no'
+  if (Test-Path -LiteralPath $LockPath -PathType Leaf) {
+    $fs = $null
+    try {
+      $fs = [System.IO.File]::Open($LockPath, 'Open', 'Read', 'ReadWrite')
+    } catch [System.IO.IOException] {
+      $held = 'yes'
+    } catch {
+      $held = 'no'
+    } finally {
+      if ($fs) { $fs.Close() }
+    }
+  }
+  Write-Output "lock_held=$held"
 }
 
 # --- entry ---
@@ -821,6 +985,7 @@ try {
     'restart-idle' { Invoke-RestartIdle }
     'logs' { Invoke-Logs $rest }
     'apply-update' { Invoke-ApplyUpdate $rest }
+    'update-status' { Invoke-UpdateStatus }
   }
   exit 0
 } catch {
