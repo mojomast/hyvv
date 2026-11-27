@@ -22,6 +22,16 @@ $BeeActiveStates = @('starting','running','cancel_requested')
 $RestartWaitSeconds = 1800
 $HealthRetries = 20
 $HealthDelaySeconds = 3
+# Post-restart startup wait: start.ps1 waits this many wall-clock seconds for loopback health
+# (passed down as HYVV_START_HEALTH_WAIT_S). A host with ~1300 journalled attempts measured
+# ~414 s from process start to listening, so the default leaves ~3x margin. Override with the
+# machine/user environment variable HYVV_ADMIN_START_HEALTH_WAIT_S (whole seconds, 60-7200).
+$StartHealthWaitSeconds = 1200
+if ($env:HYVV_ADMIN_START_HEALTH_WAIT_S -match '^[0-9]{2,4}$') {
+  $v = [int]$env:HYVV_ADMIN_START_HEALTH_WAIT_S
+  if ($v -ge 60 -and $v -le 7200) { $StartHealthWaitSeconds = $v }
+}
+$script:LastStartupSeconds = $null
 
 # --- logs ---
 $AttemptsDir = Join-Path $Data 'attempts'
@@ -467,6 +477,7 @@ function Invoke-RemoveProject([string[]]$argv) {
 
 function Invoke-StartDetached {
   # start.ps1 already detaches uv; it also calls status.ps1, whose errors may include a bind address.
+  $env:HYVV_START_HEALTH_WAIT_S = [string]$StartHealthWaitSeconds
   $out = & "$ScriptDir\start.ps1" 2>&1 | Out-String
   Write-Scrubbed $out
   if ($LASTEXITCODE -ne 0) { throw "start.ps1 exited $LASTEXITCODE" }
@@ -480,6 +491,7 @@ function Invoke-RestartIdle {
 # Caller must hold the admin lock (FileShare.None, so re-acquiring here would self-deadlock).
 function Invoke-RestartIdleCore {
   $backup = $null
+  $script:LastStartupSeconds = $null
   try {
     $backup = Backup-Config 'restart-idle'
     $active = Get-ActiveBeeCount
@@ -497,12 +509,15 @@ function Invoke-RestartIdleCore {
     $stopOut = & "$ScriptDir\stop.ps1" 2>&1 | Out-String
     Write-Scrubbed $stopOut
     if ($LASTEXITCODE -ne 0) { throw "stop.ps1 exited $LASTEXITCODE" }
+    $startT0 = Get-Date
     try {
       Invoke-StartDetached
       $code = Wait-LauncherHealthy
-      Write-Audit 'restart-idle' $true "restarted, health_http=$code" $backup @{ bee_active_before = 0 }
-      Write-Output "ok=yes op=restart-idle health_http=$code backup=$backup"
+      $script:LastStartupSeconds = [int]((Get-Date) - $startT0).TotalSeconds
+      Write-Audit 'restart-idle' $true "restarted, health_http=$code startup_s=$($script:LastStartupSeconds)" $backup @{ bee_active_before = 0; startup_s = $script:LastStartupSeconds }
+      Write-Output "ok=yes op=restart-idle health_http=$code startup_s=$($script:LastStartupSeconds) health_wait_s=$StartHealthWaitSeconds backup=$backup"
     } catch {
+      $script:LastStartupSeconds = [int]((Get-Date) - $startT0).TotalSeconds
       Write-Output "start_or_health_failed; restoring backup and restarting"
       if (Test-Path -LiteralPath $backup) { Copy-Item -LiteralPath $backup -Destination $Config -Force }
       & "$ScriptDir\stop.ps1" 2>&1 | Out-String | ForEach-Object { Write-Scrubbed $_ } | Out-Null
@@ -618,17 +633,19 @@ function Get-BuildSha([string]$version) {
 # The one outcome line apply-update prints (and mirrors into the state file): what is deployed,
 # the running version, the build sha that version proves, and the revert result. The free-text
 # reason, when there is one, always comes last.
-function Format-OutcomeLine([string]$outcome, [string]$deployed, [string]$version, [string]$revert, [string]$reason) {
+function Format-OutcomeLine([string]$outcome, [string]$deployed, [string]$version, [string]$revert, [string]$startup, [string]$reason) {
   if (-not $deployed) { $deployed = 'none' }
   if (-not $version) { $version = 'unknown' }
   if (-not $revert) { $revert = 'none' }
-  $line = "outcome=$outcome deployed=$deployed version=$version build_sha=$(Get-BuildSha $version) revert=$revert"
+  if (-not $startup) { $startup = 'none' }
+  $line = "outcome=$outcome deployed=$deployed version=$version build_sha=$(Get-BuildSha $version) revert=$revert startup_s=$startup"
   if ($reason) { $line = "$line reason=$reason" }
   return $line
 }
 
-function Set-DeployOutcome([string]$deployed, [string]$version, [string]$revert) {
+function Set-DeployOutcome([string]$deployed, [string]$version, [string]$revert, [string]$startup) {
   if ($null -eq $script:DeployState) { return }
+  $script:DeployState['startup_s'] = $(if ($startup) { $startup } else { 'none' })
   $script:DeployState['deployed'] = $deployed
   $script:DeployState['version'] = $(if ($version) { $version } else { 'unknown' })
   $script:DeployState['build_sha'] = Get-BuildSha $version
@@ -650,7 +667,7 @@ function Write-Phase([string]$phase, [string]$outcome, [string]$reason) {
   }
   if ($outcome) { $rec['outcome'] = $outcome }
   if ($reason) { $rec['reason'] = $reason }
-  foreach ($k in @('deployed','version','build_sha','revert')) {
+  foreach ($k in @('deployed','version','build_sha','revert','startup_s')) {
     if ($script:DeployState.ContainsKey($k) -and $script:DeployState[$k]) { $rec[$k] = [string]$script:DeployState[$k] }
   }
   $dest = Join-Path $Data 'apply-update.state.json'
@@ -836,7 +853,7 @@ function Invoke-ApplyUpdate([string[]]$argv) {
   if ($argv.Count -lt 1 -or $argv.Count -gt 2) { throw 'usage: apply-update <commit-sha> [hyvv]' }
   $ref = $argv[0]
   $repo = if ($argv.Count -eq 2) { $argv[1] } else { $HyvvRepoName }
-  $auditArgs = [ordered]@{ repo = $repo; ref = $ref; old_sha = $null; new_sha = $null; version_before = $null; version_after = $null; build_sha = $null; payload_backup = $null; rolled_back = $false }
+  $auditArgs = [ordered]@{ repo = $repo; ref = $ref; old_sha = $null; new_sha = $null; version_before = $null; version_after = $null; build_sha = $null; startup_s = $null; payload_backup = $null; rolled_back = $false }
   try {
     if ($repo -cne $HyvvRepoName) { throw "repo must be '$HyvvRepoName'" }
     if ($ref -cnotmatch '^[0-9a-f]{7,40}$') { throw 'ref must be a lowercase commit sha (7-40 hex); branches and tags are refused' }
@@ -909,16 +926,19 @@ function Invoke-ApplyUpdate([string[]]$argv) {
       if (-not (Test-LauncherRunsFromRoot)) { throw 'no launcher process is running launcher.py from the install dir' }
       $auditArgs.version_after = "$($probe.Version)@$new"
       $auditArgs.build_sha = Get-BuildSha "$($probe.Version)"
-      Set-DeployOutcome $new "$($probe.Version)" 'none'
+      $auditArgs.startup_s = $script:LastStartupSeconds
+      $startupS = "$($script:LastStartupSeconds)"
+      Set-DeployOutcome $new "$($probe.Version)" 'none' $startupS
       Write-Phase 'done' 'ok'
       Write-Audit 'apply-update' $true "updated $old -> $new" $payloadBak $auditArgs
-      Write-Output (Format-OutcomeLine 'ok' $new "$($probe.Version)" 'none' '')
+      Write-Output (Format-OutcomeLine 'ok' $new "$($probe.Version)" 'none' $startupS '')
       Write-Output "ok=yes op=apply-update old_sha=$old new_sha=$new version=$want deployed=$($dv1.status) payload_backup=$payloadBak"
     } catch {
       $why = [string]$_.Exception.Message
       $failedVersion = $(if ($probe) { "$($probe.Version)" } else { '' })
-      Set-DeployOutcome 'none' $failedVersion 'pending'
-      Write-Output (Format-OutcomeLine 'failed' 'none' $failedVersion 'pending' "target=$new old_sha=$old $why")
+      $failedStartup = "$($script:LastStartupSeconds)"
+      Set-DeployOutcome 'none' $failedVersion 'pending' $failedStartup
+      Write-Output (Format-OutcomeLine 'failed' 'none' $failedVersion 'pending' $failedStartup "target=$new old_sha=$old $why")
       Write-Phase 'failed' 'failed' $why
       Write-Output "apply_update_failed; reverting to $old"
       $auditArgs.rolled_back = $true
@@ -940,9 +960,11 @@ function Invoke-ApplyUpdate([string[]]$argv) {
       $dvr = Get-DeployedVersion
       $auditArgs.version_after = "running=$($pr.Version) deployed=$($dvr.status)"
       $auditArgs.build_sha = Get-BuildSha "$($pr.Version)"
-      Set-DeployOutcome $old "$($pr.Version)" $revert
+      $auditArgs.startup_s = $script:LastStartupSeconds
+      $revertStartup = "$($script:LastStartupSeconds)"
+      Set-DeployOutcome $old "$($pr.Version)" $revert $revertStartup
       Write-Phase 'reverted' 'failed' $why
-      Write-Output (Format-OutcomeLine 'failed' $old "$($pr.Version)" $revert '')
+      Write-Output (Format-OutcomeLine 'failed' $old "$($pr.Version)" $revert $revertStartup '')
       Write-Audit 'apply-update' $false ("failed: $why; revert=$revert") $payloadBak $auditArgs
       throw "apply-update failed: $why (revert=$revert, old_sha=$old)"
     }
@@ -958,7 +980,7 @@ function Invoke-UpdateStatus {
   $statePath = Join-Path $Data 'apply-update.state.json'
   if (Test-Path -LiteralPath $statePath -PathType Leaf) {
     $phase = 'unknown'; $target = 'unknown'; $oldSha = 'unknown'; $outcome = 'none'; $updated = 'unknown'
-    $extra = [ordered]@{ deployed = 'unknown'; version = 'unknown'; build_sha = 'unknown'; revert = 'unknown' }
+    $extra = [ordered]@{ deployed = 'unknown'; version = 'unknown'; build_sha = 'unknown'; revert = 'unknown'; startup_s = 'unknown' }
     try {
       $st = Get-Content -LiteralPath $statePath -Raw -Encoding utf8 | ConvertFrom-Json
       if ($st.PSObject.Properties['phase']) { $phase = [string]$st.phase }

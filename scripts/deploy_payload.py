@@ -460,7 +460,7 @@ from pathlib import Path
 root = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(root))
 result = {"ok": False, "ticket_schema": "unknown", "rizzstack_validators": "absent",
-          "brief_schema": "n/a", "brief_validation": "n/a",
+          "brief_schema": "n/a", "attempt_schema": "n/a", "brief_validation": "n/a",
           "modules": {}, "hyvv_version": None, "error": ""}
 errors = []
 
@@ -495,34 +495,54 @@ def check_hyvv_origin(mod):
         return ""
     return "hyvv metadata resolved outside the deploy root"
 
-# A launcher that validates briefs (B4 on) must load the deployed brief schema and its
-# vendored validator must answer: a "unavailable" status is what a broken deploy looks
-# like at runtime, so it fails smoke (and with it, the deploy). A launcher that predates
-# brief validation (a rollback target) reports n/a for both.
-BRIEF_PROBE = {"schema": "rizzstack.brief/1"}
+# A launcher that validates briefs (B4 on) must prove brief validation works from the
+# deployed bytes: both frozen schemas load, hyvv.rizzstack_validators imports from the
+# root (and is what launcher picked up), and brief_validation() calls a minimal VALID
+# rizzstack.brief/1 brief "valid". "unavailable" (a broken deploy) or "invalid" (the
+# deployed schema and validator disagree with the frozen contract) fails smoke, and with
+# it the deploy. A launcher that predates brief validation (a rollback target) reports n/a.
+BRIEF_PROBE = {
+    "schema": "rizzstack.brief/1",
+    "objective": "apply-update smoke probe",
+    "project": "hyvv",
+    "source_rev": "0" * 40,
+    "assigned_files": ["launcher.py"],
+    "acceptance": {"criteria": ["the deployed launcher validates a brief"]},
+    "risk": {"tier": "low"},
+}
+
+def load_schema(key, filename):
+    try:
+        schema = json.loads((root / "schemas" / filename).read_text(encoding="utf-8"))
+    except Exception as exc:
+        result[key] = "%s: %s" % (type(exc).__name__, exc)
+        errors.append("%s: %s" % (filename, exc))
+        return
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    if isinstance(props, dict) and props:
+        result[key] = "ok"
+    else:
+        result[key] = "no properties"
+        errors.append("%s has no properties" % filename)
 
 def check_brief(launcher):
     if not callable(getattr(launcher, "brief_validation", None)):
         return
-    try:
-        schema = json.loads((root / "schemas" / "rizzstack-brief.schema.json").read_text(encoding="utf-8"))
-        props = schema.get("properties") if isinstance(schema, dict) else None
-        if isinstance(props, dict) and props:
-            result["brief_schema"] = "ok"
-        else:
-            result["brief_schema"] = "no properties"
-            errors.append("brief schema has no properties")
-    except Exception as exc:
-        result["brief_schema"] = "%s: %s" % (type(exc).__name__, exc)
-        errors.append("brief schema: %s" % exc)
+    load_schema("brief_schema", "rizzstack-brief.schema.json")
+    load_schema("attempt_schema", "rizzstack-attempt.schema.json")
+    validators = note("hyvv.rizzstack_validators")
+    if validators is not None and result["modules"].get("hyvv.rizzstack_validators") == "ok":
+        result["rizzstack_validators"] = "imported"
+    if getattr(launcher, "_rizzstack_validators", None) is None:
+        errors.append("launcher has no rizzstack validator loaded")
     try:
         report = launcher.brief_validation(dict(BRIEF_PROBE))
         status = str(report.get("status")) if isinstance(report, dict) else "not a dict"
     except Exception as exc:
         status = "error: %s: %s" % (type(exc).__name__, exc)
     result["brief_validation"] = status
-    if status not in ("valid", "invalid"):
-        errors.append("brief_validation status is %s after deploy" % status)
+    if status != "valid":
+        errors.append("brief_validation of the valid probe brief is %s after deploy (want valid)" % status)
 
 launcher = note("launcher")
 if launcher is not None:
@@ -579,7 +599,7 @@ if pkg.is_dir():
             if origin_error:
                 result["modules"]["hyvv"] = "error: " + origin_error
                 errors.append(origin_error)
-if (pkg / "rizzstack_validators.py").is_file():
+if result["rizzstack_validators"] == "absent" and (pkg / "rizzstack_validators.py").is_file():
     result["rizzstack_validators"] = "present"
 
 result["ok"] = not errors and result["ticket_schema"] == "ok"
@@ -622,6 +642,7 @@ def _smoke_result_fields(data):
             "ticket_schema": str(data.get("ticket_schema", "unknown")),
             "rizzstack_validators": str(data.get("rizzstack_validators", "unknown")),
             "brief_schema": str(data.get("brief_schema", "unknown")),
+            "attempt_schema": str(data.get("attempt_schema", "unknown")),
             "brief_validation": str(data.get("brief_validation", "unknown")),
             "modules": modules if isinstance(modules, dict) else {},
             "hyvv_version": str(hyvv_version) if hyvv_version else None,
@@ -635,10 +656,11 @@ def smoke(root, python=None, timeout=180):
     ok False. ok means launcher and every runtime module imported from under root,
     the ticket schema loaded as a dict, hyvv's module and dist-info metadata both
     resolved from under root, and (for a launcher with brief validation) the brief
-    schema loaded and brief_validation answered valid/invalid, never "unavailable".
+    and attempt schemas loaded, hyvv.rizzstack_validators imported from root, and
+    brief_validation called the minimal valid probe brief "valid".
     """
     result = {"ok": False, "ticket_schema": "unknown", "rizzstack_validators": "unknown",
-              "brief_schema": "unknown", "brief_validation": "unknown",
+              "brief_schema": "unknown", "attempt_schema": "unknown", "brief_validation": "unknown",
               "modules": {}, "hyvv_version": None, "error": ""}
     exe = python or sys.executable
     # The child runs with cwd=root, so hand it an absolute root (a relative one would
@@ -762,10 +784,11 @@ def _cmd_restore(args):
 
 def _cmd_smoke(args):
     result = smoke(args.root, python=args.python)
-    print("smoke=%s ticket_schema=%s rizzstack_validators=%s brief_schema=%s brief_validation=%s"
-          " modules=%d hyvv_version=%s" % (
+    print("smoke=%s ticket_schema=%s rizzstack_validators=%s brief_schema=%s attempt_schema=%s"
+          " brief_validation=%s modules=%d hyvv_version=%s" % (
         "ok" if result["ok"] else "fail", _one_line(result["ticket_schema"]),
         result["rizzstack_validators"], _one_line(result["brief_schema"]),
+        _one_line(result["attempt_schema"]),
         _one_line(result["brief_validation"]), len(result["modules"]),
         result["hyvv_version"] if result["hyvv_version"] else "none"))
     if not result["ok"]:
