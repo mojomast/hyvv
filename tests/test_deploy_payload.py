@@ -187,9 +187,15 @@ class WheelPayload(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def test_runtime_files_come_from_the_wheel_without_dist_info(self):
+    def test_runtime_files_come_from_the_wheel_with_its_metadata(self):
+        """The dist-info ships too: hyvv/__init__ resolves its version from it on a host."""
         files = self.dp.runtime_files(self.wheel)
-        self.assertEqual(files, sorted(n for n in SYNTH if ".dist-info/" not in n))
+        self.assertEqual(files, sorted(SYNTH))
+
+    def test_two_dist_info_dirs_are_refused(self):
+        wheel = write_wheel(self.tmp / "two.whl", {**SYNTH, "other-1.0.dist-info/METADATA": b"Name: other\n"})
+        with self.assertRaises(ValueError):
+            self.dp.runtime_files(wheel)
 
     def test_unsafe_member_names_are_refused(self):
         for bad in ("../evil.py", "/abs.py", "C:/x.py", "a\\b.py", "schemas/../../x.json"):
@@ -236,6 +242,50 @@ class WheelPayload(unittest.TestCase):
         self.assertFalse((self.root / "schemas" / "rizzstack-ticket.schema.json").exists())
         self.assertFalse((self.root / "provisioning.py").exists())
         self.assertEqual((self.root / "config.json").read_text("utf-8"), "{}")
+
+    def test_prune_removes_what_the_new_wheel_no_longer_ships_and_restore_undoes_it(self):
+        receipt = {"repo": "mojomast/hyvv", "sha": OLD, "version": "0.1.18",
+                   "installed_at_utc": "2026-11-24T00:23:18Z",
+                   "files": {"launcher.py": "x", "old_module.py": "x", "hyvv-0.1.18.dist-info/METADATA": "x"}}
+        (self.root / "hyvv-deployed.json").write_text(json.dumps(receipt), encoding="utf-8")
+        (self.root / "launcher.py").write_bytes(b"OLD\n")
+        (self.root / "old_module.py").write_bytes(b"OLDMOD\n")
+        stale = self.root / "hyvv-0.1.17.dist-info"
+        stale.mkdir()
+        (stale / "METADATA").write_bytes(b"Name: hyvv\nVersion: 0.1.17\n")
+        (self.root / "hyvv-0.1.18.dist-info").mkdir()
+        (self.root / "hyvv-0.1.18.dist-info" / "METADATA").write_bytes(b"Name: hyvv\nVersion: 0.1.18\n")
+        (self.root / "config.json").write_text("{}", encoding="utf-8")
+        dest = self.tmp / "payload.bak"
+        self.dp.backup(self.wheel, self.root, dest)
+        self.dp.install(self.wheel, self.root)
+        removed = self.dp.prune(self.wheel, self.root)
+        self.assertIn("old_module.py", removed)
+        self.assertIn("hyvv-0.1.18.dist-info/METADATA", removed)
+        self.assertIn("hyvv-0.1.17.dist-info/METADATA", removed)
+        self.assertFalse((self.root / "old_module.py").exists())
+        self.assertFalse(stale.exists())
+        self.assertFalse((self.root / "hyvv-0.1.18.dist-info").exists())
+        self.assertTrue((self.root / "hyvv-0.1.19.dist-info" / "METADATA").is_file())
+        self.assertEqual((self.root / "config.json").read_text("utf-8"), "{}")
+        self.assertEqual(self.dp.verify_root(self.wheel, self.root), [])
+        self.dp.restore(dest, self.root)
+        self.assertEqual((self.root / "launcher.py").read_bytes(), b"OLD\n")
+        self.assertEqual((self.root / "old_module.py").read_bytes(), b"OLDMOD\n")
+        self.assertTrue((stale / "METADATA").is_file())
+        self.assertTrue((self.root / "hyvv-0.1.18.dist-info" / "METADATA").is_file())
+        self.assertFalse((self.root / "hyvv-0.1.19.dist-info").exists())
+        self.assertFalse((self.root / "schemas").exists())
+        self.assertEqual((self.root / "config.json").read_text("utf-8"), "{}")
+
+    def test_prune_refuses_guarded_receipt_names(self):
+        receipt = {"repo": "mojomast/hyvv", "sha": OLD, "version": "0.1.19",
+                   "installed_at_utc": "2026-11-24T00:23:18Z", "files": {"config.json": "x"}}
+        (self.root / "hyvv-deployed.json").write_text(json.dumps(receipt), encoding="utf-8")
+        (self.root / "config.json").write_text("{}", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.dp.prune(self.wheel, self.root)
+        self.assertTrue((self.root / "config.json").is_file())
 
     def test_cli_files_install_verify(self):
         r = run([sys.executable, str(HELPER), "files", "--wheel", str(self.wheel)])
@@ -321,8 +371,10 @@ class BuiltWheelPayload(unittest.TestCase):
         missing = sorted(needed - set(self.files))
         self.assertEqual(missing, [], f"runtime files absent from the wheel: {missing}")
 
-    def test_wheel_runtime_files_carry_no_scripts_or_dist_info(self):
-        self.assertFalse([f for f in self.files if f.startswith("scripts/") or ".dist-info/" in f])
+    def test_wheel_runtime_files_carry_no_scripts_and_one_metadata(self):
+        self.assertFalse([f for f in self.files if f.startswith("scripts/")])
+        metadata = [f for f in self.files if re.fullmatch(r"hyvv-[^/]+\.dist-info/METADATA", f)]
+        self.assertEqual(len(metadata), 1, metadata)
 
     def test_installed_tree_passes_smoke(self):
         root = self.tmp / "smoke-ok"
@@ -335,8 +387,22 @@ class BuiltWheelPayload(unittest.TestCase):
         for mod in ("launcher", "provisioning", "landing_export", "rails_emitter", "rails_export",
                     "rails_log_source", "hyvv.ticket_verify"):
             self.assertIn(mod, result["modules"])
+        self.assertIn("hyvv", result["modules"])
+        version = re.search(r'^version = "([^"]+)"', (ROOT / "pyproject.toml").read_text("utf-8"), re.M).group(1)
+        self.assertEqual(result["hyvv_version"], version)
         want = "present" if "hyvv/rizzstack_validators.py" in self.files else "absent"
         self.assertEqual(result["rizzstack_validators"], want)
+
+    def test_smoke_fails_when_the_hyvv_metadata_is_missing(self):
+        """No faked metadata: a host without the dist-info cannot import hyvv, and smoke says so."""
+        root = self.tmp / "smoke-no-metadata"
+        root.mkdir()
+        self.dp.install(self.wheel, root)
+        for d in root.glob("hyvv-*.dist-info"):
+            shutil.rmtree(d)
+        result = self.dp.smoke(root)
+        self.assertFalse(result["ok"])
+        self.assertIn("hyvv", result["error"])
 
     def test_smoke_fails_without_the_ticket_schema(self):
         root = self.tmp / "smoke-missing"
@@ -379,10 +445,14 @@ class LauncherAdminApplyUpdate(unittest.TestCase):
 
     def test_apply_update_uses_the_helper_for_every_step(self):
         body = function_body(self.text, "Invoke-ApplyUpdate")
-        for sub in ("check-version", "verify-root", "smoke", "backup", "restore", "install"):
+        for sub in ("check-version", "verify-root", "smoke", "backup", "restore", "install", "prune"):
             self.assertTrue(re.search(rf"'{sub}'", self.text), sub)
         self.assertIn("uv", self.text)
         self.assertRegex(self.text, r"'build'")
+        self.assertIn("'--no-project'", self.text)
+        install = function_body(self.text, "Invoke-Install")
+        order = [install.find("'install'"), install.find("'prune'"), install.find("'verify-root'"), install.find("'smoke'")]
+        self.assertTrue(all(i > -1 for i in order) and order == sorted(order), order)
         self.assertIn("Invoke-", body)
 
     def test_exact_version_compare_is_gone(self):
