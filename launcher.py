@@ -2436,6 +2436,9 @@ class Launcher:
         self.model_health = {m: {"last_limited": 0.0, "last_used": 0.0} for m in FREE_POOL}
         self.dir = Path(cfg["data_dir"]); (self.dir / "attempts").mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        # Journal writes are serialized per attempt and refuse an older lseq.
+        self._save_locks: dict[str, threading.Lock] = {}
+        self._save_locks_guard = threading.Lock()
         self.attempts = {}
         self.controllers = {}  # attempt_id -> asyncio task (exactly one per attempt)
         self._budget_finishing = set()  # attempt_ids with a budget teardown in flight (in-memory single-flight)
@@ -2462,12 +2465,37 @@ class Launcher:
     # journal: one JSON per attempt (atomic replace) + append-only events log
     def _path(self, aid): return self.dir / "attempts" / f"{aid}.json"
     def _save(self, a):
+        with self._save_lock(str(a["attempt_id"])):
+            self._save_locked(a)
+
+    def _save_lock(self, aid):
+        with self._save_locks_guard:
+            lock = self._save_locks.get(aid)
+            if lock is None:
+                lock = threading.Lock()
+                self._save_locks[aid] = lock
+            return lock
+
+    def _save_locked(self, a):
         p = self._path(a["attempt_id"])
+        # Last-writer-wins would let a stale "running" save overwrite a newer
+        # "cancel_requested".  lseq is monotonic on every state transition, so
+        # a write older than the journal is refused.
+        try:
+            current_lseq = int(json.loads(p.read_text(encoding="utf-8")).get("lseq", 0))
+        except (OSError, ValueError, TypeError):
+            current_lseq = -1
+        if int(a.get("lseq", 0)) < current_lseq:
+            return
         fd, tmp_name = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=p.parent)
         tmp = Path(tmp_name)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(json.dumps(a, indent=1))
+            try:
+                os.chmod(tmp, 0o644)  # mkstemp is 0600; readers saw 0644 before
+            except OSError:
+                pass
             last = None
             delays = _save_replace_delays()
             for i in range(SAVE_REPLACE_TRIES):
