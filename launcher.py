@@ -1301,6 +1301,9 @@ def load_config(path):
     cfg.setdefault("ticket_mode", "off")
     if cfg["ticket_mode"] not in ("off", "report"):
         raise ValueError("ticket_mode must be off or report")
+    cfg.setdefault("brief_mode", "report")
+    if cfg["brief_mode"] not in ("off", "report", "enforce"):
+        raise ValueError("brief_mode must be off, report, or enforce")
     cfg.setdefault("data_dir", str(Path.home() / ".orbit-launcher"))
     cfg.setdefault("projects", {})  # name -> {"repo": url} (authorized projects)
     cfg.setdefault("provisioning", {})  # {"policy": path, "journal": path, "enabled": bool}
@@ -2736,7 +2739,8 @@ class Launcher:
                 if report is not None: a["ticket_report"] = report
                 self.attempts[aid] = a; self._save(a)
                 self.kick(); return a, True
-            if validation is None: validation = brief_validation(brief)
+            if validation is None and self.cfg.get("brief_mode", "report") != "off":
+                validation = brief_validation(brief)
             if kind == "agy-cua":
                 sel = model or brief.get("tier") or brief.get("model") or AGY_DEFAULT_TIER
                 m = AGY_TIERS.get(sel, sel)
@@ -2747,8 +2751,9 @@ class Launcher:
             if brief.get("verify_of") is not None: self._check_verify_of(brief, kind)
             now = time.time()
             a = {"attempt_id": aid, "kind": kind, "brief": brief, "state": "queued", "detail": "waiting for a worker slot", "created_at": now,
-                 "updated_at": now, "lseq": 0, "cursor": 0, "rate_limited": 0, "model": None if spec.get("pool") else spec["name"],
-                 "brief_validation": validation}
+                 "updated_at": now, "lseq": 0, "cursor": 0, "rate_limited": 0, "model": None if spec.get("pool") else spec["name"]}
+            if validation is not None:
+                a["brief_validation"] = validation
             if report is not None: a["ticket_report"] = report
             if spec.get("pool"): a.update(pool=spec["pool"], tried=[], model_history=[])
             if kind == "agy-cua":
@@ -3889,7 +3894,17 @@ def make_handler(L, token):
                     aid = "att_" + uuid.uuid4().hex[:16]  # 0.1.13: mint when omitted (bundlebees client does not send one)
                 elif not re.fullmatch(r"[A-Za-z0-9_\-]{8,64}", aid):
                     return self._send(400, {"error": "attempt_id required"})
-                validation = brief_validation(b.get("brief")) if isinstance(b.get("brief"), dict) else None
+                brief_mode = L.cfg.get("brief_mode", "report")
+                validation = brief_validation(b.get("brief")) if isinstance(b.get("brief"), dict) and brief_mode != "off" else None
+                if isinstance(validation, dict) and brief_mode == "enforce":
+                    if validation.get("status") == "unavailable":
+                        return self._send(503, {"error": "brief_validation_unavailable",
+                                                "problems": validation.get("problems") or []})
+                    problems = list(validation.get("problems") or [])
+                    problems.extend(f"$.{field}: unknown top-level field"
+                                    for field in validation.get("unknown_fields") or [])
+                    if validation.get("status") == "invalid" or problems:
+                        return self._send(400, {"error": "invalid_brief", "problems": problems})
                 if isinstance(b.get("brief"), dict): b["brief"] = normalize_brief(b["brief"])
                 err = validate_brief(b.get("brief"), L.cfg)
                 if err: return self._send(400, {"error": err})
