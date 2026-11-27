@@ -70,6 +70,22 @@ class SaveOrdering(unittest.TestCase):
             self.assertEqual(running["state"], "cancel_requested")
             self.assertEqual(running["lseq"], 2)
 
+    def test_a_stale_object_that_is_not_live_is_refreshed_too(self):
+        with tempfile.TemporaryDirectory() as d:
+            la, _ = _launcher(d)
+            aid = "att_dd00000005"
+            live = _attempt(aid=aid, state="running", lseq=1)
+            la.attempts[aid] = live
+            la._save(live)
+            la._save(dict(live, state="cancel_requested", lseq=2))
+            stale = dict(live)  # a caller-held snapshot, not the live object
+
+            la._save(stale)
+
+            self.assertIs(la.attempts[aid], live)
+            self.assertEqual(stale["state"], "cancel_requested")
+            self.assertEqual(stale["lseq"], 2)
+
     @unittest.skipIf(os.name == "nt", "POSIX mode bits")
     def test_saved_journal_keeps_the_previous_mode(self):
         with tempfile.TemporaryDirectory() as d:

@@ -2521,6 +2521,9 @@ class Launcher:
         else:
             live.clear()
             live.update(current)
+        if a is not live:
+            a.clear()
+            a.update(current)
 
     def _write_journal(self, p, a):
         fd, tmp_name = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=p.parent)
