@@ -643,6 +643,57 @@ function Format-OutcomeLine([string]$outcome, [string]$deployed, [string]$versio
   return $line
 }
 
+# Smoke evidence. The helper's passing 'smoke=ok ...' line carries these seven fields; apply-update
+# prints them as their own line for the pre-restart and the post-restart check, and keeps them
+# under the same names as 'smoke_pre' / 'smoke_post' in apply-update.state.json, the audit
+# record and update-status. The outcome line is unchanged. A value that is not a plain token
+# is never stored or shown as-is.
+$SmokeFields = @('ticket_schema','brief_schema','attempt_schema','rizzstack_validators','brief_validation','modules','hyvv_version')
+$SmokeValuePattern = '^[0-9A-Za-z._+/:-]{1,64}$'
+
+function ConvertFrom-SmokeOutput([string]$out) {
+  # The seven fields of the helper's one 'smoke=ok' line, or $null when there is no such line,
+  # a field is missing, or a value is not a plain token.
+  $line = $null
+  foreach ($l in @([string]$out -split "`r?`n")) {
+    if ($l -cmatch '^smoke=ok(?: |$)') { $line = $l.Trim(); break }
+  }
+  if (-not $line) { return $null }
+  $map = [ordered]@{}
+  foreach ($k in $SmokeFields) {
+    $m = [regex]::Match($line, "(?:^| )$k=(\S+)")
+    if (-not $m.Success) { return $null }
+    $v = $m.Groups[1].Value
+    if ($v -cnotmatch $SmokeValuePattern) { return $null }
+    $map[$k] = $v
+  }
+  return $map
+}
+
+function Format-SmokeFields($fields) {
+  # 'ticket_schema=ok brief_schema=ok ...' from a recorded map (a hashtable, or the object
+  # ConvertFrom-Json returns); 'none' when nothing was recorded. A missing field reads
+  # 'unknown', a value that is not a plain token reads 'invalid'.
+  if ($null -eq $fields) { return 'none' }
+  $parts = foreach ($k in $SmokeFields) {
+    $v = $null
+    if ($fields -is [System.Collections.IDictionary]) {
+      if ($fields.Contains($k)) { $v = $fields[$k] }
+    } elseif ($fields.PSObject.Properties[$k]) {
+      $v = $fields.PSObject.Properties[$k].Value
+    }
+    if ($null -eq $v -or [string]$v -eq '') { $v = 'unknown' }
+    elseif ([string]$v -cnotmatch $SmokeValuePattern) { $v = 'invalid' }
+    "$k=$v"
+  }
+  return ($parts -join ' ')
+}
+
+function Format-SmokeLine([string]$check, $fields) {
+  # One line per passing check, printed beside (never inside) the outcome line.
+  return "smoke_check=$check smoke=ok $(Format-SmokeFields $fields)"
+}
+
 function Set-DeployOutcome([string]$deployed, [string]$version, [string]$revert, [string]$startup) {
   if ($null -eq $script:DeployState) { return }
   $script:DeployState['startup_s'] = $(if ($startup) { $startup } else { 'none' })
@@ -669,6 +720,9 @@ function Write-Phase([string]$phase, [string]$outcome, [string]$reason) {
   if ($reason) { $rec['reason'] = $reason }
   foreach ($k in @('deployed','version','build_sha','revert','startup_s')) {
     if ($script:DeployState.ContainsKey($k) -and $script:DeployState[$k]) { $rec[$k] = [string]$script:DeployState[$k] }
+  }
+  foreach ($k in @('smoke_pre','smoke_post')) {
+    if ($script:DeployState.ContainsKey($k) -and $null -ne $script:DeployState[$k]) { $rec[$k] = $script:DeployState[$k] }
   }
   $dest = Join-Path $Data 'apply-update.state.json'
   $tmp = "$dest.tmp-admin"
@@ -845,15 +899,20 @@ function Invoke-Install([string]$wheel) {
   if ($v.Code -ne 0) { throw "post-copy check failed: $($v.Out)" }
   $s = Invoke-DeployHelper @('smoke','--root',$Root)
   if ($s.Code -ne 0) { throw "pre-restart smoke failed: $($s.Out)" }
+  # Fail closed: a pass we cannot record is not proof.
+  $smokePre = ConvertFrom-SmokeOutput $s.Out
+  if ($null -eq $smokePre) { throw "pre-restart smoke passed but printed no complete smoke line: $($s.Out)" }
   $warm = & uv @InstallUvArgs 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "uv env warm-up failed: $((Write-Scrubbed $warm) -join ' ')" }
+  # The only pipeline output: the pre-restart smoke fields.
+  return $smokePre
 }
 
 function Invoke-ApplyUpdate([string[]]$argv) {
   if ($argv.Count -lt 1 -or $argv.Count -gt 2) { throw 'usage: apply-update <commit-sha> [hyvv]' }
   $ref = $argv[0]
   $repo = if ($argv.Count -eq 2) { $argv[1] } else { $HyvvRepoName }
-  $auditArgs = [ordered]@{ repo = $repo; ref = $ref; old_sha = $null; new_sha = $null; version_before = $null; version_after = $null; build_sha = $null; startup_s = $null; payload_backup = $null; rolled_back = $false }
+  $auditArgs = [ordered]@{ repo = $repo; ref = $ref; old_sha = $null; new_sha = $null; version_before = $null; version_after = $null; build_sha = $null; startup_s = $null; payload_backup = $null; rolled_back = $false; smoke_pre = $null; smoke_post = $null }
   try {
     if ($repo -cne $HyvvRepoName) { throw "repo must be '$HyvvRepoName'" }
     if ($ref -cnotmatch '^[0-9a-f]{7,40}$') { throw 'ref must be a lowercase commit sha (7-40 hex); branches and tags are refused' }
@@ -908,7 +967,11 @@ function Invoke-ApplyUpdate([string[]]$argv) {
       $auditArgs.payload_backup = $payloadBak
       Write-Phase 'backed-up'
       $want = Get-PayloadVersion $HyvvCheckout
-      Invoke-Install $wheel
+      $smokePre = Invoke-Install $wheel
+      if (-not ($smokePre -is [System.Collections.IDictionary])) { throw 'pre-restart smoke fields were not recorded' }
+      $auditArgs.smoke_pre = $smokePre
+      $script:DeployState['smoke_pre'] = $smokePre
+      Write-Output (Format-SmokeLine 'pre' $smokePre)
       Write-DeployedVersion $new $want $wheel
       $dv1 = Get-DeployedVersion
       if ($dv1.status -ne 'match' -or $dv1.sha -ne $new) { throw 'version file did not read back as the new sha' }
@@ -923,6 +986,11 @@ function Invoke-ApplyUpdate([string[]]$argv) {
       if ($cv.Code -ne 0) { throw "version check failed: $($cv.Out)" }
       $sm = Invoke-DeployHelper @('smoke','--root',$Root)
       if ($sm.Code -ne 0) { throw "post-restart smoke failed: $($sm.Out)" }
+      $smokePost = ConvertFrom-SmokeOutput $sm.Out
+      if ($null -eq $smokePost) { throw "post-restart smoke passed but printed no complete smoke line: $($sm.Out)" }
+      $auditArgs.smoke_post = $smokePost
+      $script:DeployState['smoke_post'] = $smokePost
+      Write-Output (Format-SmokeLine 'post' $smokePost)
       if (-not (Test-LauncherRunsFromRoot)) { throw 'no launcher process is running launcher.py from the install dir' }
       $auditArgs.version_after = "$($probe.Version)@$new"
       $auditArgs.build_sha = Get-BuildSha "$($probe.Version)"
@@ -981,6 +1049,7 @@ function Invoke-UpdateStatus {
   if (Test-Path -LiteralPath $statePath -PathType Leaf) {
     $phase = 'unknown'; $target = 'unknown'; $oldSha = 'unknown'; $outcome = 'none'; $updated = 'unknown'
     $extra = [ordered]@{ deployed = 'unknown'; version = 'unknown'; build_sha = 'unknown'; revert = 'unknown'; startup_s = 'unknown' }
+    $statePre = $null; $statePost = $null
     try {
       $st = Get-Content -LiteralPath $statePath -Raw -Encoding utf8 | ConvertFrom-Json
       if ($st.PSObject.Properties['phase']) { $phase = [string]$st.phase }
@@ -989,6 +1058,8 @@ function Invoke-UpdateStatus {
       if ($st.PSObject.Properties['outcome']) { $outcome = [string]$st.outcome }
       if ($st.PSObject.Properties['updated_at']) { $updated = [string]$st.updated_at }
       foreach ($k in @($extra.Keys)) { if ($st.PSObject.Properties[$k]) { $extra[$k] = [string]$st.$k } }
+      if ($st.PSObject.Properties['smoke_pre']) { $statePre = $st.smoke_pre }
+      if ($st.PSObject.Properties['smoke_post']) { $statePost = $st.smoke_post }
     } catch { }
     Write-Output "state_phase=$phase"
     Write-Output "state_target=$target"
@@ -996,6 +1067,8 @@ function Invoke-UpdateStatus {
     Write-Output "state_outcome=$outcome"
     Write-Output "state_updated_at=$updated"
     foreach ($k in $extra.Keys) { Write-Output "state_$k=$($extra[$k])" }
+    Write-Output "state_smoke_pre=$(Format-SmokeFields $statePre)"
+    Write-Output "state_smoke_post=$(Format-SmokeFields $statePost)"
   } else {
     Write-Output "state=none"
   }
@@ -1016,6 +1089,13 @@ function Invoke-UpdateStatus {
     Write-Output "last_apply_update_ts=$ts"
     Write-Output "last_apply_update_ok=$okv"
     Write-Output ("last_apply_update_detail=" + (Format-RedactedLogLine $detail))
+    $lastPre = $null; $lastPost = $null
+    if ($last.PSObject.Properties['args'] -and $null -ne $last.args) {
+      if ($last.args.PSObject.Properties['smoke_pre']) { $lastPre = $last.args.smoke_pre }
+      if ($last.args.PSObject.Properties['smoke_post']) { $lastPost = $last.args.smoke_post }
+    }
+    Write-Output "last_apply_update_smoke_pre=$(Format-SmokeFields $lastPre)"
+    Write-Output "last_apply_update_smoke_post=$(Format-SmokeFields $lastPost)"
   }
   # Read-only probe: a missing lock file means 'no'; an IOException means another
   # process holds it ('yes'); any other error fails closed as 'unknown' (never 'no').
