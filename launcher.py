@@ -2481,12 +2481,18 @@ class Launcher:
         # Last-writer-wins would let a stale "running" save overwrite a newer
         # "cancel_requested".  lseq is monotonic on every state transition, so
         # a write older than the journal is refused.
-        try:
-            current_lseq = int(json.loads(p.read_text(encoding="utf-8")).get("lseq", 0))
-        except (OSError, ValueError, TypeError):
-            current_lseq = -1
-        if int(a.get("lseq", 0)) < current_lseq:
+        if int(a.get("lseq", 0)) < self._journal_lseq(p):
             return
+        self._write_journal(p, a)
+
+    @staticmethod
+    def _journal_lseq(p):
+        try:
+            return int(json.loads(p.read_text(encoding="utf-8")).get("lseq", 0))
+        except (OSError, ValueError, TypeError):
+            return -1
+
+    def _write_journal(self, p, a):
         fd, tmp_name = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=p.parent)
         tmp = Path(tmp_name)
         try:
