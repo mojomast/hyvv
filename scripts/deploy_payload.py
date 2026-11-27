@@ -135,6 +135,22 @@ def _is_guarded(name):
     return False
 
 
+def _scan_wheel_member(info):
+    """Validate one wheel member; return (name, is_dir, dist_info_top_or_None).
+
+    Any unsafe or guarded member raises ValueError, rejecting the whole wheel.
+    """
+    name = info.filename
+    is_dir = info.is_dir() or name.endswith("/")
+    check = name[:-1] if is_dir and name.endswith("/") else name
+    _check_member_name(check)
+    if _is_guarded(check):
+        raise ValueError("guarded member refused: %r" % name)
+    parts = check.split("/")
+    top = parts[0] if parts[0].endswith(".dist-info") and (is_dir or len(parts) > 1) else None
+    return check, is_dir, top
+
+
 def runtime_files(wheel_path):
     """Sorted posix names of the wheel members that belong on the install root.
 
@@ -149,15 +165,9 @@ def runtime_files(wheel_path):
     dist_info = set()
     with zipfile.ZipFile(wheel_path) as zf:
         for info in zf.infolist():
-            name = info.filename
-            is_dir = info.is_dir() or name.endswith("/")
-            check = name[:-1] if is_dir and name.endswith("/") else name
-            _check_member_name(check)
-            if _is_guarded(check):
-                raise ValueError("guarded member refused: %r" % name)
-            parts = check.split("/")
-            if parts[0].endswith(".dist-info") and (is_dir or len(parts) > 1):
-                dist_info.add(parts[0])
+            check, is_dir, top = _scan_wheel_member(info)
+            if top is not None:
+                dist_info.add(top)
             if is_dir:
                 continue
             names.append(check)
@@ -332,14 +342,8 @@ def backup(wheel_path, root, dest):
     return dest
 
 
-def restore(dest, root):
-    """Restore a backup() dir: existing files get their backed-up bytes back (tmp +
-    os.replace); files that did not exist are removed (then now-empty parent dirs
-    inside root, never root itself). Manifest names failing the safety rules refuse
-    the whole restore.
-    """
-    dest = Path(dest)
-    root = Path(root)
+def _read_backup_manifest(dest):
+    """The 'files' map of a backup() dir's manifest, validated against BACKUP_SCHEMA."""
     try:
         manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
@@ -349,27 +353,47 @@ def restore(dest, root):
     files = manifest.get("files")
     if not isinstance(files, dict):
         raise ValueError("backup manifest has no files map")
+    return files
+
+
+def _remove_restored_file(root, target):
+    """Remove a not-previously-existing file, then now-empty parents inside root."""
+    if target.is_file() or target.is_symlink():
+        target.unlink()
+    parent = target.parent
+    while parent != root and root in parent.parents and parent.is_dir() and not any(parent.iterdir()):
+        parent.rmdir()
+        parent = parent.parent
+
+
+def _restore_entry(dest, root, name, entry):
+    """Restore one manifest entry: backed-up bytes back, or a new file removed."""
+    _check_member_name(name)
+    if _is_guarded(name):
+        raise ValueError("guarded manifest member refused: %r" % name)
+    if not isinstance(entry, dict):
+        raise ValueError("bad backup manifest entry: %r" % name)
+    target = _dest_for(root, name)
+    if not entry.get("existed"):
+        _remove_restored_file(root, target)
+        return
+    src = _dest_for(dest, name)
+    if not src.is_file():
+        raise ValueError("backup entry missing: %r" % name)
+    _write_atomic(target, src.read_bytes())
+
+
+def restore(dest, root):
+    """Restore a backup() dir: existing files get their backed-up bytes back (tmp +
+    os.replace); files that did not exist are removed (then now-empty parent dirs
+    inside root, never root itself). Manifest names failing the safety rules refuse
+    the whole restore.
+    """
+    dest = Path(dest)
+    root = Path(root)
+    files = _read_backup_manifest(dest)
     for name in sorted(files):
-        _check_member_name(name)
-        if _is_guarded(name):
-            raise ValueError("guarded manifest member refused: %r" % name)
-        entry = files[name]
-        if not isinstance(entry, dict):
-            raise ValueError("bad backup manifest entry: %r" % name)
-        existed = bool(entry.get("existed"))
-        target = _dest_for(root, name)
-        if existed:
-            src = _dest_for(dest, name)
-            if not src.is_file():
-                raise ValueError("backup entry missing: %r" % name)
-            _write_atomic(target, src.read_bytes())
-        else:
-            if target.is_file() or target.is_symlink():
-                target.unlink()
-            parent = target.parent
-            while parent != root and root in parent.parents and parent.is_dir() and not any(parent.iterdir()):
-                parent.rmdir()
-                parent = parent.parent
+        _restore_entry(dest, root, name, files[name])
 
 
 def _remove_empty_parents(root, start):
@@ -423,10 +447,14 @@ def prune(wheel_path, root):
 # is imported honestly like any other module: the wheel's dist-info ships in the
 # runtime set, so on a real install hyvv/__init__ resolves its version from that
 # metadata, and when the metadata is missing the import fails and smoke says so
-# (no faked dist-info, no temp package). Every imported module's __file__ must
+# (no faked dist-info, no temp package). Isolation does not hide the interpreter's
+# own installed distributions, so importing hyvv is not proof enough: the dist-info
+# importlib.metadata resolves for hyvv, and hyvv.__file__ itself, must both live
+# under the deploy root, or an interpreter whose environment carries hyvv would
+# make a metadata-less root look importable. Every imported module's __file__ must
 # still live under the root.
 _SMOKE_CHILD = r"""
-import importlib, json, sys
+import importlib, importlib.metadata, json, sys
 from pathlib import Path
 
 root = Path(sys.argv[1]).resolve()
@@ -449,6 +477,22 @@ def note(name):
         return mod
     result["modules"][name] = "ok"
     return mod
+
+def check_hyvv_origin(mod):
+    where = Path(getattr(mod, "__file__", "") or "").resolve()
+    if where != root and root not in where.parents:
+        return "hyvv loaded from %s, outside the deploy root" % getattr(mod, "__file__", "?")
+    try:
+        dist = importlib.metadata.distribution("hyvv")
+    except Exception as exc:
+        return "hyvv metadata not found: %s" % exc
+    base = Path(dist.locate_file("")).resolve()
+    if base == root or root in base.parents:
+        return ""
+    dist_info = Path(getattr(dist, "_path", base)).resolve()
+    if dist_info == root or root in dist_info.parents:
+        return ""
+    return "hyvv metadata resolved outside the deploy root"
 
 launcher = note("launcher")
 if launcher is not None:
@@ -500,6 +544,10 @@ if pkg.is_dir():
                 result["hyvv_version"] = str(mod.__version__)
             except Exception:
                 result["hyvv_version"] = None
+            origin_error = check_hyvv_origin(mod)
+            if origin_error:
+                result["modules"]["hyvv"] = "error: " + origin_error
+                errors.append(origin_error)
 if (pkg / "rizzstack_validators.py").is_file():
     result["rizzstack_validators"] = "present"
 
@@ -509,25 +557,18 @@ print(json.dumps(result))
 """
 
 
-def smoke(root, python=None, timeout=180):
-    """Run the isolated child against root and parse its one JSON result line.
-
-    Never raises: any failure to run or parse the child lands in 'error' with
-    ok False. ok means launcher and every runtime module imported from under root
-    and the ticket schema loaded as a dict.
-    """
-    result = {"ok": False, "ticket_schema": "unknown", "rizzstack_validators": "unknown",
-              "modules": {}, "hyvv_version": None, "error": ""}
-    exe = python or sys.executable
-    # The child runs with cwd=root, so hand it an absolute root (a relative one would
-    # resolve against itself).
-    root = Path(root).resolve()
+def _run_smoke_child(exe, root, timeout):
+    """Run the isolated smoke child; return (proc, error) with error set on failure."""
     try:
         proc = subprocess.run([exe, "-I", "-c", _SMOKE_CHILD, str(root)], cwd=str(root),
                               capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
-        result["error"] = "smoke child failed to run: %s" % exc
-        return result
+        return None, "smoke child failed to run: %s" % exc
+    return proc, ""
+
+
+def _parse_smoke_child_output(proc):
+    """Parse the child's one JSON result line; return (data, error) on failure."""
     line = ""
     for candidate in proc.stdout.splitlines():
         if candidate.strip():
@@ -536,19 +577,47 @@ def smoke(root, python=None, timeout=180):
         data = json.loads(line)
     except ValueError:
         detail = (proc.stderr or proc.stdout or "").strip().replace("\n", " ")[:300]
-        result["error"] = "smoke child printed no result (exit %s): %s" % (proc.returncode, detail)
-        return result
+        return None, "smoke child printed no result (exit %s): %s" % (proc.returncode, detail)
     if not isinstance(data, dict):
-        result["error"] = "smoke child result is not an object"
-        return result
+        return None, "smoke child result is not an object"
+    return data, ""
+
+
+def _smoke_result_fields(data):
+    """Normalize the child's result object into the smoke() result fields."""
     modules = data.get("modules")
-    result["ok"] = bool(data.get("ok"))
-    result["ticket_schema"] = str(data.get("ticket_schema", "unknown"))
-    result["rizzstack_validators"] = str(data.get("rizzstack_validators", "unknown"))
-    result["modules"] = modules if isinstance(modules, dict) else {}
     hyvv_version = data.get("hyvv_version")
-    result["hyvv_version"] = str(hyvv_version) if hyvv_version else None
-    result["error"] = str(data.get("error", ""))
+    return {"ok": bool(data.get("ok")),
+            "ticket_schema": str(data.get("ticket_schema", "unknown")),
+            "rizzstack_validators": str(data.get("rizzstack_validators", "unknown")),
+            "modules": modules if isinstance(modules, dict) else {},
+            "hyvv_version": str(hyvv_version) if hyvv_version else None,
+            "error": str(data.get("error", ""))}
+
+
+def smoke(root, python=None, timeout=180):
+    """Run the isolated child against root and parse its one JSON result line.
+
+    Never raises: any failure to run or parse the child lands in 'error' with
+    ok False. ok means launcher and every runtime module imported from under root,
+    the ticket schema loaded as a dict, and hyvv's module and dist-info metadata
+    both resolved from under root.
+    """
+    result = {"ok": False, "ticket_schema": "unknown", "rizzstack_validators": "unknown",
+              "modules": {}, "hyvv_version": None, "error": ""}
+    exe = python or sys.executable
+    # The child runs with cwd=root, so hand it an absolute root (a relative one would
+    # resolve against itself).
+    root = Path(root).resolve()
+    proc, error = _run_smoke_child(exe, root, timeout)
+    if proc is None:
+        result["error"] = error
+        return result
+    data, error = _parse_smoke_child_output(proc)
+    if data is None:
+        result["error"] = error
+        return result
+    result.update(_smoke_result_fields(data))
     if proc.returncode != 0 and result["ok"]:
         result["ok"] = False
         result["error"] = (result["error"] + " child exit %s" % proc.returncode).strip()
@@ -559,7 +628,7 @@ def _one_line(text):
     return re.sub(r"\s+", " ", str(text)).strip()
 
 
-def main(argv=None):
+def _build_parser():
     ap = argparse.ArgumentParser(prog="deploy_payload.py",
                                  description="Deploy the built hyvv wheel's runtime files onto a launcher install root.")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -597,64 +666,98 @@ def main(argv=None):
     p = sub.add_parser("smoke", help="import-prove an installed root in an isolated child")
     p.add_argument("--root", required=True)
     p.add_argument("--python", default=None)
+    return ap
 
-    args = ap.parse_args(argv)
+
+def _cmd_check_version(args):
     try:
-        if args.cmd == "check-version":
-            try:
-                text = Path(args.target_launcher).read_text(encoding="utf-8")
-            except OSError as exc:
-                print("error=cannot read target launcher: %s" % exc, file=sys.stderr)
-                return 2
-            capable = is_describe_capable(text)
-            ok, reason = check_version(args.running, args.want, args.target, capable)
-            mode = "describe" if capable else "pre-describe"
-            print("version_check=%s mode=%s running=%s reason=%s" % ("ok" if ok else "fail", mode, args.running, _one_line(reason)))
-            return 0 if ok else 1
-        if args.cmd == "files":
-            for name in runtime_files(args.wheel):
-                print(name)
-            return 0
-        if args.cmd == "install":
-            names = install(args.wheel, args.root)
-            print("installed=%d" % len(names))
-            return 0
-        if args.cmd == "prune":
-            removed = prune(args.wheel, args.root)
-            print("pruned=%d" % len(removed))
-            for name in removed:
-                print(name)
-            return 0
-        if args.cmd == "verify-root":
-            problems = verify_root(args.wheel, args.root)
-            if not problems:
-                print("verify_root=ok files=%d" % len(runtime_files(args.wheel)))
-                return 0
-            print("verify_root=fail")
-            for problem in problems:
-                print(problem)
-            return 1
-        if args.cmd == "backup":
-            dest = backup(args.wheel, args.root, args.dest)
-            print("backup=%s" % dest)
-            return 0
-        if args.cmd == "restore":
-            restore(args.backup, args.root)
-            print("restore=ok")
-            return 0
-        if args.cmd == "smoke":
-            result = smoke(args.root, python=args.python)
-            print("smoke=%s ticket_schema=%s rizzstack_validators=%s modules=%d hyvv_version=%s" % (
-                "ok" if result["ok"] else "fail", _one_line(result["ticket_schema"]),
-                result["rizzstack_validators"], len(result["modules"]),
-                result["hyvv_version"] if result["hyvv_version"] else "none"))
-            if not result["ok"]:
-                print("error=%s" % _one_line(result["error"]))
-            return 0 if result["ok"] else 1
+        text = Path(args.target_launcher).read_text(encoding="utf-8")
+    except OSError as exc:
+        print("error=cannot read target launcher: %s" % exc, file=sys.stderr)
+        return 2
+    capable = is_describe_capable(text)
+    ok, reason = check_version(args.running, args.want, args.target, capable)
+    mode = "describe" if capable else "pre-describe"
+    print("version_check=%s mode=%s running=%s reason=%s" % ("ok" if ok else "fail", mode, args.running, _one_line(reason)))
+    return 0 if ok else 1
+
+
+def _cmd_files(args):
+    for name in runtime_files(args.wheel):
+        print(name)
+    return 0
+
+
+def _cmd_install(args):
+    names = install(args.wheel, args.root)
+    print("installed=%d" % len(names))
+    return 0
+
+
+def _cmd_prune(args):
+    removed = prune(args.wheel, args.root)
+    print("pruned=%d" % len(removed))
+    for name in removed:
+        print(name)
+    return 0
+
+
+def _cmd_verify_root(args):
+    problems = verify_root(args.wheel, args.root)
+    if not problems:
+        print("verify_root=ok files=%d" % len(runtime_files(args.wheel)))
+        return 0
+    print("verify_root=fail")
+    for problem in problems:
+        print(problem)
+    return 1
+
+
+def _cmd_backup(args):
+    dest = backup(args.wheel, args.root, args.dest)
+    print("backup=%s" % dest)
+    return 0
+
+
+def _cmd_restore(args):
+    restore(args.backup, args.root)
+    print("restore=ok")
+    return 0
+
+
+def _cmd_smoke(args):
+    result = smoke(args.root, python=args.python)
+    print("smoke=%s ticket_schema=%s rizzstack_validators=%s modules=%d hyvv_version=%s" % (
+        "ok" if result["ok"] else "fail", _one_line(result["ticket_schema"]),
+        result["rizzstack_validators"], len(result["modules"]),
+        result["hyvv_version"] if result["hyvv_version"] else "none"))
+    if not result["ok"]:
+        print("error=%s" % _one_line(result["error"]))
+    return 0 if result["ok"] else 1
+
+
+_COMMANDS = {
+    "check-version": _cmd_check_version,
+    "files": _cmd_files,
+    "install": _cmd_install,
+    "prune": _cmd_prune,
+    "verify-root": _cmd_verify_root,
+    "backup": _cmd_backup,
+    "restore": _cmd_restore,
+    "smoke": _cmd_smoke,
+}
+
+
+def main(argv=None):
+    args = _build_parser().parse_args(argv)
+    handler = _COMMANDS.get(args.cmd)
+    if handler is None:
+        return 2
+    try:
+        return handler(args)
     except (ValueError, OSError, zipfile.BadZipFile) as exc:
         print("error=%s" % _one_line(exc), file=sys.stderr)
         return 2
-    return 2
 
 
 if __name__ == "__main__":
