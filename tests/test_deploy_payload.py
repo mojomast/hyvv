@@ -410,6 +410,24 @@ class BuiltWheelPayload(unittest.TestCase):
         self.assertEqual(result["attempt_schema"], "ok")
         self.assertEqual(result["brief_validation"], "valid")
 
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh is required to run the smoke parser")
+    def test_cli_smoke_on_an_installed_tree_records_all_seven_fields(self):
+        """End to end: the helper's real passing line, read by launcher-admin's own parser."""
+        root = self._installed("smoke-cli-record")
+        r = run([sys.executable, str(HELPER), "smoke", "--root", str(root)])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        text = ADMIN.read_text("utf-8")
+        q = r.stdout.replace("'", "''")
+        p = run(["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+                 "Set-StrictMode -Version 3.0\n" + smoke_functions(text) +
+                 f"\n$m = ConvertFrom-SmokeOutput '{q}'\nif ($null -eq $m) {{ 'null' }} else {{ Format-SmokeLine 'post' $m }}"])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        line = p.stdout.strip()
+        version = re.search(r'^version = "([^"]+)"', (ROOT / "pyproject.toml").read_text("utf-8"), re.M).group(1)
+        self.assertRegex(line, r"^smoke_check=post smoke=ok ticket_schema=ok brief_schema=ok attempt_schema=ok"
+                               r" rizzstack_validators=imported brief_validation=valid modules=[1-9][0-9]*"
+                               rf" hyvv_version={re.escape(version)}$")
+
     def _installed(self, name):
         root = self.tmp / name
         root.mkdir()
@@ -672,6 +690,216 @@ class LauncherAdminApplyUpdate(unittest.TestCase):
             self.assertIn("lock_held=no", out)
             after = {p.name: p.read_bytes() for p in data.iterdir()}
             self.assertEqual(before, after)
+
+
+
+SMOKE_OK = ("smoke=ok ticket_schema=ok rizzstack_validators=imported brief_schema=ok attempt_schema=ok"
+            " brief_validation=valid modules=13 hyvv_version=0.1.19")
+SMOKE_FIELDS = ("ticket_schema", "brief_schema", "attempt_schema", "rizzstack_validators",
+                "brief_validation", "modules", "hyvv_version")
+SMOKE_FIELDS_LINE = ("ticket_schema=ok brief_schema=ok attempt_schema=ok rizzstack_validators=imported"
+                     " brief_validation=valid modules=13 hyvv_version=0.1.19")
+SMOKE_MAP = {"ticket_schema": "ok", "brief_schema": "ok", "attempt_schema": "ok",
+             "rizzstack_validators": "imported", "brief_validation": "valid", "modules": "13",
+             "hyvv_version": "0.1.19"}
+
+
+def smoke_functions(text):
+    """The smoke-evidence functions with the two settings they read, runnable on their own."""
+    settings = "\n".join(re.findall(r"^\$Smoke(?:Fields|ValuePattern) = .*$", text, re.M))
+    return "\n".join([settings] + [function_body(text, n) for n in
+                                   ("ConvertFrom-SmokeOutput", "Format-SmokeFields", "Format-SmokeLine")])
+
+
+def ps_quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+class LauncherAdminSmokeEvidence(unittest.TestCase):
+    """T3: a passing apply-update records both smoke checks (pre- and post-restart).
+
+    Before this, the smoke output was printed only when smoke failed, so a passing run's log
+    showed nothing but phase=installed / verifying / done.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = ADMIN.read_text("utf-8")
+
+    def pwsh(self, script, **kw):
+        r = run(["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+                 "$ErrorActionPreference = 'Stop'; Set-StrictMode -Version 3.0\n" + script], **kw)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r.stdout.strip().splitlines()
+
+    def test_fields_are_the_seven_smoke_fields_in_order(self):
+        m = re.search(r"^\$SmokeFields = @\(([^)]*)\)$", self.text, re.M)
+        self.assertIsNotNone(m)
+        self.assertEqual(tuple(re.findall(r"'([a-z_]+)'", m.group(1))), SMOKE_FIELDS)
+
+    def test_apply_update_prints_and_records_both_checks_on_success(self):
+        body = function_body(self.text, "Invoke-ApplyUpdate")
+        install = body.find("$smokePre = Invoke-Install $wheel")
+        pre_line = body.find("Format-SmokeLine 'pre' $smokePre")
+        restart = body.find("Invoke-RestartIdleCore")
+        post_check = body.find("post-restart smoke failed")
+        post_line = body.find("Format-SmokeLine 'post' $smokePost")
+        done = body.find("Write-Phase 'done' 'ok'")
+        audit_ok = body.find("Write-Audit 'apply-update' $true")
+        outcome_ok = body.find("Format-OutcomeLine 'ok'")
+        for i in (install, pre_line, restart, post_check, post_line, done, audit_ok, outcome_ok):
+            self.assertGreater(i, -1)
+        self.assertTrue(install < pre_line < restart < post_check < post_line < done < audit_ok < outcome_ok)
+        # Both land in the audit args and the state the phase writer persists.
+        self.assertIn("$auditArgs.smoke_pre = $smokePre", body)
+        self.assertIn("$auditArgs.smoke_post = $smokePost", body)
+        self.assertIn("$script:DeployState['smoke_pre'] = $smokePre", body)
+        self.assertIn("$script:DeployState['smoke_post'] = $smokePost", body)
+        self.assertLess(body.find("$script:DeployState['smoke_pre']"), body.find("Write-Phase 'installed'"))
+        self.assertLess(body.find("$script:DeployState['smoke_post']"), done)
+        self.assertRegex(body, r"smoke_pre = \$null; smoke_post = \$null")
+        phase = function_body(self.text, "Write-Phase")
+        self.assertIn("'smoke_pre','smoke_post'", phase)
+
+    def test_failure_paths_are_unchanged(self):
+        install = function_body(self.text, "Invoke-Install")
+        self.assertIn('if ($s.Code -ne 0) { throw "pre-restart smoke failed: $($s.Out)" }', install)
+        body = function_body(self.text, "Invoke-ApplyUpdate")
+        self.assertIn('if ($sm.Code -ne 0) { throw "post-restart smoke failed: $($sm.Out)" }', body)
+        # A pass whose fields cannot be read fails closed, inside the reverting try.
+        self.assertIn("pre-restart smoke passed but printed no complete smoke line", install)
+        self.assertIn("post-restart smoke passed but printed no complete smoke line", body)
+        catch = body.find("} catch {", body.find("post-restart smoke passed but printed"))
+        self.assertIn("Restore-Payload $payloadBak", body[catch:])
+        # The smoke lines are never folded into the outcome line.
+        self.assertNotIn("smoke", function_body(self.text, "Format-OutcomeLine"))
+
+    def test_helper_smoke_line_still_carries_every_field(self):
+        """The parser reads the helper's own success format; pin the helper side too."""
+        src = HELPER.read_text("utf-8")
+        cmd = src[src.index("def _cmd_smoke"):src.index("_COMMANDS = {")]
+        self.assertIn('print("smoke=%s ', cmd)
+        for k in SMOKE_FIELDS:
+            self.assertIn(f"{k}=%", cmd, k)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh is required to run the smoke parser")
+    def test_success_output_parses_into_the_seven_fields_and_one_line(self):
+        out = "uv: resolved 0 packages\n" + SMOKE_OK + "\n"
+        lines = self.pwsh(smoke_functions(self.text) +
+                          f"\n$m = ConvertFrom-SmokeOutput {ps_quote(out)}"
+                          "\n($m.Keys -join ',')"
+                          "\n($m.Values -join ',')"
+                          "\nFormat-SmokeLine 'pre' $m"
+                          "\nFormat-SmokeLine 'post' $m")
+        self.assertEqual(lines[0], ",".join(SMOKE_FIELDS))
+        self.assertEqual(lines[1], ",".join(SMOKE_MAP[k] for k in SMOKE_FIELDS))
+        self.assertEqual(lines[2], "smoke_check=pre smoke=ok " + SMOKE_FIELDS_LINE)
+        self.assertEqual(lines[3], "smoke_check=post smoke=ok " + SMOKE_FIELDS_LINE)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh is required to run the smoke parser")
+    def test_rollback_target_na_fields_parse(self):
+        out = ("smoke=ok ticket_schema=ok rizzstack_validators=absent brief_schema=n/a attempt_schema=n/a"
+               " brief_validation=n/a modules=9 hyvv_version=0.1.18")
+        lines = self.pwsh(smoke_functions(self.text) + f"\nFormat-SmokeFields (ConvertFrom-SmokeOutput {ps_quote(out)})")
+        self.assertEqual(lines, ["ticket_schema=ok brief_schema=n/a attempt_schema=n/a rizzstack_validators=absent"
+                                 " brief_validation=n/a modules=9 hyvv_version=0.1.18"])
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh is required to run the smoke parser")
+    def test_unrecordable_output_parses_to_null(self):
+        bad = [
+            "",
+            "smoke=fail ticket_schema=ok rizzstack_validators=imported brief_schema=ok attempt_schema=ok"
+            " brief_validation=unavailable modules=13 hyvv_version=0.1.19",
+            SMOKE_OK.replace(" modules=13", ""),
+            SMOKE_OK.replace("hyvv_version=0.1.19", "hyvv_version=" + "x" * 65),
+            SMOKE_OK.replace("brief_validation=valid", "brief_validation=va\"lid"),
+            "note: " + SMOKE_OK,
+        ]
+        script = smoke_functions(self.text) + "".join(
+            f"\nif ($null -eq (ConvertFrom-SmokeOutput {ps_quote(b)})) {{ 'null' }} else {{ 'parsed' }}" for b in bad)
+        self.assertEqual(self.pwsh(script), ["null"] * len(bad))
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh is required to run the smoke formatter")
+    def test_stored_values_that_are_not_tokens_are_never_echoed(self):
+        lines = self.pwsh(smoke_functions(self.text) +
+                          "\n$o = '{\"ticket_schema\":\"ok\",\"brief_schema\":\"Bearer abc def\",\"modules\":13}' | ConvertFrom-Json"
+                          "\nFormat-SmokeFields $o"
+                          "\nFormat-SmokeFields $null")
+        self.assertEqual(lines[0], "ticket_schema=ok brief_schema=invalid attempt_schema=unknown"
+                                   " rizzstack_validators=unknown brief_validation=unknown modules=13 hyvv_version=unknown")
+        self.assertEqual(lines[1], "none")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh is required to run the phase writer")
+    def test_state_file_and_audit_record_carry_smoke_pre_and_post(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            audit = data / "admin-audit.jsonl"
+            fns = "\n".join(function_body(self.text, n) for n in ("Get-BuildSha", "Write-Phase", "ConvertTo-JsonLine", "Write-Audit"))
+            self.pwsh(smoke_functions(self.text) + "\n" + fns +
+                      f"\n$Data = {ps_quote(data)}; $AuditPath = {ps_quote(audit)}"
+                      f"\n$m = ConvertFrom-SmokeOutput {ps_quote(SMOKE_OK)}"
+                      "\n$script:DeployState = @{ target = 't'; old_sha = 'o'; started = Get-Date; started_at = 's' }"
+                      "\n$script:DeployState['smoke_pre'] = $m"
+                      "\n$script:DeployState['smoke_post'] = $m"
+                      "\nWrite-Phase 'done' 'ok' | Out-Null"
+                      "\n$a = [ordered]@{ new_sha = 't'; smoke_pre = $m; smoke_post = $m }"
+                      "\nWrite-Audit 'apply-update' $true 'updated o -> t' $null $a")
+            state = json.loads((data / "apply-update.state.json").read_text("utf-8-sig"))
+            self.assertEqual(state["phase"], "done")
+            self.assertEqual(state["smoke_pre"], SMOKE_MAP)
+            self.assertEqual(state["smoke_post"], SMOKE_MAP)
+            self.assertEqual(list(state["smoke_pre"]), list(SMOKE_FIELDS))
+            rec = json.loads(audit.read_text("utf-8-sig").strip().splitlines()[-1])
+            self.assertEqual(rec["args"]["smoke_pre"], SMOKE_MAP)
+            self.assertEqual(rec["args"]["smoke_post"], SMOKE_MAP)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh is required to run update-status")
+    def test_update_status_shows_both_checks_and_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            data = home / ".orbit-launcher"
+            data.mkdir()
+            rec = {"ts": "2026-11-27T14:53:55-05:00", "op": "apply-update", "ok": True,
+                   "detail": f"updated {OLD} -> {TARGET}", "backup": None,
+                   "args": {"new_sha": TARGET, "smoke_pre": SMOKE_MAP, "smoke_post": SMOKE_MAP},
+                   "user": "u", "src": "ssh"}
+            (data / "admin-audit.jsonl").write_text(json.dumps(rec) + "\n", encoding="utf-8")
+            (data / "apply-update.state.json").write_text(json.dumps({
+                "op": "apply-update", "target": TARGET, "old_sha": OLD, "phase": "done", "outcome": "ok",
+                "deployed": TARGET, "version": "0.1.19+g521e9bc", "build_sha": "521e9bc", "revert": "none",
+                "startup_s": "430", "started_at": "2026-11-27T19:46:09Z", "updated_at": "2026-11-27T19:53:55Z",
+                "smoke_pre": SMOKE_MAP, "smoke_post": SMOKE_MAP}), encoding="utf-8")
+            before = {p.name: p.read_bytes() for p in data.iterdir()}
+            env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
+            env.pop("SSH_ORIGINAL_COMMAND", None)
+            r = run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(ADMIN), "update-status"], env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            lines = r.stdout.splitlines()
+            self.assertIn("state_outcome=ok", lines)
+            self.assertIn("state_smoke_pre=" + SMOKE_FIELDS_LINE, lines)
+            self.assertIn("state_smoke_post=" + SMOKE_FIELDS_LINE, lines)
+            self.assertIn("last_apply_update_ok=yes", lines)
+            self.assertIn("last_apply_update_smoke_pre=" + SMOKE_FIELDS_LINE, lines)
+            self.assertIn("last_apply_update_smoke_post=" + SMOKE_FIELDS_LINE, lines)
+            self.assertEqual({p.name: p.read_bytes() for p in data.iterdir()}, before)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh is required to run update-status")
+    def test_update_status_before_this_change_reports_none(self):
+        """State and audit records written by an older apply-update have no smoke fields."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            data = home / ".orbit-launcher"
+            data.mkdir()
+            (data / "admin-audit.jsonl").write_text(json.dumps({"ts": "x", "op": "apply-update", "ok": True,
+                                                                "detail": "updated", "args": {"new_sha": TARGET}}) + "\n",
+                                                    encoding="utf-8")
+            (data / "apply-update.state.json").write_text(json.dumps({"phase": "done", "outcome": "ok"}), encoding="utf-8")
+            env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
+            env.pop("SSH_ORIGINAL_COMMAND", None)
+            r = run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(ADMIN), "update-status"], env=env, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            for key in ("state_smoke_pre", "state_smoke_post", "last_apply_update_smoke_pre", "last_apply_update_smoke_post"):
+                self.assertIn(f"{key}=none", r.stdout.splitlines())
 
 
 if __name__ == "__main__":
