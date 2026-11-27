@@ -170,5 +170,14 @@ class ExistingRefusals(unittest.TestCase):
         self.assertIn("objective", body.get("error", ""))
 
 
+class PublicAttemptSchema(unittest.TestCase):
+    def test_the_public_attempt_schema_declares_brief_validation(self):
+        schema = json.loads((HERE / "contract" / "v1" / "schemas" / "attempt.json").read_text(encoding="utf-8"))
+        self.assertIs(schema.get("additionalProperties"), False, "the public attempt schema stays a closed object")
+        props = schema.get("properties") or {}
+        self.assertIn("brief_validation", props, "the additive attempt field must be declared, not an extra key")
+        self.assertEqual(props["brief_validation"].get("type"), ["object", "null"])
+
+
 if __name__ == "__main__":
     unittest.main()
