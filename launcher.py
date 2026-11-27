@@ -9,7 +9,7 @@ narrow token-scoped HTTP API on loopback or a Tailscale address only.
   uv run --with cua==0.5.0 launcher.py doctor --config config.json
 """
 from __future__ import annotations
-import argparse, asyncio, bisect, platform, hashlib, hmac, ipaddress, json, os, re, shlex, socket, sys, threading, time, uuid
+import argparse, asyncio, bisect, platform, hashlib, hmac, ipaddress, json, os, re, shlex, socket, sys, tempfile, threading, time, uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -2462,23 +2462,30 @@ class Launcher:
     # journal: one JSON per attempt (atomic replace) + append-only events log
     def _path(self, aid): return self.dir / "attempts" / f"{aid}.json"
     def _save(self, a):
-        p = self._path(a["attempt_id"]); tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(a, indent=1), "utf-8")
-        last = None
-        delays = _save_replace_delays()
-        for i in range(SAVE_REPLACE_TRIES):
-            try:
-                os.replace(tmp, p)
-                try: self.publish_runtime_status()
-                except Exception: pass
-                return
-            except OSError as ex:
-                if not replace_retryable(ex):
-                    raise
-                last = ex
-                if i < len(delays):
-                    time.sleep(delays[i])
-        raise last
+        p = self._path(a["attempt_id"])
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=p.parent)
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(a, indent=1))
+            last = None
+            delays = _save_replace_delays()
+            for i in range(SAVE_REPLACE_TRIES):
+                try:
+                    os.replace(tmp, p)
+                    try: self.publish_runtime_status()
+                    except Exception: pass
+                    return
+                except OSError as ex:
+                    if not replace_retryable(ex):
+                        raise
+                    last = ex
+                    if i < len(delays):
+                        time.sleep(delays[i])
+            assert last is not None
+            raise last
+        finally:
+            tmp.unlink(missing_ok=True)
     def _append_events(self, a, evs):
         path = self.dir / "attempts" / f"{a['attempt_id']}.events.jsonl"
         try:
