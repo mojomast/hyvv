@@ -1,0 +1,46 @@
+{
+ "id": "wave-b-b4",
+ "lease_version": "rizzstack.lease/1",
+ "slice": "wave-b-b4",
+ "branch": "feat/wave-b-b4",
+ "contract_id": "wave-b-b4",
+ "contract_sha256": "9a719bc5eb3942f66e500d7ff54813229bb58b3df53979603424d885ec02bf96",
+ "source_rev": "9e89e0d17b8bcc038d1c3cd4a5a0779414cce80b",
+ "scope": {
+  "assigned_files": [
+   "launcher.py"
+  ],
+  "test_files": [
+   "tests/test_brief_contract_v1.py"
+  ],
+  "prohibited": [
+   "tests/test_brief_contract_v1.py",
+   "hyvv/rizzstack_validators.py",
+   "schemas/rizzstack-brief.schema.json",
+   "schemas/rizzstack-attempt.schema.json",
+   "CHANGELOG.md",
+   ".github/workflows/**",
+   "pyproject.toml",
+   "uv.lock",
+   "evidence/**"
+  ],
+  "read_only": [
+   "brief.schema.json",
+   "schemas/rizzstack-ticket.schema.json",
+   "hyvv/rizzstack_validators.py",
+   "schemas/rizzstack-brief.schema.json",
+   "schemas/rizzstack-attempt.schema.json"
+  ]
+ },
+ "derived_from": {
+  "contract": "B4",
+  "approved_by": "Kyle (owner), typed approval in chat, 2026-11-26: approved: 9a719bc5 (B4)",
+  "approved_at": "2026-11-26T22:40:02Z"
+ },
+ "review": {
+  "status": "approved",
+  "approved_by": "Kyle (owner), typed approval in chat, 2026-11-26: approved: 9a719bc5 (B4)",
+  "approved_at": "2026-11-26T22:40:02Z",
+  "contract_sha256": "9a719bc5eb3942f66e500d7ff54813229bb58b3df53979603424d885ec02bf96"
+ }
+}
