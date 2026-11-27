@@ -1,0 +1,41 @@
+{
+ "id": "wave-b-b6-r3",
+ "lease_version": "rizzstack.lease/1",
+ "slice": "wave-b-b6-r3",
+ "branch": "feat/wave-b-b6-r3",
+ "contract_id": "wave-b-b6-enforce",
+ "contract_sha256": "da07129c76edb6847db39efe08e1baf0baad2819bafe478d55d4c9bbd68add9f",
+ "source_rev": "20e85a4773870c93639f51385d9b37200be970e4",
+ "scope": {
+  "assigned_files": [
+   "launcher.py"
+  ],
+  "test_files": [
+   "tests/test_brief_enforce.py"
+  ],
+  "prohibited": [
+   "tests/test_brief_enforce.py",
+   "CHANGELOG.md",
+   ".github/workflows/**",
+   "pyproject.toml",
+   "uv.lock",
+   "schemas/**",
+   "hyvv/rizzstack_validators.py"
+  ],
+  "read_only": [
+   "hyvv/rizzstack_validators.py",
+   "schemas/rizzstack-brief.schema.json"
+  ]
+ },
+ "derived_from": {
+  "contract": "B6-r3",
+  "approved_by": "Kyle (owner), typed approval in chat, 2026-11-27: approved: da07129c (B6-r3; 503 brief_validation_unavailable kept)",
+  "approved_at": "2026-11-27T18:51:33Z"
+ },
+ "review": {
+  "status": "approved",
+  "approved_by": "Kyle (owner), typed approval in chat, 2026-11-27: approved: da07129c (B6-r3; 503 brief_validation_unavailable kept)",
+  "approved_at": "2026-11-27T18:51:33Z",
+  "contract_sha256": "da07129c76edb6847db39efe08e1baf0baad2819bafe478d55d4c9bbd68add9f"
+ }
+}
