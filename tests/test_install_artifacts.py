@@ -338,3 +338,34 @@ class BuiltArtifacts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+    def test_every_runtime_schema_is_in_the_built_wheel(self):
+        # Reuse the artifact build from Artifacts (same module, one build).
+        expected = {
+            str(path.relative_to(ROOT))
+            for path in sorted((ROOT / "schemas").rglob("*"))
+            if path.is_file()
+        }
+        expected |= {
+            "brief.schema.json",
+            "result.schema.json",
+            "contract/v1/schemas/attempt.json",
+        }
+        with zipfile.ZipFile(self.wheel) as archive:
+            names = set(archive.namelist())
+        missing = sorted(name for name in expected if name not in names)
+        self.assertEqual(missing, [], f"runtime schemas missing from the wheel: {missing}")
+
+
+class SchemaPayload(unittest.TestCase):
+    """Every runtime schema ships in both artifacts, not just the source tree."""
+
+    def test_wheel_mapping_covers_the_whole_schemas_directory(self):
+        build = PYPROJECT["tool"]["hatch"]["build"]["targets"]
+        self.assertIn("schemas/**", build["sdist"]["include"])
+        force_include = build["wheel"]["force-include"]
+        self.assertEqual(force_include.get("schemas"), "schemas")
+        self.assertEqual(
+            force_include.get("contract/v1/schemas"), "contract/v1/schemas"
+        )

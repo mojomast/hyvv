@@ -47,6 +47,7 @@ include = [
   "brief.schema.json",
   "result.schema.json",
   "config.example.json",
+  "schemas/**",
   "contract/**",
   "scripts/**",
   "tests/**",
@@ -70,6 +71,8 @@ packages = ["hyvv"]
 "brief.schema.json" = "brief.schema.json"
 "result.schema.json" = "result.schema.json"
 "config.example.json" = "hyvv/config.example.json"
+"schemas" = "schemas"
+"contract/v1/schemas" = "contract/v1/schemas"
 
 [tool.uv]
 # Install and lock with uv. Signed releases are produced by .github/workflows/release.yml.
