@@ -1,7 +1,9 @@
 . "$PSScriptRoot\common.ps1"
-# How long to wait for the launcher to bind and answer loopback health (startup can take
-# ~96s of heavy CPU before it listens). Override with HYVV_START_HEALTH_WAIT_S.
-$HealthWaitSeconds = 180
+# How long (wall-clock seconds) to wait for the launcher to bind and answer loopback health.
+# Startup is CPU-bound and grows with the attempt journal (~414 s measured at ~1300 attempts),
+# so the default leaves ~3x margin. Override with HYVV_START_HEALTH_WAIT_S (launcher-admin.ps1
+# passes its own configured wait down this way).
+$HealthWaitSeconds = 1200
 if ($env:HYVV_START_HEALTH_WAIT_S -match '^[0-9]+$') { $HealthWaitSeconds = [int]$env:HYVV_START_HEALTH_WAIT_S }
 if (-not (Test-Path $Config)) { Copy-Item (Join-Path $Root 'config.example.json') $Config; Write-Host "Created $Config - edit projects, then re-run."; exit 1 }
 if ((Test-Path $PidFile) -and (Get-Process -Id (Get-Content $PidFile) -EA 0)) { Write-Host 'Already running (use stop.ps1 first to restart).'; exit 0 }
@@ -45,7 +47,10 @@ function Test-LoopbackHealthy([int]$Port) {
   }
 }
 $ok = $false
-for ($i = 0; $i -lt $HealthWaitSeconds -and -not $ok; $i++) {
+# A wall-clock deadline, not an iteration count: each pass also spends time on the process
+# query and the probe, so 'N passes' used to mean several times N seconds.
+$healthDeadline = (Get-Date).AddSeconds($HealthWaitSeconds)
+while (-not $ok -and (Get-Date) -lt $healthDeadline) {
   Start-Sleep 1
   $procs = @(Get-LauncherProcesses)
   if (-not $procs.Count) { continue }
