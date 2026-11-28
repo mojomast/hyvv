@@ -1,0 +1,52 @@
+{
+  "branch": "feat/recovery-bounded",
+  "contract_id": "recovery-bounded",
+  "contract_sha256": "2a3a2cad3027c49fba640faa83b300d8f85e69f03dcfa36af4c15d68d268eddc",
+  "derived_from": {
+    "approved_at": "2026-11-28T00:36:44Z",
+    "approved_by": "Kyle (owner) typed: approved: f23d3ab3 2a3a2cad (gate-authority r5 and hyvv recovery-bounded), 2026-11-27",
+    "contract": ".rizzstack/contracts/2a3a2cad3027c49fba640faa83b300d8f85e69f03dcfa36af4c15d68d268eddc.json"
+  },
+  "id": "recovery-bounded",
+  "lease_version": "rizzstack.lease/1",
+  "review": {
+    "approved_at": "2026-11-28T00:36:44Z",
+    "approved_by": "Kyle (owner) typed: approved: f23d3ab3 2a3a2cad (gate-authority r5 and hyvv recovery-bounded), 2026-11-27",
+    "note": "contract_sha256 names the approved frozen contract; scope and source_rev are its verbatim scope",
+    "status": "frozen"
+  },
+  "scope": {
+    "assigned_files": [
+      "launcher.py",
+      "rails_emitter.py",
+      "landing_export.py"
+    ],
+    "prohibited": [
+      "CHANGELOG.md",
+      ".rizzstack/**",
+      ".github/**",
+      "conftest.py",
+      "**/conftest.py",
+      "pyproject.toml",
+      "uv.lock",
+      "scripts/start.ps1"
+    ],
+    "read_only": [
+      "tests/test_landing_events.py",
+      "tests/test_landing_export.py",
+      "tests/test_landing_export_storage.py",
+      "tests/test_landing_export_cursor.py",
+      "tests/test_landing_publication.py",
+      "tests/test_rails_emission.py",
+      "tests/test_rails_native.py",
+      "contrib/**",
+      "rails_log_source.py",
+      "rails_export.py"
+    ],
+    "test_files": [
+      "tests/test_recovery_bounded.py"
+    ]
+  },
+  "slice": "recovery-bounded",
+  "source_rev": "03871f1f53f64b4f3a3e44a0b558889615c2870b"
+}
