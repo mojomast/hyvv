@@ -1,0 +1,244 @@
+{
+  "acceptance_criteria": [
+    {
+      "id": "AC-001",
+      "statement": "A restart parses each landed outbox file at most twice (outbox file opens <= 2N on a mixed journal with recorded and missing events), not once per terminal attempt.",
+      "tests": [
+        "tests/test_recovery_bounded.py::RecoveryScalingTest::test_restart_parses_each_outbox_file_at_most_twice"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-002",
+      "statement": "Outbox reads scale linearly: tripling the attempts at most ~triples the reads (b <= 3a + 6); a per-attempt full scan (O(N^2)) fails.",
+      "tests": [
+        "tests/test_recovery_bounded.py::RecoveryScalingTest::test_outbox_reads_grow_linearly_not_quadratically"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-003",
+      "statement": "A restart reads the export index at most twice regardless of N (batched registration, no per-attempt _load_index/_reconcile).",
+      "tests": [
+        "tests/test_recovery_bounded.py::RecoveryScalingTest::test_restart_loads_the_export_index_a_constant_number_of_times"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-004",
+      "statement": "All landed files recovered in one restart are registered in one batch: at most one export-index write, and exactly the missing events are created.",
+      "tests": [
+        "tests/test_recovery_bounded.py::RecoveryScalingTest::test_restart_writes_the_export_index_once_for_a_batch"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-005",
+      "statement": "A restart opens at most 3 rails.sqlite writer connections, and the same number for N=6 and N=24 (one writer reused for recovery ingest and receipts).",
+      "tests": [
+        "tests/test_recovery_bounded.py::RecoveryScalingTest::test_restart_reuses_one_rails_writer"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-006",
+      "statement": "Attempts whose landed record and receipt are already recorded are skipped: emit_landed_record and RailsEmitter.receipt are called for none of them, outbox reads <= N and writer opens <= 2.",
+      "tests": [
+        "tests/test_recovery_bounded.py::RecoveryIdempotenceTest::test_recorded_attempts_are_skipped_on_restart"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-007",
+      "regression": true,
+      "statement": "A second restart writes nothing: no write-mode opens under events/, outbox files, export index bytes, rails event rows and receipts are unchanged.",
+      "tests": [
+        "tests/test_recovery_bounded.py::RecoveryIdempotenceTest::test_second_restart_writes_nothing"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-008",
+      "regression": true,
+      "statement": "Partial state (terminal journal written, outbox write lost) recovers exactly the missing events once; existing outbox files are untouched; index positions stay 1..N with no conflicts.",
+      "tests": [
+        "tests/test_recovery_bounded.py::RecoveryIdempotenceTest::test_partial_state_recovers_exactly_the_missing_events"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-009",
+      "regression": true,
+      "statement": "Conflicting evidence (journal state differs from the recorded landed event) is still detected and reported in landing_conflicts for exactly that attempt; the outbox is not changed.",
+      "tests": [
+        "tests/test_recovery_bounded.py::RecoveryIdempotenceTest::test_conflicting_outbox_evidence_is_still_detected"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-010",
+      "regression": true,
+      "statement": "An interrupted outbox write (torn dot-tmp file) is ignored and every attempt ends with exactly one landed event across two restarts.",
+      "tests": [
+        "tests/test_recovery_bounded.py::InterruptedWriteTest::test_stale_outbox_temp_file_is_ignored_and_the_event_written_once"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-011",
+      "statement": "A lost export index is rebuilt on restart with all N events and no conflicts, reading each outbox file a bounded number of times (<= 3N).",
+      "tests": [
+        "tests/test_recovery_bounded.py::InterruptedWriteTest::test_lost_export_index_is_rebuilt_in_one_pass"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-012",
+      "regression": true,
+      "statement": "An interrupted receipt (outbox written, receipt append lost) is recorded on the next restart exactly once per attempt; a further restart adds no rails rows.",
+      "tests": [
+        "tests/test_recovery_bounded.py::InterruptedWriteTest::test_interrupted_receipt_is_recorded_exactly_once"
+      ],
+      "verification": "test"
+    },
+    {
+      "id": "AC-013",
+      "regression": true,
+      "statement": "Notifier replay after a bounded restart delivers the same events in the same order as before (10/10).",
+      "tests": [
+        "tests/test_recovery_bounded.py::ReplayTest::test_replay_after_bounded_restart_is_unchanged"
+      ],
+      "verification": "test"
+    }
+  ],
+  "assumptions": [
+    "Counts come from a CPython audit hook ('open', 'sqlite3.connect') installed by the test module; it observes only and is gated to the restart under test.",
+    "A throwaway GREEN prototype (not committed) passed all 13 tests and the full existing suite (851 passed, 3 skipped), so the bounds are satisfiable without weakening any check.",
+    "Six ACs are regression guards that pass on main and must keep passing."
+  ],
+  "authorization": {
+    "human_gates": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish",
+      "restart"
+    ],
+    "not_authorized": [
+      "merge",
+      "tag",
+      "release",
+      "deploy",
+      "publish",
+      "restart",
+      "live worker runs",
+      "force-push",
+      "branch deletion",
+      "edit approved tests",
+      "ruleset or settings changes"
+    ]
+  },
+  "contract_version": "acdd/1",
+  "dependencies": [],
+  "evidence_required": [
+    "red",
+    "green",
+    "review"
+  ],
+  "id": "recovery-bounded",
+  "interfaces": [
+    {
+      "change": "modify",
+      "kind": "method",
+      "name": "Launcher.recover_landed_events"
+    },
+    {
+      "change": "modify",
+      "kind": "function",
+      "name": "emit_landed_record"
+    },
+    {
+      "change": "modify",
+      "kind": "method",
+      "name": "RailsEmitter.recover"
+    },
+    {
+      "change": "modify",
+      "kind": "method",
+      "name": "RailsEmitter.receipt"
+    },
+    {
+      "change": "modify",
+      "kind": "function",
+      "name": "landing_export.register_landed_file"
+    }
+  ],
+  "outcome": {
+    "observable_behavior": [
+      "outbox file opens per restart are O(N)",
+      "export index reads/writes per restart are O(1)",
+      "rails writer opens per restart are O(1)",
+      "a fully recorded journal restarts without emitting or appending"
+    ],
+    "summary": "Launcher startup recovery does one outbox scan into an attempt-indexed map, registers all recovered landed files in one batched export-index update, reuses one rails.sqlite writer for journal ingest and receipts, and skips attempts whose landed record and receipt already exist after a cheap read-only check. Conflict detection, partial-state recovery, interrupted-write recovery and notifier replay are unchanged. Fixes the O(N^2) restart (~414 s at 1297 attempts) in #106."
+  },
+  "review": {
+    "approved_at": "2026-11-28T00:36:44Z",
+    "approved_by": "Kyle (owner) typed: approved: f23d3ab3 2a3a2cad (gate-authority r5 and hyvv recovery-bounded), 2026-11-27",
+    "contract_sha256": "2a3a2cad3027c49fba640faa83b300d8f85e69f03dcfa36af4c15d68d268eddc",
+    "status": "approved"
+  },
+  "risk": {
+    "blast_radius": "launcher startup recovery on worker PCs: landed events, export index, rails.sqlite receipts",
+    "reasons": [
+      "durable evidence path; idempotence and conflict detection must not regress"
+    ],
+    "tier": "medium"
+  },
+  "scope": {
+    "assigned_files": [
+      "launcher.py",
+      "rails_emitter.py",
+      "landing_export.py"
+    ],
+    "prohibited": [
+      "CHANGELOG.md",
+      ".rizzstack/**",
+      ".github/**",
+      "conftest.py",
+      "**/conftest.py",
+      "pyproject.toml",
+      "uv.lock",
+      "scripts/start.ps1"
+    ],
+    "read_only": [
+      "tests/test_landing_events.py",
+      "tests/test_landing_export.py",
+      "tests/test_landing_export_storage.py",
+      "tests/test_landing_export_cursor.py",
+      "tests/test_landing_publication.py",
+      "tests/test_rails_emission.py",
+      "tests/test_rails_native.py",
+      "contrib/**",
+      "rails_log_source.py",
+      "rails_export.py"
+    ],
+    "test_files": [
+      "tests/test_recovery_bounded.py"
+    ]
+  },
+  "source_rev": "03871f1f53f64b4f3a3e44a0b558889615c2870b",
+  "tdd": {
+    "applicable": true
+  },
+  "title": "Bounded launcher recovery: linear restart cost in the attempt journal (#106)",
+  "verification": {
+    "commands": [
+      "env -u PYTHONPATH python3 -m pytest -q -p no:cacheprovider tests/test_recovery_bounded.py",
+      "env -u PYTHONPATH python3 -m pytest -q -p no:cacheprovider tests"
+    ],
+    "independent": true,
+    "integration": true
+  }
+}
