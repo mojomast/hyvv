@@ -57,6 +57,9 @@
   "tests/test_r4_run_command_design.py": {
     "complexity": 1
   },
+  "tests/test_recovery_bounded.py": {
+    "complexity": 1
+  },
   "tests/test_version_endpoint.py": {
     "complexity": 1
   },
