@@ -1,7 +1,8 @@
 """Optional in-process worker observer. Durable JSONL/outbox remain authoritative."""
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 import json
+import sqlite3
 import sys
 import threading
 from pathlib import Path
@@ -36,7 +37,41 @@ class RailsEmitter:
     def _writer(self):
         return RailsLedger(str(self.path), allowed_authorities={"worker_report"})
 
-    def recover(self, attempts):
+    @staticmethod
+    def _close_writer(db):
+        if db is None:
+            return
+        try:
+            db.close()
+        except sqlite3.Error:
+            pass
+
+    @contextmanager
+    def recovery_writer(self):
+        """One ledger writer shared by startup journal ingest and receipt replay.
+
+        Recovery used to open a fresh writer per journal and per receipt. Keeping
+        one connection for the whole pass makes restart cost independent of the
+        attempt count without changing what is written.
+        """
+        db = None
+        try:
+            db = self._writer()
+        except Exception:
+            self._errors.setdefault("init", "storage_unavailable")
+        try:
+            yield db
+        finally:
+            self._close_writer(db)
+
+    def recover(self, attempts, *, writer=None):
+        if writer is None:
+            with self.recovery_writer() as db:
+                self._recover_attempts(attempts, db)
+        else:
+            self._recover_attempts(attempts, writer)
+
+    def _recover_attempts(self, attempts, writer):
         seen = set()
         try:
             # Path.glob may swallow directory listing errors; partial evidence
@@ -45,7 +80,7 @@ class RailsEmitter:
                 if path.name.endswith(".events.jsonl"):
                     aid = path.name.removesuffix(".events.jsonl")
                     seen.add(aid)
-                    self.ingest(aid, expected_seq=attempts.get(aid, {}).get("lseq"))
+                    self.ingest(aid, expected_seq=attempts.get(aid, {}).get("lseq"), writer=writer)
         except OSError:
             self._errors["recovery"] = "journal_listing_unavailable"
         expected = {aid for aid, a in attempts.items() if a.get("lseq")}
@@ -59,6 +94,22 @@ class RailsEmitter:
         for aid in expected - seen:
             self._errors[("log", aid)] = "missing_journal"
         self._ready = True
+
+    def final_receipts(self):
+        """Recorded final usage dedupe keys, or None when the ledger is unreadable.
+
+        This is a read-only check used to skip replay of receipts that already
+        exist. None means "unknown", so callers must not treat it as "none".
+        """
+        try:
+            with closing(RailsLedger(str(self.path), read_only=True)) as db:
+                rows = db.query(
+                    "SELECT dedupe_key FROM dedupe_index WHERE dedupe_key LIKE ?", ("%:final",)
+                )
+            return {row["dedupe_key"] for row in rows
+                    if isinstance(row.get("dedupe_key"), str)}
+        except Exception:
+            return None
 
     @staticmethod
     def _writer_args(event):
@@ -75,68 +126,79 @@ class RailsEmitter:
         with self._lock:
             self._errors[("write", aid)] = "journal_write_unconfirmed"
 
-    def ingest(self, aid, *, expected_seq=None):
+    def ingest(self, aid, *, expected_seq=None, writer=None):
         """Identical entry point for just-flushed native logs and startup replay."""
         with self._lock:
             error_key = ("log", aid)
+            own = writer is None
+            db = writer
             try:
+                if db is None:
+                    db = self._writer()
                 source = LogSource(self.root / "attempts" / f"{aid}.events.jsonl", aid)
-                with closing(self._writer()) as db:
 
-                    def work(conn):
-                        prev = conn.execute(
-                            "SELECT cursor FROM hyvv_log_cursor WHERE attempt=?", (aid,)
-                        ).fetchone()
-                        token = prev[0] if prev else None
-                        cursor = Cursor.decode(token)
-                        page = source.read_batch(token)
-                        next_c = Cursor.decode(page["next_cursor"])
-                        # Pin parser limits and authority to the versioned R02
-                        # primitive. All appends and the offset advance share
-                        # this transaction (including a missing-range notice).
-                        for event in page["records"]:
-                            db._append_locked(conn, **self._writer_args(event))
-                        if next_c != cursor:
-                            if next_c.offset != cursor.offset or next_c.generation != cursor.generation:
-                                mark = diagnostic(
-                                    aid,
-                                    next_c,
-                                    "source.checkpoint",
-                                    "bytes_consumed",
-                                    next_c.offset,
-                                    next_c.offset,
-                                    "offset",
-                                    next_c.offset,
-                                )
-                                db._append_locked(conn, **self._writer_args(mark))
-                            conn.execute(
-                                "INSERT OR REPLACE INTO hyvv_log_cursor VALUES (?,?)",
-                                (aid, page["next_cursor"]),
+                def work(conn):
+                    prev = conn.execute(
+                        "SELECT cursor FROM hyvv_log_cursor WHERE attempt=?", (aid,)
+                    ).fetchone()
+                    token = prev[0] if prev else None
+                    cursor = Cursor.decode(token)
+                    page = source.read_batch(token)
+                    next_c = Cursor.decode(page["next_cursor"])
+                    # Pin parser limits and authority to the versioned R02
+                    # primitive. All appends and the offset advance share
+                    # this transaction (including a missing-range notice).
+                    for event in page["records"]:
+                        db._append_locked(conn, **self._writer_args(event))
+                    if next_c != cursor:
+                        if next_c.offset != cursor.offset or next_c.generation != cursor.generation:
+                            mark = diagnostic(
+                                aid,
+                                next_c,
+                                "source.checkpoint",
+                                "bytes_consumed",
+                                next_c.offset,
+                                next_c.offset,
+                                "offset",
+                                next_c.offset,
                             )
-                        return page
+                            db._append_locked(conn, **self._writer_args(mark))
+                        conn.execute(
+                            "INSERT OR REPLACE INTO hyvv_log_cursor VALUES (?,?)",
+                            (aid, page["next_cursor"]),
+                        )
+                    return page
 
-                    while True:
-                        page = db._write_tx(work)
-                        if not page["has_more"]:
-                            break
-                if page["diagnostics"]:
-                    self._partial.add(aid)
-                else:
-                    self._partial.discard(aid)
-                if type(expected_seq) is int and expected_seq > Cursor.decode(page["next_cursor"]).seq:
-                    # A clean EOF behind a retained native manifest isn't a
-                    # complete replay, even if ingest never saw the lost tail.
-                    self._errors[("write", aid)] = "journal_shorter_than_manifest"
-                self._errors.pop(error_key, None)
+                while True:
+                    page = db._write_tx(work)
+                    if not page["has_more"]:
+                        break
+                self._record_ingest_result(aid, page, expected_seq, error_key)
             except Exception:
                 self._errors[error_key] = "replay_required"
+            finally:
+                if own:
+                    self._close_writer(db)
 
-    def receipt(self, aid, block, models, *, agy=False):
+    def _record_ingest_result(self, aid, page, expected_seq, error_key):
+        if page["diagnostics"]:
+            self._partial.add(aid)
+        else:
+            self._partial.discard(aid)
+        if type(expected_seq) is int and expected_seq > Cursor.decode(page["next_cursor"]).seq:
+            # A clean EOF behind a retained native manifest isn't a
+            # complete replay, even if ingest never saw the lost tail.
+            self._errors[("write", aid)] = "journal_shorter_than_manifest"
+        self._errors.pop(error_key, None)
+
+    def receipt(self, aid, block, models, *, agy=False, writer=None):
         """Use only the persisted landing receipt's allowlisted count block."""
         if not block:
             return
         with self._lock:
             key = ("usage", aid)
+            own = writer is None
+            db = writer
             try:
                 if not ATTEMPT.fullmatch(aid):
                     raise ValueError("unsupported attempt identity")
@@ -159,15 +221,19 @@ class RailsEmitter:
                     "output_tokens": count("output"),
                     "thinking_tokens": count("thinking") if "thinking" in block else count("reasoning"),
                 }
-                with closing(self._writer()) as db:
-                    row = db.query("SELECT cursor FROM hyvv_log_cursor WHERE attempt=?", (aid,))
-                    c = Cursor(**json.loads(row[0]["cursor"])) if row else Cursor()
-                    event = candidate(aid, c.generation, 0, "receipt", "usage.observed", payload, run=c.run)
-                    event["dedupe_key"] = aid + ":final"
-                    db.append(**self._writer_args(event))
+                if db is None:
+                    db = self._writer()
+                row = db.query("SELECT cursor FROM hyvv_log_cursor WHERE attempt=?", (aid,))
+                c = Cursor(**json.loads(row[0]["cursor"])) if row else Cursor()
+                event = candidate(aid, c.generation, 0, "receipt", "usage.observed", payload, run=c.run)
+                event["dedupe_key"] = aid + ":final"
+                db.append(**self._writer_args(event))
                 self._errors.pop(key, None)
             except Exception:
                 self._errors[key] = "receipt_replay_required"
+            finally:
+                if own:
+                    self._close_writer(db)
 
     def health(self):
         with self._lock:

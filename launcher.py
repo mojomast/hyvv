@@ -745,6 +745,33 @@ def _find_landed_events(outbox, attempt_id):
     return found
 
 
+def _scan_landed_events(outbox):
+    """Read the outbox once into an attempt_id -> (path, event) map.
+
+    Recovery used to rescan the whole outbox for every terminal attempt. The
+    first record for an attempt wins, matching the ordered search that a single
+    emit performs. Missing directories mean no landed events, not a failure.
+    """
+    try:
+        with os.scandir(outbox) as entries:
+            paths = sorted(Path(e.path) for e in entries
+                           if e.name.endswith(".json") and e.is_file(follow_symlinks=False))
+    except FileNotFoundError:
+        return {}
+    found = {}
+    for path in paths:
+        try:
+            event = json.loads(path.read_text("utf-8"))
+        except (FileNotFoundError, ValueError):
+            continue
+        data = event.get("data") if isinstance(event, dict) else None
+        if isinstance(data, dict):
+            aid = data.get("attempt_id")
+            if isinstance(aid, str) and aid:
+                found.setdefault(aid, (path, event))
+    return found
+
+
 def _fsync_dir(path, *, required=False):
     try:
         fd = os.open(str(path), os.O_RDONLY)
@@ -761,12 +788,13 @@ def _fsync_dir(path, *, required=False):
         os.close(fd)
 
 
-def _register_landed_file(outbox, *, expected_event=None):
+def _register_landed_file(outbox, *, expected_event=None, expected_events=None):
     """A registration failure leaves the file for recovery, but cannot authorize delivery."""
     if _landing_export is None:
         return False
     try:
-        _landing_export.register_landed_file(outbox, expected_event=expected_event)
+        _landing_export.register_landed_file(
+            outbox, expected_event=expected_event, expected_events=expected_events)
         return True
     except _landing_export.LandingContentConflict as ex:
         raise LandedEventConflict(str(ex)) from ex
@@ -938,22 +966,27 @@ def notify_landed_event(event, cfg=None, notifier=None):
         return False
 
 
-def emit_landed_record(a, data_dir, cfg=None, result_path=None):
+def emit_landed_record(a, data_dir, cfg=None, result_path=None, *, register=True,
+                       scan_existing=True):
     """Write one idempotent landed event and signal delivery. Returns (path, event, created)."""
     cfg = cfg or {}
     event = build_landed_event(a, cfg, result_path)
     outbox = _landed_outbox(data_dir)
     with _landed_publication(outbox):
-        for path, existing in _find_landed_events(outbox, event["data"]["attempt_id"]):
-            if _landing_conflicts(existing, event):
-                raise LandedEventConflict(f"conflicting terminal evidence for attempt {event['data']['attempt_id']}")
-            stored, created = existing, False
-            break
-        else:
+        stored = created = None
+        path = None
+        if scan_existing:
+            for path, existing in _find_landed_events(outbox, event["data"]["attempt_id"]):
+                if _landing_conflicts(existing, event):
+                    raise LandedEventConflict(f"conflicting terminal evidence for attempt {event['data']['attempt_id']}")
+                stored, created = existing, False
+                break
+        if created is None:
             path, stored, created = _persist_landed_event(outbox, event, event["id"])
-    registered = _register_landed_file(outbox, expected_event=stored if created else None)
-    if created and registered:
-        notify_landed_event(stored, cfg)
+    if register:
+        registered = _register_landed_file(outbox, expected_event=stored if created else None)
+        if created and registered:
+            notify_landed_event(stored, cfg)
     return path, stored, created
 
 
@@ -2532,8 +2565,13 @@ class Launcher:
         if cfg.get('rails_enabled') is True:
             from rails_emitter import RailsEmitter
             self.rails = RailsEmitter(self.dir)
-            self.rails.recover(self.attempts)
-        self.recover_landed_events()
+            # One ledger writer serves the whole startup pass: journal ingest
+            # and the receipts for recovered landing events share it.
+            with self.rails.recovery_writer() as writer:
+                self.rails.recover(self.attempts, writer=writer)
+                self.recover_landed_events(writer=writer)
+        else:
+            self.recover_landed_events()
         try:
             self.reconcile()
         except Exception:
@@ -2799,18 +2837,75 @@ class Launcher:
         """Re-send durable outbox events to the configured notifier (at-least-once)."""
         return replay_landed_events(self.dir, self.cfg, notifier)
 
-    def recover_landed_events(self):
-        """Emit events missed by a crash after the terminal journal write; never crashes startup."""
+    def recover_landed_events(self, writer=None):
+        """Emit events missed by a crash after the terminal journal write; never crashes startup.
+
+        One outbox scan builds an attempt-indexed map, recorded attempts are
+        skipped after a read-only receipt check, and every newly persisted file
+        is registered in a single export-index update. Conflicts and unreadable
+        evidence are still reported in ``landing_conflicts``.
+        """
         recovered = []
-        for a in list(self.attempts.values()):
-            if a.get("state") not in TERMINAL:
-                continue
+        terminal = [a for a in list(self.attempts.values()) if a.get("state") in TERMINAL]
+        if not terminal:
+            return recovered
+        outbox = _landed_outbox(self.dir)
+        existing = _scan_landed_events(outbox)
+        recorded_receipts = self.rails.final_receipts() if self.rails is not None else set()
+        created_events = []
+        models = MODELS.keys() | AGY_MODELS
+        for a in terminal:
+            aid = a.get("attempt_id")
             try:
-                recovered.append(self.emit_landed_event(a))
+                landed = existing.get(aid)
+                if landed is not None:
+                    stored = landed[1]
+                    event = self.build_landed_event(a)
+                    if _landing_conflicts(stored, event):
+                        raise LandedEventConflict(
+                            f"conflicting terminal evidence for attempt {aid}")
+                    if self.rails is not None:
+                        key = aid + ":final"
+                        if recorded_receipts is None or key not in recorded_receipts:
+                            self.rails.receipt(
+                                aid, stored.get(LANDED_USAGE_ATTR), models,
+                                agy=a.get("kind") == "agy-cua", writer=writer)
+                            if recorded_receipts is not None:
+                                recorded_receipts.add(key)
+                    recovered.append(stored)
+                    continue
+                _, event, created = emit_landed_record(
+                    a, self.dir, self.cfg, self.landed_result_path(a),
+                    register=False, scan_existing=False)
+                recovered.append(event)
+                if created:
+                    created_events.append(event)
+                if self.rails is not None:
+                    key = aid + ":final"
+                    if recorded_receipts is None or key not in recorded_receipts:
+                        self.rails.receipt(
+                            aid, event.get(LANDED_USAGE_ATTR), models,
+                            agy=a.get("kind") == "agy-cua", writer=writer)
+                        if recorded_receipts is not None:
+                            recorded_receipts.add(key)
             except LandedEventConflict as ex:
-                self.landing_conflicts.append({"attempt_id": a.get("attempt_id"), "error": str(ex)})
+                self.landing_conflicts.append({"attempt_id": aid, "error": str(ex)})
             except Exception as ex:  # disk errors must not stop the launcher; the journal still has the state
-                self.landing_conflicts.append({"attempt_id": a.get("attempt_id"), "error": type(ex).__name__})
+                self.landing_conflicts.append({"attempt_id": aid, "error": type(ex).__name__})
+        if created_events:
+            try:
+                registered = _register_landed_file(outbox, expected_events=created_events)
+            except LandedEventConflict as ex:
+                self.landing_conflicts.append({"attempt_id": None, "error": str(ex)})
+                registered = False
+            if registered:
+                for event in created_events:
+                    notify_landed_event(event, self.cfg)
+        else:
+            try:
+                _register_landed_file(outbox)
+            except LandedEventConflict as ex:
+                self.landing_conflicts.append({"attempt_id": None, "error": str(ex)})
         return recovered
 
     def _set(self, a, state, detail, ev=None):
@@ -4075,6 +4170,36 @@ def model_spec(cfg, name, brief=None):
             spec.update(base_url=cfg["base_url"], wire=cfg.get("wire") or "openai-chat")
     return spec
 
+def _credential_sources(cfg):
+    creds = {}
+    for source in ("zoo", "deepseek", "go"):
+        try:
+            creds[source] = bool(provider_key(cfg, source))
+        except KeyError:
+            creds[source] = False  # a partial cfg (unit tests) has no data_dir to read from
+    return creds
+
+def _route_why(spec, requested, brief, pm):
+    if spec.get("pool"):
+        return "the free pool is used, so the launcher picks one free model per attempt"
+    if requested and requested in TIERS:
+        return "tier " + requested + " maps to " + TIERS[requested]
+    if requested:
+        return "a model was named, so its allow-listed spec is used"
+    if is_high_priority(brief):
+        return "no model was named and brief priority is high, so DeepSeek official flash is used"
+    if pm:
+        return ("no model was named and project " + str(brief.get("project") or "")
+                + " sets model " + pm + ", so the project default is used")
+    return None
+
+def _default_route_why(cfg, creds):
+    if creds["zoo"] and cfg.get("prefer_zoo", PREFER_ZOO_DEFAULT):
+        return "no model was named and this host can authenticate to Zoo, so the preferred free pass is used"
+    if not cfg.get("prefer_zoo", PREFER_ZOO_DEFAULT):
+        return "no model was named and the Zoo preference is off on this host (the default), so the host default is used"
+    return "no model was named and there is no Zoo credential, so the host default is used"
+
 def route_preview(cfg, model=None, brief=None, kind=None):
     """What a dispatch of this request would resolve to, without starting one.
 
@@ -4106,28 +4231,11 @@ def route_preview(cfg, model=None, brief=None, kind=None):
     spec = model_spec(cfg, requested, brief)  # ValueError -> the handler answers 400
     src = spec.get("key") or "none"
     eff = dict([("name", spec.get("name")), ("model", spec.get("model")), ("key", src)])
-    creds = {}
-    for source in ("zoo", "deepseek", "go"):
-        try: creds[source] = bool(provider_key(cfg, source))
-        except KeyError: creds[source] = False  # a partial cfg (unit tests) has no data_dir to read from
+    creds = _credential_sources(cfg)
     pm = project_model(cfg, brief)
-    if spec.get("pool"):
-        why = "the free pool is used, so the launcher picks one free model per attempt"
-    elif requested and requested in TIERS:
-        why = "tier " + requested + " maps to " + TIERS[requested]
-    elif requested:
-        why = "a model was named, so its allow-listed spec is used"
-    elif is_high_priority(brief):
-        why = "no model was named and brief priority is high, so DeepSeek official flash is used"
-    elif pm:
-        why = ("no model was named and project " + str(brief.get("project") or "")
-               + " sets model " + pm + ", so the project default is used")
-    elif creds["zoo"] and cfg.get("prefer_zoo", PREFER_ZOO_DEFAULT):
-        why = "no model was named and this host can authenticate to Zoo, so the preferred free pass is used"
-    elif not cfg.get("prefer_zoo", PREFER_ZOO_DEFAULT):
-        why = "no model was named and the Zoo preference is off on this host (the default), so the host default is used"
-    else:
-        why = "no model was named and there is no Zoo credential, so the host default is used"
+    why = _route_why(spec, requested, brief, pm)
+    if why is None:
+        why = _default_route_why(cfg, creds)
     out = {}
     out["requested"] = requested
     out["effective"] = eff
