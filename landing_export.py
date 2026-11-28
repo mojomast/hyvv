@@ -489,26 +489,34 @@ def _reconcile(source, index, *, use_hints=True, registered_only=False):
     return retained, changed
 
 
-def register_landed_file(source, path=None, *, expected_event=None):
-    """Register a durable outbox file in append order.
+def register_landed_file(source, path=None, *, expected_event=None, expected_events=None):
+    """Register durable outbox files in append order in one batched update.
 
-    Called by the launcher immediately after an outbox file is persisted.  The
-    registration is idempotent: a file that is already indexed keeps its
-    original position, and a crash before this call is recovered by the next
-    export's outbox scan.
+    Called by the launcher immediately after an outbox file is persisted, and
+    once for the whole startup recovery set. The registration is idempotent: a
+    file that is already indexed keeps its original position, and a crash
+    before this call is recovered by the next export's outbox scan. Discovery,
+    index load, and the index write happen once per call so recovery cost stays
+    linear in the size of the outbox.
     """
     index_file = export_index_path(source)
+    if expected_events is None:
+        expected_events = () if expected_event is None else (expected_event,)
+    else:
+        expected_events = tuple(expected_events)
+        if expected_event is not None:
+            expected_events = (expected_event, *expected_events)
     with _index_lock(source):
         index = _load_index(index_file)
         retained, changed = _reconcile(source, index)
-        if expected_event is not None:
+        for expected in expected_events:
             # Do not authorize a fresh signal when discovery observed other
             # content (or no retained copy) in the publication/registration gap.
-            event_id = expected_event["id"]
+            event_id = expected["id"]
             if event_id not in retained:
                 raise OSError("published landing event missing at registration")
             entry = next(e for e in index["events"] if e["event_id"] == event_id)
-            if entry["sha256"] != _canonical_digest(expected_event):
+            if entry["sha256"] != _canonical_digest(expected):
                 raise LandingContentConflict(entry["position"])
         if changed:
             _write_index(index_file, index)
