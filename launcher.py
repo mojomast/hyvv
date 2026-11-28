@@ -4170,6 +4170,36 @@ def model_spec(cfg, name, brief=None):
             spec.update(base_url=cfg["base_url"], wire=cfg.get("wire") or "openai-chat")
     return spec
 
+def _credential_sources(cfg):
+    creds = {}
+    for source in ("zoo", "deepseek", "go"):
+        try:
+            creds[source] = bool(provider_key(cfg, source))
+        except KeyError:
+            creds[source] = False  # a partial cfg (unit tests) has no data_dir to read from
+    return creds
+
+def _route_why(spec, requested, brief, pm):
+    if spec.get("pool"):
+        return "the free pool is used, so the launcher picks one free model per attempt"
+    if requested and requested in TIERS:
+        return "tier " + requested + " maps to " + TIERS[requested]
+    if requested:
+        return "a model was named, so its allow-listed spec is used"
+    if is_high_priority(brief):
+        return "no model was named and brief priority is high, so DeepSeek official flash is used"
+    if pm:
+        return ("no model was named and project " + str(brief.get("project") or "")
+                + " sets model " + pm + ", so the project default is used")
+    return None
+
+def _default_route_why(cfg, creds):
+    if creds["zoo"] and cfg.get("prefer_zoo", PREFER_ZOO_DEFAULT):
+        return "no model was named and this host can authenticate to Zoo, so the preferred free pass is used"
+    if not cfg.get("prefer_zoo", PREFER_ZOO_DEFAULT):
+        return "no model was named and the Zoo preference is off on this host (the default), so the host default is used"
+    return "no model was named and there is no Zoo credential, so the host default is used"
+
 def route_preview(cfg, model=None, brief=None, kind=None):
     """What a dispatch of this request would resolve to, without starting one.
 
@@ -4201,28 +4231,11 @@ def route_preview(cfg, model=None, brief=None, kind=None):
     spec = model_spec(cfg, requested, brief)  # ValueError -> the handler answers 400
     src = spec.get("key") or "none"
     eff = dict([("name", spec.get("name")), ("model", spec.get("model")), ("key", src)])
-    creds = {}
-    for source in ("zoo", "deepseek", "go"):
-        try: creds[source] = bool(provider_key(cfg, source))
-        except KeyError: creds[source] = False  # a partial cfg (unit tests) has no data_dir to read from
+    creds = _credential_sources(cfg)
     pm = project_model(cfg, brief)
-    if spec.get("pool"):
-        why = "the free pool is used, so the launcher picks one free model per attempt"
-    elif requested and requested in TIERS:
-        why = "tier " + requested + " maps to " + TIERS[requested]
-    elif requested:
-        why = "a model was named, so its allow-listed spec is used"
-    elif is_high_priority(brief):
-        why = "no model was named and brief priority is high, so DeepSeek official flash is used"
-    elif pm:
-        why = ("no model was named and project " + str(brief.get("project") or "")
-               + " sets model " + pm + ", so the project default is used")
-    elif creds["zoo"] and cfg.get("prefer_zoo", PREFER_ZOO_DEFAULT):
-        why = "no model was named and this host can authenticate to Zoo, so the preferred free pass is used"
-    elif not cfg.get("prefer_zoo", PREFER_ZOO_DEFAULT):
-        why = "no model was named and the Zoo preference is off on this host (the default), so the host default is used"
-    else:
-        why = "no model was named and there is no Zoo credential, so the host default is used"
+    why = _route_why(spec, requested, brief, pm)
+    if why is None:
+        why = _default_route_why(cfg, creds)
     out = {}
     out["requested"] = requested
     out["effective"] = eff

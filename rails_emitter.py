@@ -2,6 +2,7 @@
 
 from contextlib import closing, contextmanager
 import json
+import sqlite3
 import sys
 import threading
 from pathlib import Path
@@ -36,6 +37,15 @@ class RailsEmitter:
     def _writer(self):
         return RailsLedger(str(self.path), allowed_authorities={"worker_report"})
 
+    @staticmethod
+    def _close_writer(db):
+        if db is None:
+            return
+        try:
+            db.close()
+        except sqlite3.Error:
+            pass
+
     @contextmanager
     def recovery_writer(self):
         """One ledger writer shared by startup journal ingest and receipt replay.
@@ -52,11 +62,7 @@ class RailsEmitter:
         try:
             yield db
         finally:
-            if db is not None:
-                try:
-                    db.close()
-                except Exception:
-                    pass
+            self._close_writer(db)
 
     def recover(self, attempts, *, writer=None):
         if writer is None:
@@ -167,23 +173,23 @@ class RailsEmitter:
                     page = db._write_tx(work)
                     if not page["has_more"]:
                         break
-                if page["diagnostics"]:
-                    self._partial.add(aid)
-                else:
-                    self._partial.discard(aid)
-                if type(expected_seq) is int and expected_seq > Cursor.decode(page["next_cursor"]).seq:
-                    # A clean EOF behind a retained native manifest isn't a
-                    # complete replay, even if ingest never saw the lost tail.
-                    self._errors[("write", aid)] = "journal_shorter_than_manifest"
-                self._errors.pop(error_key, None)
+                self._record_ingest_result(aid, page, expected_seq, error_key)
             except Exception:
                 self._errors[error_key] = "replay_required"
             finally:
-                if own and db is not None:
-                    try:
-                        db.close()
-                    except Exception:
-                        pass
+                if own:
+                    self._close_writer(db)
+
+    def _record_ingest_result(self, aid, page, expected_seq, error_key):
+        if page["diagnostics"]:
+            self._partial.add(aid)
+        else:
+            self._partial.discard(aid)
+        if type(expected_seq) is int and expected_seq > Cursor.decode(page["next_cursor"]).seq:
+            # A clean EOF behind a retained native manifest isn't a
+            # complete replay, even if ingest never saw the lost tail.
+            self._errors[("write", aid)] = "journal_shorter_than_manifest"
+        self._errors.pop(error_key, None)
 
     def receipt(self, aid, block, models, *, agy=False, writer=None):
         """Use only the persisted landing receipt's allowlisted count block."""
@@ -226,11 +232,8 @@ class RailsEmitter:
             except Exception:
                 self._errors[key] = "receipt_replay_required"
             finally:
-                if own and db is not None:
-                    try:
-                        db.close()
-                    except Exception:
-                        pass
+                if own:
+                    self._close_writer(db)
 
     def health(self):
         with self._lock:
